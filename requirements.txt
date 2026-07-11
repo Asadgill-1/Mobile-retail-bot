@@ -1,0 +1,39 @@
+# Multi-shop chatbot — pinned dependencies (ADR-001, ADR-004)
+# Python 3.11+
+
+# Web
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Settings / validation
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# Supabase (Postgres + Storage) — ADR-001, ADR-003
+supabase==2.10.0
+
+# Redis
+redis==5.2.1
+
+# Celery — §11, §13
+celery==5.4.0
+flower==2.0.1
+
+# Telegram — python-telegram-bot v20+ (§1, §2)
+python-telegram-bot==21.10
+
+# Twilio / WhatsApp — §1, §9 (mocked until Stage 13, ADR-002)
+twilio==9.4.2
+
+# LLM — OpenAI-compatible client (Moonshot test / OpenAI prod, ADR-004)
+openai==1.59.7
+
+# Excel export — §10
+openpyxl==3.1.5
+
+# HTTP / utils (httpx version is driven by supabase/openai; not pinned to avoid conflicts)
+python-dotenv==1.0.1
+
+# Testing — §16, CONVENTIONS
+pytest==8.3.4
+pytest-asyncio==0.25.2

@@ -1,0 +1,23 @@
+# Dev/test-only dependencies (not shipped in the runtime image).
+# Install: pip install -r requirements.txt -r requirements-dev.txt
+
+# Test runner (the whole suite is async; pytest-asyncio drives it)
+pytest==8.3.4
+pytest-asyncio==0.25.2
+
+# Telethon — userbot sessions to script customer/shopkeeper messages in tests (ADR-005)
+telethon==1.36.0
+
+# fakeredis — async Redis mock for unit tests (no real Redis needed in CI)
+fakeredis==2.26.2
+
+# ruff/black already in requirements; lint tooling
+ruff==0.8.4
+black==24.10.0
+
+# Coverage
+coverage==7.6.10
+
+# MCP SDK — Supabase MCP server (ADR-007). NOTE: install core `mcp` only (not [cli]);
+# the [cli] extra pulls starlette>=1.x which breaks fastapi's starlette<0.42 pin.
+mcp==1.28.1

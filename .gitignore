@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs / local DB
+*.log
+*.sqlite3
+
+# Telethon userbot sessions (secrets — ADR-005)
+*.session
+*.session-journal
+
+# Owner-supplied test media (~1.4 MB of phone photos + videos, binaries).
+# Consumed by tests/fixtures/catalog.py + scripts/seed_test_catalog.py.
+pices and Video/

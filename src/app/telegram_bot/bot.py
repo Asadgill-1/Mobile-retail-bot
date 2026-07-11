@@ -1,0 +1,1047 @@
+"""Telegram bot: owner + shopkeeper commands (SPEC §1, §2, §5, §6, §12).
+
+One module (ethos: fewest files) — split only when it genuinely needs it.
+Handlers parse `update.message.text` directly (not PTB's `context.args`) so they
+are unit-testable without the PTB dispatcher. Service is injected via
+`application.bot_data["tenant_service"]`.
+
+Testing mode = long-polling (ADR-002). WhatsApp is mocked (ADR-002).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+import signal
+import uuid
+from typing import Awaitable, Callable
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    ApplicationHandlerStop,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+
+from app.escalations.service import DeliveryFailed, NoPendingEscalation
+from app.orders.service import (
+    NoPendingDraft,
+    NoPriceRequest,
+    OutOfStock,
+    approve_price,
+    confirm_order,
+    deny_price,
+    export_orders,
+    export_rider,
+    list_drafts,
+    profit_summary,
+    reject_order,
+    set_negotiation,
+)
+from app.products.addproduct_flow import build_addproduct_handler
+from app.reports.service import format_owner_profit, format_profit, parse_period
+from app.products.service import (
+    InvalidBoostLevel,
+    InvalidTag,
+    ProductNotFound,
+    add_tags,
+    clear_tags,
+    parse_boost_level,
+    parse_price,
+    parse_tags,
+    remove_tag,
+    set_boost,
+    toggle_featured,
+)
+from app.tenants.auth import is_owner
+from app.tenants.models import Shop, ShopStatus
+from app.tenants.service import ClientNotFound, ShopNotFound, TenantService
+
+logger = logging.getLogger(__name__)
+
+
+# --- helpers ---
+def _service(context: ContextTypes.DEFAULT_TYPE) -> TenantService:
+    return context.application.bot_data["tenant_service"]
+
+
+async def _reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+
+def _split(text: str, *, maxsplit: int = 2) -> list[str]:
+    parts = (text or "").split(maxsplit=maxsplit)
+    return parts[1:]  # drop the command itself
+
+
+async def _resolve_shop(service: TenantService, arg: str):
+    """Resolve by UUID or whatsapp_number. Raises ShopNotFound if neither matches."""
+    try:
+        return await service.get_shop(uuid.UUID(arg))
+    except (ValueError, ShopNotFound):
+        pass
+    shop = await service.get_shop_by_whatsapp_number(arg)
+    if shop is None:
+        raise ShopNotFound(arg)
+    return shop
+
+
+# --- auth decorators ---
+def owner_only(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable]) -> Callable:
+    """Gate owner commands. Replies denial to non-owners. Wraps error replies."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if user is None or not is_owner(user.id):
+            await _reply(update, context, "⛔ Owner only.")
+            return
+        try:
+            await handler(update, context)
+        except (ShopNotFound, ClientNotFound) as e:
+            await _reply(update, context, f"❌ Not found: {e}")
+        except ValueError as e:
+            await _reply(update, context, f"⚠️ {e}")
+        except Exception:
+            logger.exception("owner command failed")
+            await _reply(update, context, "❌ Internal error. Owner alerted.")
+        else:
+            await _audit(update, context, handler.__name__)  # §16: log the privileged action
+
+    return wrapper
+
+
+# --- owner commands (SPEC §2) ---
+@owner_only
+async def pauseshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    arg = parts[0] if parts else None
+    reason = parts[1] if len(parts) > 1 else None
+    if not arg or not reason:
+        await _reply(update, context, "Usage: /pauseshop <shop_id|number> <reason>")
+        return
+    service = _service(context)
+    shop = await _resolve_shop(service, arg)
+    suspended = await service.suspend_shop(shop.id, reason)
+    await _reply(update, context, f"✅ Suspended: {suspended.name}\nReason: {suspended.suspension_reason}")
+
+
+@owner_only
+async def resumeshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    arg = parts[0] if parts else None
+    if not arg:
+        await _reply(update, context, "Usage: /resumeshop <shop_id|number>")
+        return
+    service = _service(context)
+    shop = await _resolve_shop(service, arg)
+    resumed = await service.resume_shop(shop.id)
+    await _reply(update, context, f"✅ Resumed: {resumed.name} ({resumed.status.value})")
+
+
+@owner_only
+async def shopstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    arg = parts[0] if parts else None
+    if not arg:
+        await _reply(update, context, "Usage: /shopstatus <shop_id|number>")
+        return
+    service = _service(context)
+    shop = await _resolve_shop(service, arg)
+    info = await service.shop_status(shop.id)
+    keepers = "\n".join(
+        f"  - {sk.name or '—'}{' (owner)' if sk.is_owner else ''} [{sk.telegram_id}]"
+        for sk in info.shopkeepers
+    ) or "  (none)"
+    await _reply(
+        update,
+        context,
+        f"🏪 {info.name}\nStatus: {info.status.value}\n"
+        f"Reason: {info.suspension_reason or '—'}\nShopkeepers:\n{keepers}",
+    )
+
+
+# --- owner security commands (SPEC §7 investigation, §8 bypass) — Stage 7 ---
+@owner_only
+async def investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /investigate <incident_id>")
+        return
+    from app.security.service import get_incident
+
+    inc = await get_incident(parts[0])
+    if inc is None:
+        await _reply(update, context, "❌ No such incident.")
+        return
+    snap = inc.get("message_snapshot") or []
+    lines = "\n".join(f"  {m.get('role', '?')}: {m.get('content', '')[:120]}" for m in snap) or "  (none)"
+    await _reply(
+        update,
+        context,
+        f"🛡 Incident {inc['id']}\nShop: {inc.get('shop_id')}\nCustomer: {inc['phone']}\n"
+        f"Type: {inc['attack_type']}  ·  Status: {inc['status']}\n"
+        f"When: {inc['created_at']}\n\nLast {len(snap)} message(s):\n{lines}",
+    )
+
+
+@owner_only
+async def quarantine_extend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /quarantine_extend <phone>")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import extend_quarantine
+
+    await extend_quarantine(get_redis(), parts[0])
+    await _reply(update, context, f"⏳ Quarantine extended to 24h for {parts[0]}.")
+
+
+@owner_only
+async def quarantine_lift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /quarantine_lift <phone>")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import lift_quarantine
+
+    await lift_quarantine(get_redis(), parts[0])
+    await _reply(update, context, f"✅ Quarantine lifted for {parts[0]}.")
+
+
+@owner_only
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /blacklist <phone> [reason]")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import blacklist
+
+    phone = parts[0]
+    reason = parts[1] if len(parts) > 1 else "owner blacklist"
+    await blacklist(get_redis(), phone, None, reason)
+    await _reply(update, context, f"⛔ {phone} blacklisted. Their messages are now silently ignored.")
+
+
+@owner_only
+async def forward_to_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /forward_to_shop <phone> <shop_id|number>")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import forward_to_shop as _forward
+
+    shop = await _resolve_shop(_service(context), parts[1])  # validate the shop exists
+    await _forward(get_redis(), parts[0])
+    await _reply(update, context, f"➡️ {parts[0]} now routed straight to {shop.name}'s staff (quarantine lifted).")
+
+
+@owner_only
+async def bypass_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    if not parts:
+        await _reply(update, context, "Usage: /bypass_ai <phone> [shop_id] [reason]")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import set_bypass
+
+    await set_bypass(get_redis(), parts[0])
+    await _reply(update, context, f"➡️ {parts[0]} bypasses the AI — messages go straight to the shop's staff.")
+
+
+@owner_only
+async def bypass_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /bypass_remove <phone>")
+        return
+    from app.db.redis_client import get_redis
+    from app.security.service import remove_bypass
+
+    await remove_bypass(get_redis(), parts[0])
+    await _reply(update, context, f"✅ Bypass removed for {parts[0]} — the AI handles them again.")
+
+
+OWNER_SECURITY_COMMANDS: dict[str, Callable] = {
+    "investigate": investigate,
+    "quarantine_extend": quarantine_extend,
+    "quarantine_lift": quarantine_lift,
+    "blacklist": blacklist_cmd,
+    "forward_to_shop": forward_to_shop,
+    "bypass_ai": bypass_ai,
+    "bypass_remove": bypass_remove,
+}
+
+
+# --- owner dispatcher (SPEC §6 profit + §12 dashboards) — Stage 8/10 ---
+@owner_only
+async def owner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner <dashboard|health|profit|escalations|security|audit> …` (SPEC §6, §12)."""
+    args = _split(update.message.text, maxsplit=3)
+    sub = args[0].lower() if args else ""
+    rest = args[1:]
+    if sub == "profit":
+        return await _owner_profit(update, context, rest)
+    if sub == "dashboard":
+        return await _owner_dashboard(update, context)
+    if sub == "health":
+        return await _owner_health(update, context)
+    if sub == "escalations":
+        return await _owner_escalations(update, context)
+    if sub == "security":
+        return await _owner_security(update, context)
+    if sub == "audit":
+        return await _owner_audit(update, context)
+    await _reply(
+        update, context,
+        "Usage: /owner <cmd>\n"
+        "dashboard · health · escalations · security · audit\n"
+        "profit [all|compare|shop <id>] [period]",
+    )
+
+
+async def _owner_profit(update: Update, context: ContextTypes.DEFAULT_TYPE, rest: list[str]) -> None:
+    """`/owner profit [all|compare|shop <id>] [period]` — profit across shops (SPEC §6)."""
+    service = _service(context)
+    mode = rest[0] if rest and rest[0] in ("all", "compare", "shop") else None
+
+    if mode == "shop":
+        if len(rest) < 2:
+            await _reply(update, context, "Usage: /owner profit shop <id|number> [period]")
+            return
+        shop = await _resolve_shop(service, rest[1])
+        start, end, label = parse_period(rest[2] if len(rest) > 2 else "today")
+        s = await profit_summary(shop.id, start, end)
+        await _reply(update, context, format_profit(s, f"{shop.name} — {label}"))
+        return
+
+    period = rest[1] if mode and len(rest) > 1 else (rest[0] if rest and not mode else "today")
+    start, end, label = parse_period(period)
+    items = [(sh.name, await profit_summary(sh.id, start, end)) for sh in await service.list_shops()]
+    await _reply(update, context, format_owner_profit(items, label))
+
+
+async def _owner_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner health` — full subsystem health (§13), same checker `/health` uses."""
+    from app.db.factory import get_tenant_repo
+    from app.db.redis_client import get_redis
+    from app.reports.health import check_health, format_health
+
+    report = await check_health(get_redis(), get_tenant_repo())
+    await _reply(update, context, format_health(report))
+
+
+async def _owner_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner dashboard` — one-screen ops snapshot for today (§12)."""
+    from app.db.factory import get_tenant_repo
+    from app.db.redis_client import get_redis
+    from app.escalations.service import count_open
+    from app.reports.health import check_health
+
+    service = _service(context)
+    shops = await service.list_shops()
+    active = sum(1 for s in shops if s.status.value == "active")
+    start, end, label = parse_period("today")
+    total = 0.0
+    for s in shops:
+        total += float((await profit_summary(s.id, start, end)).profit)
+    report = await check_health(get_redis(), get_tenant_repo())
+    open_esc = await count_open()
+    await _reply(
+        update, context,
+        f"🏢 Owner Dashboard — {label}\n\n"
+        f"Shops: {len(shops)} · {active} active · {len(shops) - active} paused\n"
+        f"Profit today: +{total:,.0f} AED (all shops)\n"
+        f"Open escalations: {open_esc}\n\n"
+        f"Health: {'🟢 healthy' if report.ok else '🔴 UNHEALTHY'}\n"
+        f"  active chats: {report.metrics.get('active_conversations', 0)} · "
+        f"quarantined: {report.metrics.get('quarantined', 0)}",
+    )
+
+
+async def _owner_escalations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner escalations` — open escalations across all shops (§12)."""
+    from app.escalations.service import list_open
+
+    rows = await list_open()
+    if not rows:
+        await _reply(update, context, "No open escalations. 🎉")
+        return
+    lines = [f"• {r['phone']} — {(r.get('message') or '')[:50]} ({(r.get('created_at') or '')[:16]})"
+             for r in rows]
+    await _reply(update, context, "Open escalations:\n" + "\n".join(lines))
+
+
+async def _owner_security(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner security` — recent security incidents (§12); `/investigate <id>` for detail."""
+    from app.security.service import recent_incidents
+
+    rows = await recent_incidents()
+    if not rows:
+        await _reply(update, context, "No security incidents recorded.")
+        return
+    lines = [f"• {r['id'][:8]} {r['attack_type']} — {r['phone']} [{r['status']}] "
+             f"({(r.get('created_at') or '')[:16]})" for r in rows]
+    await _reply(update, context, "Recent security incidents:\n" + "\n".join(lines)
+                 + "\n\n/investigate <id> for the full snapshot")
+
+
+async def _owner_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/owner audit` — recent privileged actions from `audit_logs` (§16)."""
+    from app.audit.service import recent
+
+    rows = await recent()
+    if not rows:
+        await _reply(update, context, "No audit entries yet.")
+        return
+    lines = [f"• {(r.get('created_at') or '')[:16]} — {r['actor']} → {r['action']}" for r in rows]
+    await _reply(update, context, "Recent activity:\n" + "\n".join(lines))
+
+
+# --- common ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply(update, context, "Multi-shop chatbot. Owner: /help. Shopkeepers: /help.")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user and is_owner(user.id):
+        await _reply(
+            update,
+            context,
+            "Owner commands:\n/pauseshop <id|num> <reason>\n/resumeshop <id|num>\n"
+            "/shopstatus <id|num>\n\n"
+            "Dashboards (§12):\n/owner dashboard · /owner health\n"
+            "/owner escalations · /owner security · /owner audit\n\n"
+            "Profit (§6):\n/owner profit [all|compare|shop <id>] [period]\n\n"
+            "Security (§7/§8):\n/investigate <incident_id>\n"
+            "/quarantine_lift <phone> · /quarantine_extend <phone>\n"
+            "/blacklist <phone> [reason]\n/forward_to_shop <phone> <shop_id>\n"
+            "/bypass_ai <phone> · /bypass_remove <phone>",
+        )
+    else:
+        await _reply(
+            update,
+            context,
+            "Shopkeeper commands (Stages 5–9):\n/addproduct · /boost · /tag · /feature\n"
+            "/profit today · /exportorders today\n(replies 'not implemented' until then)",
+        )
+
+
+# --- shopkeeper stubs (SPEC §5/§6/§12) — real impl in Stages 5–9 ---
+def _stub(name: str, stage: int) -> Callable:
+    async def _h(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _reply(update, context, f"⏳ /{name} — not implemented yet (Stage {stage}).")
+
+    _h.__name__ = name
+    return _h
+
+
+SHOPKEEPER_STUBS: dict[str, tuple[int, str]] = {
+    # §4/§5 products
+    "addproduct": (5, "addproduct"),
+    "boost": (5, "boost"),
+    "unboost": (5, "unboost"),
+    "tag": (5, "tag"),
+    "untag": (5, "untag"),
+    "cleartags": (5, "cleartags"),
+    "feature": (5, "feature"),
+    # §6 profit
+    "profit": (8, "profit"),
+    # §10 export
+    "exportorders": (9, "exportorders"),
+    "exportrider": (9, "exportrider"),
+    # §12 reports
+    "report": (8, "report"),
+    # §3 escalation
+    "reply": (6, "reply"),
+    "handover": (6, "handover"),
+}
+
+
+# --- shopkeeper product commands (SPEC §5) — Stage 5 ---
+def _shop_of(context: ContextTypes.DEFAULT_TYPE) -> Shop:
+    return context.application.bot_data["shop"]
+
+
+def _product_id(raw: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise ValueError(f"'{raw}' is not a valid product id")
+
+
+def keeper_command(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable]) -> Callable:
+    """Wrap a shopkeeper command: typed errors → safe replies (CONVENTIONS)."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            await handler(update, context)
+        except ProductNotFound:
+            # Same message whether the id is unknown or owned by another shop —
+            # never confirm that another shop's product exists.
+            await _reply(update, context, "❌ No such product in this shop.")
+        except NoPendingEscalation as e:
+            await _reply(update, context, f"❌ {e} is not waiting for a reply from this shop.")
+        except NoPendingDraft as e:
+            await _reply(update, context, f"❌ No pending order draft #{e} for this shop.")
+        except NoPriceRequest as e:
+            await _reply(update, context, f"❌ No pending price request #{e} for this shop.")
+        except OutOfStock as e:
+            await _reply(update, context, f"⚠️ Order #{e} can't be confirmed — that item is now out of stock.")
+        except DeliveryFailed as e:
+            await _reply(update, context, f"❌ Could not deliver to {e}. They may have blocked the bot.")
+        except (InvalidBoostLevel, InvalidTag, ValueError) as e:
+            await _reply(update, context, f"⚠️ {e}")
+        except Exception:
+            logger.exception("keeper command failed")
+            await _reply(update, context, "❌ Internal error.")
+        else:
+            await _audit(update, context, handler.__name__)  # §16: log the shop action
+
+    return wrapper
+
+
+async def _audit(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    """Append an audit row for a completed privileged command (§16). Best-effort — never raises."""
+    from app.audit.service import record
+
+    user = update.effective_user
+    shop = context.application.bot_data.get("shop")  # present on keeper bots, absent on owner control bot
+    text = (update.message.text or "")[:300] if update.message else ""
+    await record(
+        str(user.id) if user else "unknown", action,
+        shop_id=shop.id if shop else None, detail={"text": text},
+    )
+
+
+@keeper_command
+async def boost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /boost <product_id> <1-10>")
+        return
+    p = await set_boost(_shop_of(context).id, _product_id(parts[0]), parse_boost_level(parts[1]))
+    await _reply(update, context, f"🚀 {p.brand} {p.model} — boost {p.boost_level}/10.")
+
+
+@keeper_command
+async def unboost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /unboost <product_id>")
+        return
+    p = await set_boost(_shop_of(context).id, _product_id(parts[0]), 0)  # /unboost = boost 0
+    await _reply(update, context, f"✅ {p.brand} {p.model} — boost cleared.")
+
+
+@keeper_command
+async def tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /tag <product_id> <tag1,tag2>")
+        return
+    p = await add_tags(_shop_of(context).id, _product_id(parts[0]), parse_tags(parts[1]))
+    await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
+
+
+@keeper_command
+async def untag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /untag <product_id> <tag>")
+        return
+    p = await remove_tag(_shop_of(context).id, _product_id(parts[0]), parts[1])
+    await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
+
+
+@keeper_command
+async def cleartags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /cleartags <product_id>")
+        return
+    p = await clear_tags(_shop_of(context).id, _product_id(parts[0]))
+    await _reply(update, context, f"🏷 {p.brand} {p.model} — all tags removed.")
+
+
+@keeper_command
+async def feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /feature <product_id>")
+        return
+    p = await toggle_featured(_shop_of(context).id, _product_id(parts[0]))
+    await _reply(update, context, f"{'⭐' if p.is_featured else '☆'} {p.brand} {p.model} — featured: {p.is_featured}")
+
+
+# --- shopkeeper profit (SPEC §6) — Stage 8 ---
+@keeper_command
+async def profit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/profit [today|yesterday|weekly|monthly|YYYY-MM-DD]` — this shop's profit (SPEC §6)."""
+    parts = _split(update.message.text, maxsplit=1)
+    start, end, label = parse_period(parts[0] if parts else "today")
+    s = await profit_summary(_shop_of(context).id, start, end)
+    await _reply(update, context, format_profit(s, label))
+
+
+# --- shopkeeper order confirmation (Q-017 hybrid booking) — Stage 8 ---
+def _order_number(raw: str) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{raw}' is not an order number")
+
+
+@keeper_command
+async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/orders` — list order drafts awaiting confirmation."""
+    drafts = await list_drafts(_shop_of(context).id)
+    if not drafts:
+        await _reply(update, context, "No pending order drafts.")
+        return
+    lines = []
+    for d in drafts:
+        p = d.get("products") or {}
+        net = float(d["selling_price"]) - float(d["discount_amount"])
+        lines.append(f"#{d['order_number']} — {d['customer_name']} — "
+                     f"{p.get('brand', '')} {p.get('model', '')} ×{d['quantity']} — {net:.0f} AED")
+    await _reply(
+        update, context,
+        "Pending drafts:\n" + "\n".join(lines) + "\n\n/confirmorder <#>  ·  /rejectorder <#> [reason]",
+    )
+
+
+@keeper_command
+async def confirmorder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/confirmorder <#>` — accept a draft: decrement stock + notify the customer."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /confirmorder <order_number>")
+        return
+    num = _order_number(parts[0])
+    await confirm_order(_shop_of(context), num)
+    await _reply(update, context, f"✅ Order #{num} confirmed. Stock updated, customer notified.")
+
+
+@keeper_command
+async def rejectorder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/rejectorder <#> [reason]` — decline a draft. The customer is not cold-messaged."""
+    parts = _split(update.message.text, maxsplit=2)
+    if not parts:
+        await _reply(update, context, "Usage: /rejectorder <order_number> [reason]")
+        return
+    num = _order_number(parts[0])
+    await reject_order(_shop_of(context), num, parts[1] if len(parts) > 1 else None)
+    await _reply(update, context, f"❌ Order #{num} rejected. Use /reply {num} … if you want to tell the customer.")
+
+
+# --- shopkeeper price negotiation (ADR-010 rev.) — Stage 8 ---
+@keeper_command
+async def negotiation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/negotiation on|off` — allow or forbid the AI to raise price requests for this shop."""
+    parts = _split(update.message.text, maxsplit=1)
+    choice = (parts[0].lower() if parts else "")
+    if choice not in ("on", "off"):
+        await _reply(update, context, "Usage: /negotiation on|off")
+        return
+    await set_negotiation(_shop_of(context).id, choice == "on")
+    await _reply(
+        update, context,
+        "💬 Negotiation ON — the assistant may ask you to approve discounts." if choice == "on"
+        else "🔒 Negotiation OFF — the assistant will hold every price at list; no discounts.",
+    )
+
+
+@keeper_command
+async def approveprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/approveprice <#>` — accept the customer's requested price. Customer is told."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /approveprice <request_number>")
+        return
+    price = await approve_price(_shop_of(context), _order_number(parts[0]))
+    await _reply(update, context, f"✅ Approved at {price} AED. Customer notified.")
+
+
+@keeper_command
+async def custom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/custom <#> <price>` — counter with your own price. Customer is told."""
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /custom <request_number> <price>")
+        return
+    price = await approve_price(_shop_of(context), _order_number(parts[0]), parse_price(parts[1]))
+    await _reply(update, context, f"✅ Offered {price} AED to the customer.")
+
+
+@keeper_command
+async def denyprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/denyprice <#>` — decline. Customer told the list price is the best available."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /denyprice <request_number>")
+        return
+    await deny_price(_shop_of(context), _order_number(parts[0]))
+    await _reply(update, context, "❌ Declined. Customer told the list price stands.")
+
+
+# --- shopkeeper Excel export (SPEC §10) — Stage 9 ---
+@keeper_command
+async def exportorders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/exportorders [today|yesterday|YYYY-MM-DD|pending|all] [detailed]` — pick-&-pack .xlsx."""
+    parts = _split(update.message.text, maxsplit=2)
+    filt = parts[0] if parts else "today"
+    detailed = any(p.lower() == "detailed" for p in parts[1:])
+    if filt.lower() == "detailed":  # `/exportorders detailed` → today, detailed
+        filt, detailed = "today", True
+    name, url, n = await export_orders(_shop_of(context), filt, detailed)
+    await _reply(update, context, f"📄 {n} order(s) — {name}\n{url}\n(link valid 24h)")
+
+
+@keeper_command
+async def exportrider_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/exportrider <rider_id> [today|yesterday|YYYY-MM-DD]` — one rider's route, sorted by address."""
+    parts = _split(update.message.text, maxsplit=2)
+    if not parts:
+        await _reply(update, context, "Usage: /exportrider <rider_id> [today|yesterday|YYYY-MM-DD]")
+        return
+    try:
+        rider = uuid.UUID(parts[0])
+    except ValueError:
+        raise ValueError(f"'{parts[0]}' is not a valid rider id")
+    name, url, n = await export_rider(_shop_of(context), rider, parts[1] if len(parts) > 1 else "today")
+    await _reply(update, context, f"🛵 {n} order(s) for rider — {name}\n{url}\n(link valid 24h)")
+
+
+# --- shopkeeper product stats (SPEC §5; Q-014) ---
+@keeper_command
+async def productstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/productstats` — per-product view/suggestion stats (Q-014). No tracking source exists yet."""
+    await _reply(
+        update, context,
+        "📊 Product stats aren't available yet — the shop doesn't track product views or how often "
+        "the assistant suggests each item. This turns on once that tracking is added (Q-014).",
+    )
+
+
+# --- shopkeeper escalation commands (SPEC §3) — Stage 6 ---
+@keeper_command
+async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/reply <customer> <text>` — answer an escalated customer, in the shop's voice."""
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2 or not parts[1].strip():
+        await _reply(update, context, "Usage: /reply <customer> <your message>")
+        return
+    from app.db.redis_client import get_redis
+    from app.escalations.service import reply as send_reply
+
+    shop = _shop_of(context)
+    await send_reply(get_redis(), shop, parts[0], parts[1].strip())
+    await _reply(update, context, f"✅ Sent to {parts[0]}.")
+
+
+@keeper_command
+async def handover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/handover <customer>` — give the conversation back to the assistant (SPEC §3)."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /handover <customer>")
+        return
+    from app.db.redis_client import get_redis
+    from app.escalations.service import handover
+
+    shop = _shop_of(context)
+    await handover(get_redis(), shop, parts[0])
+    await _reply(
+        update,
+        context,
+        f"✅ {parts[0]} handed back to the assistant. It has the full conversation.",
+    )
+
+
+# Real handlers replace the stubs on the per-shop keeper bot (they need bot_data["shop"]).
+KEEPER_COMMANDS: dict[str, Callable] = {
+    "boost": boost,
+    "unboost": unboost,
+    "tag": tag,
+    "untag": untag,
+    "cleartags": cleartags,
+    "feature": feature,
+    # SPEC §3 escalation (Stage 6)
+    "reply": reply_cmd,
+    "handover": handover_cmd,
+    # SPEC §6 profit (Stage 8)
+    "profit": profit_cmd,
+    # Q-017 hybrid booking (Stage 8)
+    "orders": orders_cmd,
+    "confirmorder": confirmorder_cmd,
+    "rejectorder": rejectorder_cmd,
+    # ADR-010 rev. price negotiation (Stage 8)
+    "negotiation": negotiation_cmd,
+    "approveprice": approveprice_cmd,
+    "custom": custom_cmd,
+    "denyprice": denyprice_cmd,
+    # SPEC §10 Excel export (Stage 9)
+    "exportorders": exportorders_cmd,
+    "exportrider": exportrider_cmd,
+    # SPEC §5 product stats (Q-014 — honest "not tracked yet")
+    "productstats": productstats_cmd,
+}
+
+# `/addproduct` is a ConversationHandler, not a plain CommandHandler — registered separately.
+KEEPER_REAL_COMMANDS: frozenset[str] = frozenset({*KEEPER_COMMANDS, "addproduct"})
+
+
+# --- application factory: OWNER control bot (ADR-005) ---
+async def _log_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Low-priority inbound logger so messages are visible in the runner log."""
+    u = update.effective_user
+    m = update.message
+    if m is None:
+        return
+    logger.info("inbound bot=%s user=%s chat=%s text=%r",
+                context.bot.username, u.id if u else None,
+                update.effective_chat.id, (m.text or "")[:200])
+
+
+def build_application(service: TenantService) -> Application:
+    """Owner control bot: admin commands (/pauseshop, /shopstatus, ...)."""
+    app = (
+        ApplicationBuilder()
+        .token(_owner_token())
+        .build()
+    )
+    app.bot_data["tenant_service"] = service
+
+    app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    # owner (§2)
+    app.add_handler(CommandHandler("pauseshop", pauseshop))
+    app.add_handler(CommandHandler("resumeshop", resumeshop))
+    app.add_handler(CommandHandler("shopstatus", shopstatus))
+    # owner profit (§6)
+    app.add_handler(CommandHandler("owner", owner_cmd))
+    # owner security (§7, §8)
+    for name, handler in OWNER_SECURITY_COMMANDS.items():
+        app.add_handler(CommandHandler(name, handler))
+    # shopkeeper stubs (§3/§5/§6/§10/§12)
+    for name, (stage, _alias) in SHOPKEEPER_STUBS.items():
+        app.add_handler(CommandHandler(name, _stub(name, stage)))
+    return app
+
+
+# --- application factory: per-shop SHOPKEEPER bot (ADR-005) ---
+async def _shopkeeper_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    shop: Shop = context.application.bot_data["shop"]
+    await _reply(update, context, f"🏪 {shop.name} — shopkeeper bot. Commands: /help")
+
+
+async def _shopkeeper_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    shop: Shop = context.application.bot_data["shop"]
+    await _reply(
+        update,
+        context,
+        f"🏪 {shop.name} — shopkeeper commands\n\n"
+        "Products:\n"
+        "/addproduct — add a product (11 steps, /cancel any time)\n"
+        "/boost <id> <1-10> · /unboost <id>\n"
+        "/tag <id> <tag1,tag2> · /untag <id> <tag> · /cleartags <id>\n"
+        "/feature <id>\n\n"
+        "Escalated customers:\n"
+        "/reply <customer> <text> — answer them yourself\n"
+        "/handover <customer> — give them back to the assistant\n\n"
+        "Orders:\n/orders — drafts awaiting your OK\n"
+        "/confirmorder <#> · /rejectorder <#> [reason]\n\n"
+        "Price requests:\n/approveprice <#> · /custom <#> <price> · /denyprice <#>\n"
+        "/negotiation on|off\n\n"
+        "Profit:\n/profit [today|yesterday|weekly|monthly|YYYY-MM-DD]\n\n"
+        "Export:\n/exportorders [today|yesterday|YYYY-MM-DD|pending|all] [detailed]\n"
+        "/exportrider <rider_id> [period]\n\n"
+        "Stats:\n/productstats",
+    )
+
+
+async def _is_shopkeeper(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Is this Telegram user a registered shopkeeper of this bot's shop? Fail CLOSED on error."""
+    shop = context.application.bot_data.get("shop")
+    if shop is None:
+        return False
+    try:
+        from app.db.factory import get_tenant_repo
+
+        keepers = await get_tenant_repo().list_shopkeepers(shop.id)
+        return any(sk.telegram_id == user_id for sk in keepers)
+    except Exception:
+        logger.exception("shopkeeper auth lookup failed shop=%s", shop.id)
+        return False  # deny on error — never fail open on an auth check
+
+
+async def _keeper_auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs first on the keeper bot. Blocks anyone who isn't a registered shopkeeper of this shop
+    (the global owner is allowed). Telegram bots are publicly discoverable by @username, so without
+    this ANY user could run /confirmorder, /approveprice (arbitrary discounts), /profit (revenue),
+    or /exportorders (customer names/addresses/phones — PII). Covers every command AND the
+    /addproduct conversation, because it intercepts the Update before any handler group."""
+    user = update.effective_user
+    if user and (is_owner(user.id) or await _is_shopkeeper(context, user.id)):
+        return  # authorized → let the normal handlers run
+    if update.message is not None:
+        await _reply(update, context, "⛔ This bot is for shop staff only.")
+    raise ApplicationHandlerStop  # stop ALL further handlers for this unauthorized update
+
+
+def build_shopkeeper_application(service: TenantService, shop: Shop) -> Application:
+    """Per-shop shopkeeper bot: staff-side commands scoped to one shop."""
+    if not shop.telegram_keeper_bot_token:
+        raise RuntimeError(f"shop {shop.id} has no telegram_keeper_bot_token")
+    app = ApplicationBuilder().token(shop.telegram_keeper_bot_token).build()
+    app.bot_data["tenant_service"] = service
+    app.bot_data["shop"] = shop
+    app.add_handler(TypeHandler(Update, _keeper_auth_gate), group=-10)  # staff-only gate, runs first
+    app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
+    app.add_handler(CommandHandler("start", _shopkeeper_start))
+    app.add_handler(CommandHandler("help", _shopkeeper_help))
+    # Stage 5: real product commands (SPEC §5) + the /addproduct flow (SPEC §4).
+    app.add_handler(build_addproduct_handler())
+    for name, handler in KEEPER_COMMANDS.items():
+        app.add_handler(CommandHandler(name, handler))
+    for name, (stage, _alias) in SHOPKEEPER_STUBS.items():
+        if name not in KEEPER_REAL_COMMANDS:
+            app.add_handler(CommandHandler(name, _stub(name, stage)))
+    return app
+
+
+# --- application factory: per-shop CUSTOMER bot (ADR-005; = "WhatsApp" channel in testing) ---
+async def _customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Customer inbound → SPEC §9 pipeline (Stage 3). WhatsApp mocked; this is the test channel (ADR-002)."""
+    from app.db.redis_client import get_redis
+    from app.messaging.pipeline import InboundMessage, process_message
+
+    shop: Shop = context.application.bot_data["shop"]
+    user = update.effective_user
+    # Customer identity: Telegram user id in testing, phone in prod — same field (SPEC §1, ADR-005).
+    identity = str(user.id) if user else str(update.effective_chat.id)
+    msg = InboundMessage(shop=shop, identity=identity, text=update.message.text or "")
+    result = await process_message(msg, get_redis())
+    logger.info("customer msg shop=%s identity=%s action=%s media=%d",
+                shop.id, identity, result.action, len(result.media))
+    if result.reply is not None:
+        await _reply(update, context, result.reply)
+    await _send_media(update, context, result.media)
+
+
+async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media: tuple) -> None:
+    """Send product photos/video the AI chose to show (SPEC §4 step 10). Best-effort — a failed
+    media send must never break the text reply the customer already got."""
+    chat_id = update.effective_chat.id
+    for item in media:
+        try:
+            if item.get("type") == "video":
+                await context.bot.send_video(chat_id, item["url"])
+            else:
+                await context.bot.send_photo(chat_id, item["url"])
+        except Exception:
+            logger.exception("send media failed chat=%s url=%s", chat_id, item.get("url"))
+
+
+def build_customer_application(service: TenantService, shop: Shop) -> Application:
+    """Per-shop customer bot: customer-facing channel (Telegram-first testing)."""
+    if not shop.telegram_customer_bot_token:
+        raise RuntimeError(f"shop {shop.id} has no telegram_customer_bot_token")
+    app = ApplicationBuilder().token(shop.telegram_customer_bot_token).build()
+    app.bot_data["tenant_service"] = service
+    app.bot_data["shop"] = shop
+    app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
+    app.add_handler(CommandHandler("start", _shopkeeper_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _customer_message))
+    return app
+
+
+def _owner_token() -> str:
+    from app.core.config import settings
+
+    if not settings.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set (see .env.example).")
+    return settings.telegram_bot_token
+
+
+def run_polling(service: TenantService) -> None:
+    """Long-polling runner for the OWNER bot only (ADR-002). For quick smoke tests."""
+    app = build_application(service)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+# --- multi-bot runner: owner + every shop's keeper + customer bots (ADR-005) ---
+async def _build_all_applications(service: TenantService) -> list[Application]:
+    """Owner app + one shopkeeper app + one customer app per configured shop."""
+    apps = [build_application(service)]
+    shops = await service.list_shops()
+    for shop in shops:
+        if shop.telegram_keeper_bot_token:
+            apps.append(build_shopkeeper_application(service, shop))
+        if shop.telegram_customer_bot_token:
+            apps.append(build_customer_application(service, shop))
+    return apps
+
+
+async def _run_apps_forever(service: TenantService) -> None:
+    apps = await _build_all_applications(service)
+    if len(apps) == 1:
+        logger.warning("no per-shop bots configured — running owner bot only")
+    for app in apps:
+        await app.initialize()
+        if app.updater is not None:
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await app.start()
+    logger.info("polling started: %d bot(s)", len(apps))
+
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            # Windows ProactorEventLoop has no add_signal_handler — fall back to KeyboardInterrupt.
+            pass
+
+    try:
+        await stop.wait()
+    finally:
+        for app in reversed(apps):
+            try:
+                await app.stop()
+            except Exception:
+                logger.exception("stop failed for bot")
+            if app.updater is not None:
+                try:
+                    await app.updater.stop()
+                except Exception:
+                    logger.exception("updater.stop failed for bot")
+            try:
+                await app.shutdown()
+            except Exception:
+                logger.exception("shutdown failed for bot")
+
+
+def run_all_polling(service: TenantService) -> None:
+    """Run owner + all shop bots concurrently under one event loop (ADR-005)."""
+    from app.core.logging import setup_logging
+
+    setup_logging()  # §16: structured logs for the bot process
+    try:
+        asyncio.run(_run_apps_forever(service))
+    except KeyboardInterrupt:
+        pass

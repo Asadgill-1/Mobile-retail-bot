@@ -1,0 +1,472 @@
+# Multi-Shop Chatbot System: Complete Design & Conversation
+
+> ⚠️ **UPDATED CONCEPTS (2026-07-09) — this brainstorm is the original design; three ideas below have since changed. The BUILT SYSTEM follows the updated versions, not the original text. Corrections are marked `[UPDATED …]` at the exact spots.**
+>
+> 1. **Business model flipped.** Owner is NOT a chain operating its own 30 shops. Owner is a **SaaS provider** who onboards independent shops as **paying tenant clients** and charges them for the automation. Schema gained two tables the original never had: `clients` (billing entity above shops) and `usage_daily` (per-shop message meter). See §1, §SYSTEM OVERVIEW, §15.
+> 2. **Telegram-first, WhatsApp later.** Customer channel is still WhatsApp/Twilio for production, but all testing runs on **Telegram** until go-to-market. The WhatsApp webhook + signature verify are built and tested but **mocked**; one adapter flip activates the real path. See §TECH STACK, §1, §9.
+> 3. **Moonshot for now, and NO fallback message.** LLM is **Moonshot `kimi-k2.6`** in testing (provider abstraction swaps to GPT-4o at production). The "fallback message" is **deleted**: the customer must NEVER see "I'm having trouble" — every failure is byte-identical to a normal handoff ("Let me connect you with our specialist"). The customer never learns a machine was involved. See §3, §11, §TECH STACK.
+
+## Initial Request
+
+**User:** I want to build a chatbot for mobile shops and computer shops. It receives messages from customers, asks which mobile/laptop they want, shows pictures and specs, then handles booking. On the backend, shopkeepers manage inventory, orders, and delivery via Telegram. Need tracking system, delivery confirmation, notifications to delivery person and customer. Need complete system design and tech stack.
+
+## Technology Stack Recommendation
+
+**Assistant:** Recommended stack:
+- **Backend:** Python 3.11+ with FastAPI, async, good for chatbots and REST APIs
+- **Database:** PostgreSQL with SQLAlchemy & Alembic
+- **Redis:** caching, session state, message broker for Celery
+- **Celery:** background job queue for sending notifications, processing images
+- **python-telegram-bot:** for Telegram bot (shopkeeper)
+- **Twilio API for WhatsApp:** customer communication
+- **Amazon S3 or Cloudinary:** for storing product pictures and videos
+- **Docker & docker-compose:** for easy deployment
+- **Optional:** React frontend for admin, but Telegram-first recommended.
+
+---
+
+## AI Brain Integration
+
+**User:** Does it not need an AI brain?
+
+**Assistant:** For the customer-facing side (WhatsApp), you absolutely need an LLM to handle free-text questions like "suggest a gaming laptop under $1500" or "I want something like Samsung S23 but cheaper". The AI should use **function calling** to search the real inventory. OpenAI GPT-4o (or Claude) with function calling, conversation context stored in Redis.
+
+**Updated prompt added:** AI-powered WhatsApp bot with function calling, flexible conversation.
+
+---
+
+## Multi-Tenancy for 30 Shops
+
+**User:** How tech works because I will bind 30 shops on one system. It is good if anything happen I have to debug one system not 30.
+
+**Assistant:** Multi-tenancy design:
+- Single deployment, one database, all tables have `shop_id` column.
+- Shopkeepers authenticated via Telegram user ID, mapped to shop.
+- WhatsApp: one Twilio number per shop, all forward to a single webhook; webhook reads `To` number to set `shop_id`.
+- Single codebase, single log stream, fix once for all shops.
+
+**Added to prompt:** Explicit multi-tenancy requirements, `shops` table, WhatsApp per-shop numbers.
+
+---
+
+## Invisible Shop Isolation & Supabase Decision
+
+**User:** Customer message it must go to that shop which customer is contacting with, not customer nor shopkeeper get that 30 shops are conducted. Did we use supabase or database?
+
+**Assistant:** 
+- One WhatsApp number per shop, all pointing to same webhook. No "which shop?" message.
+- Shopkeeper Telegram bot scoped automatically.
+- **Supabase** recommended as managed PostgreSQL + file storage, replaces self-hosted PostgreSQL and S3.
+- Redis still needed for sessions and Celery broker.
+
+**Final stack:** FastAPI, Supabase (DB + Storage), Redis, Celery, python-telegram-bot, Twilio, OpenAI.
+
+---
+
+## Concurrency Handling (300+ Messages)
+
+**User:** How brain handle 30×10=300 messages from different customers for different shops and sometime customer do more then 1 message a time. Brain must not for get or dump or dies requests. How this handle.
+
+**Assistant:** Detailed concurrency design:
+- FastAPI async: non-blocking, handles thousands of connections.
+- Conversation state in Redis only, no local memory.
+- Per-session Redis lock (`lock:session:{shop_id}:{phone}`) to process messages from same customer sequentially.
+- Webhook returns 200 immediately, processing delegated to Celery background task.
+- Twilio MessageSid deduplication via Redis.
+- OpenAI errors retried once with fallback.
+
+**Added to prompt:** Reliability & concurrency section with locking, async ack, dedup.
+
+---
+
+## Anti-Hallucination, Human Escalation, Security, Reports, Owner Controls
+
+**User:** How this system handle that AI didnot invent answers and helusinate or which thing is out of its range bypass to shopkeepers telegram and shopkeeper handle chat and when problem solve again take up chat without customer know this happen?
+How peoples those get it system have AI they try to find vernabilites and try to hack or get information or any shopkeeper do this for other shops.
+Reports which shops give
+There is no system for adding new shops there staff this is for company owner to handle system,
+How to check system health that every thing is working prefectly
+Reports for owner
+
+**Assistant:** 
+- **Anti-hallucination:** AI system prompt enforces function calling only for products; no invention.
+- **Escalation:** Out-of-domain (refunds, complaints, "talk to human") triggers freeze of AI, forwards to shopkeeper Telegram, shopkeeper can `/reply` and `/handover` back to AI.
+- **Security:** Prompt injection defense, SQL injection detection, rapid-fire detection, cross-shop probing detection, credential probing detection. All customer input untrusted.
+- **Auto-quarantine:** Detects attacks, quarantines number in Redis, captures last 25 messages, alerts owner via Telegram with forensic data.
+- **Direct-to-shop bypass:** Owner can route specific customer numbers directly to shopkeeper Telegram, bypassing AI.
+- **Reports:** Shopkeepers get daily, inventory_low, top_products. Owner gets dashboard, per-shop drilldown, escalations, audit, health.
+- **System health:** `/health` endpoint, Celery Beat health checks, owner alerts on failure.
+- **Owner-only management:** `/addshop`, `/removeshop`, etc., only for owner Telegram ID.
+
+**Added to prompt:** Full security framework, escalation workflow, quarantine system, owner commands, health monitoring.
+
+---
+
+## Shop Suspension & Direct Message Bypass
+
+**User:** If pause any shop because he did paid or during maintenance plus system and start going messages directly to shops.
+Or if anyone try to hack or do this then show its last 25 messages to owner and flag to owner and on owner system it set send this number messages direct to shop do not go to AI or system , because otherwise system get infected
+How this system handles
+
+**Assistant:** 
+- **Shop suspension:** `/pauseshop` sets status to suspended; WhatsApp auto-replies with maintenance message, AI processing skipped; shopkeeper Telegram read-only.
+- **Attack detection + quarantine:** Automatically quarantines attacker, captures 25 messages, alerts owner with incident ID. Owner can extend quarantine, blacklist, or forward to shop.
+- **Direct-to-shop bypass:** `/bypass_ai` routes customer messages straight to shopkeeper (no AI), for VIPs or false positives.
+
+**Added to prompt:** Message processing pipeline with priority checks: Twilio validation → shop status → blacklist → quarantine → bypass → attack detection → normal AI.
+
+---
+
+## Pick & Pack Excel Reports
+
+**User:** When shop needs give all order detail . System give proper excel file report. Which have customer no, adress, product which they have order , qty , selling price which they have tell to customer
+This file shopkeeper gives to there staff to take out order pack it and give to rider.
+
+**Assistant:** 
+- `/exportorders today|yesterday|date|pending|all`
+- Excel with columns: Order ID, Customer Name, Phone, Address, Product, Brand, Model, Color, RAM, Storage, Qty, Selling Price, Delivery Date, Status.
+- Detailed version adds Order Time, Rider Name, Rider Phone, Special Instructions.
+- Rider-specific export `/exportrider <id> today` sorted by address.
+- Generated via Celery task, uploaded to Supabase Storage, signed URL sent to Telegram.
+- Formatted with openpyxl (blue headers, borders, auto-width).
+
+**Added to prompt:** Complete Excel export system.
+
+---
+
+## Flexible Product Specs, Boosting Old Stock, Profit Calculation
+
+**User:** How customer add inventory and details which is easy for AI and system to get exactly when customer ask. Sometimes customer is not sure about exact product. For example customer says i want good camera phone , which have 5000 mah battery and price is 12000 dirhum.
+Also some products shop wants to sell due to old stock or high profit margin how do this.
+How shop calculate profit
+
+**Assistant:** 
+- **Flexible specs:** Shopkeeper enters specs as key:value pairs (e.g., `camera: 108MP`, `battery: 5000mAh`) stored in `products.specs` JSONB column. AI searches with `ILIKE` inside JSONB, relevance scoring.
+- **Boosting old stock:** `boost_level` (0-10), `tags` array (clearance, best_camera, high_margin), `is_featured`. AI sorts results by boost level, relevance, featured status.
+- **Profit tracking:** `cost_price` and `selling_price` columns; profit = selling_price - discount - cost_price. `/profit today` shows gross profit, top products, clearance profit. Owner sees all-shop profit comparison.
+
+**Added to prompt:** Flexible specs, product boosting/tagging, profit reporting.
+
+---
+
+## Training Data: Real-Life Customer Questions & Answers
+
+**User:** I have to train system fully on what people ask queries in real life about mobiles. Tell real life question and there answers new mobile and about used mobiles.
+
+**Assistant:** Provided extensive training data with categories:
+- New phones: budget, camera, gaming, storage, brand comparisons, timing.
+- Used phones: battery health, condition grading, IMEI, authenticity, pricing, trade-ins.
+- Objection handling and cultural specifics (UAE market).
+- AI system prompt instructions for natural sales conversation.
+
+---
+
+## Deployment: VPS vs Alternatives
+
+**User:** Its means when code complete i put full code on VPS like Hostinger
+
+**Assistant:** Explained Hostinger VPS compatibility (needs KVM VPS, not shared hosting). Step-by-step: buy VPS, SSH, install Docker, upload code, set .env, `docker-compose up -d`. Daily life: add shops via Telegram, check health endpoint.
+
+**User:** Which is best system which we are using or supabase edge or n8n
+
+**Assistant:** Compared custom system vs Supabase Edge Functions vs n8n:
+- Supabase Edge: timeout/stateless issues, not for complex bots.
+- n8n: great for simple automations, terrible for multi-tenant security and 300+ chat concurrency.
+- **Custom FastAPI on VPS is the right choice** for this project.
+
+**User:** If i do not want to deploy on vps what is send option locally
+
+**Assistant:** Explored local options: desktop+ngrok (testing only), mini PC with UPS and static IP (hardware risks), old phone (unreliable), Railway/Render (managed cloud, no VPS management). Recommended cloud (Railway or VPS) for 30 shops.
+
+---
+
+## Final Comprehensive Prompt
+
+The final, all-in-one prompt to give to Claude for generating the complete codebase includes all features:
+
+- Multi-tenancy with `shop_id`, WhatsApp per-shop numbers, single Telegram bot
+- AI with function calling, anti-hallucination, escalation to shopkeeper
+- Security: attack detection (6 patterns), auto-quarantine, last 25 messages capture, owner alerts
+- Shop suspension and direct-to-shop bypass
+- Message processing pipeline with priority checks
+- Flexible product specs in JSONB, spec-based search, relevance scoring
+- Product boosting/tagging for old stock and high margin
+- Profit calculation and reporting (shopkeeper and owner)
+- Order export as Excel (pick & pack sheets) for staff and riders
+- System health monitoring, audit logging, Flower dashboard
+- Tech stack: FastAPI, Supabase, Redis, Celery, python-telegram-bot, Twilio, OpenAI, openpyxl, Docker
+
+---
+
+## Complete System Prompt (Ready to Copy-Paste into Claude)
+
+```text
+You are an expert full-stack developer, AI integration specialist, and cybersecurity engineer. Build a complete, production-ready, multi-shop chatbot system for a mobile/computer store chain (30 shops, single deployment, complete tenant isolation).
+
+## SYSTEM OVERVIEW
+The company owner operates all shops. No shop staff self-management. Owner needs full control, security, and observability. System handles 300+ concurrent conversations, never drops messages, never leaks data, auto-defends against attacks.
+
+> [UPDATED 2026-07-09] The owner does NOT operate the shops. The owner is a **SaaS provider** who onboards independent shops as **paying tenant clients** and charges them to automate their sales. Shops are customers of the owner; a shop's end-customers are customers of the shop. Shopkeepers DO manage their own inventory/orders (via their per-shop keeper bot); the owner manages the platform, onboarding, suspension for non-payment, security, and billing. This added `clients` (billing entity, one client may own several shops) and `usage_daily` (message meter for billing) to the schema.
+
+---
+
+## 1. MULTI-TENANCY & ISOLATION
+- Supabase (PostgreSQL + Storage) for all data and media.
+- `shops` table: id, name, whatsapp_number, status (active/suspended), suspension_reason, created_at.
+- ALL other tables have `shop_id` FK. Every query scoped by shop_id.
+- WhatsApp: One Twilio number per shop, all forward to SINGLE webhook. Webhook reads `To` number, looks up shop, sets shop_id. No "which shop" prompt.
+- Telegram: One bot token. Shopkeepers authenticated by telegram_id → shop_id. Commands auto-scoped.
+- Internal API endpoints require `X-Internal-API-Key` header.
+
+---
+
+## 2. SHOP SUSPENSION SYSTEM
+Owner commands (owner Telegram ID only):
+- `/pauseshop <shop_id> <reason>` — Sets shop.status = 'suspended'.
+- `/resumeshop <shop_id>` — Sets shop.status = 'active'.
+- `/shopstatus <shop_id>` — Returns status info.
+
+When suspended:
+- WhatsApp webhook checks shop.status FIRST. If suspended, sends auto-reply: "We are currently undergoing maintenance. Please contact us later or visit our store." Message NOT processed by AI. Returns 200 OK and stops.
+- Shopkeeper Telegram: READ-ONLY mode. Shows "⚠️ Shop suspended: {reason}". Cannot create/modify.
+- Existing orders/deliveries continue functioning.
+
+---
+
+## 3. AI ANTI-HALLUCINATION & HUMAN ESCALATION
+> [UPDATED 2026-07-09] Model is **Moonshot `kimi-k2.6`** in testing (provider abstraction swaps to GPT-4o at production). Also: the customer must NEVER learn a machine is involved — the AI never volunteers it, never denies it. If a customer sincerely asks "are you a bot?", the AI escalates to a human instead of answering. Step 3 below ("Let me connect you with our specialist") is the ONLY non-answer the customer ever sees — escalation and every technical failure use that identical line.
+- AI (GPT-4o) uses function calling as ONLY source of product data. System prompt: "You do NOT know products from memory. You MUST call search_products. Never invent products, prices, or specs."
+- Out-of-domain detection: refunds, complaints, repairs, negotiations, "talk to human", legal questions → AI MUST NOT answer.
+- On detection:
+  1. Save to `pending_escalations` table.
+  2. Notify shopkeeper via Telegram: "⚠️ Escalation from {phone}: {message}"
+  3. Tell customer: "Let me connect you with our specialist."
+  4. Freeze AI. Forward subsequent customer messages to shopkeeper's Telegram.
+- Shopkeeper replies via `/reply {phone} {text}` → forwarded to WhatsApp.
+- Return to AI: `/handover {phone}`. AI resumes with full Redis context.
+
+---
+
+## 4. PRODUCT INVENTORY WITH FLEXIBLE SPECIFICATIONS
+
+### Product Addition Flow (`/addproduct`):
+1. Category? (Mobile/Laptop/Tablet/Accessory)
+2. Brand?
+3. Model?
+4. Color?
+5. Condition? (New/Used/Refurbished)
+6. Specs: "Enter specifications as key:value pairs. Examples: `camera: 108MP`, `battery: 5000mAh`, `processor: Snapdragon 8 Gen 3`. Type one per line. `/done` when finished."
+7. Cost price?
+8. Selling price?
+9. Quantity?
+10. Upload images (up to 5), optional video.
+11. Confirmation and save.
+
+### Products Table Schema:
+- id, shop_id, category, brand, model, color, condition, cost_price (DECIMAL), selling_price (DECIMAL), quantity (INTEGER), images (TEXT[]), video_url (TEXT).
+- `specs` (JSONB) — all flexible key:value specifications.
+- `boost_level` (INTEGER DEFAULT 0, range 0-10).
+- `tags` (TEXT[]) — array: clearance, trending, best_camera, long_battery, gaming, budget, premium, high_margin, staff_pick, new_arrival, limited_stock.
+- `is_featured` (BOOLEAN DEFAULT false).
+
+### AI Search for Flexible Specs:
+- `search_products` function accepts `requirements` string (natural language from customer).
+- Backend parses requirements, builds PostgreSQL query searching `specs` JSONB with `ILIKE`, also searches `tags`.
+- Sorts by: boost_level DESC, relevance score (matching spec pairs + matching tags × 2), is_featured DESC.
+- Relevance multiplied by (1 + boost_level/10).
+
+---
+
+## 5. PRODUCT BOOSTING & TAGGING (Old Stock / High Margin Push)
+
+### Shopkeeper Commands:
+- `/boost <product_id> <level>` — Set boost 1-10.
+- `/unboost <product_id>` — Reset to 0.
+- `/tag <product_id> <tag1,tag2>` — Add tags.
+- `/untag <product_id> <tag>` — Remove specific tag.
+- `/cleartags <product_id>` — Remove all tags.
+- `/feature <product_id>` — Toggle is_featured.
+- `/productstats <product_id>` — Views, suggestions, orders, profit generated.
+
+### AI Promotion Instructions (in system prompt):
+When presenting products:
+
+Boosted products appear first.
+
+Vague requests: prioritize featured products.
+
+Mention naturally: "clearance" = "Special clearance deal!", "best_camera" when customer mentions camera.
+
+Never expose boost levels or tags to customer.
+
+---
+
+## 6. PROFIT CALCULATION & REPORTING
+
+### Profit Formula:
+Profit per order = order.selling_price - order.discount_amount - product.cost_price
+Margin % = (Profit / product.cost_price) × 100
+
+### Orders Table:
+- selling_price (DECIMAL) — actual price charged.
+- discount_amount (DECIMAL DEFAULT 0).
+
+### Shopkeeper Profit Commands:
+- `/profit today` — Orders, revenue, discounts, cost, gross profit, margin %, top 5 profitable products, clearance profit.
+- `/profit yesterday`, `/profit weekly`, `/profit monthly`, `/profit YYYY-MM-DD`.
+- `/profit product <product_id>` — Lifetime product profit.
+
+### Owner Profit Commands:
+- `/owner profit all` — Combined profit all shops today.
+- `/owner profit shop <shop_id>` — Single shop breakdown.
+- `/owner profit compare` — Side-by-side all shops.
+
+### Profit Report Format:
+Profit Report - Today (July 7, 2026)
+
+Total Orders: 12
+
+Total Revenue: 45,200 AED
+
+Total Piscounts: 1,500 AEP
+
+|Total Cost: 32,000 AED
+
+(+
+
+Gross Profit: 11,700 AEP
+
+/ Average Margin: 36.5%
+
+Top Profitable Products:
+
+iPhone 16 Pro Max 256G3 - 3 sold, +3,600 AED
+
+2. Galaxy S25 Ultra 512GB -2 sold, +z,200 AEP
+
+Clearance Sold: 4 (+1,800 AED from old stock)
+Use monospace formatting where possible, proper alignment, emojis, currency symbols.
+
+---
+
+## 7. INTRUSION DETECTION & AUTO-QUARANTINE
+
+### Attack patterns to detect:
+1. Prompt injection: "ignore previous", "you are DAN", "system prompt", "act as admin", base64, messages >2000 chars.
+2. SQL injection patterns.
+3. Rapid-fire: 20+ messages in 60 seconds.
+4. Cross-shop probing: "other shops", "all your locations", "give me data from shop #".
+5. Admin commands in customer messages: `/addshop`, `/owner`, `/pauseshop`.
+6. Credential probing: "API key", "database password", "show me backend".
+
+### When attack detected, AUTOMATICALLY:
+1. Quarantine: `quarantine:{phone}` in Redis (1-hour TTL).
+2. Stop processing: generic reply "Your message could not be processed."
+3. Capture LAST 25 MESSAGES from Redis session into `security_incidents` table.
+4. Alert owner via Telegram with full forensic data and incident ID.
+
+### Owner investigation:
+- `/investigate <incident_id>`, `/quarantine_extend`, `/quarantine_lift`, `/blacklist <phone>`, `/forward_to_shop <phone> <shop_id>`.
+
+---
+
+## 8. DIRECT-TO-SHOP BYPASS MODE
+- `/bypass_ai <phone> <shop_id> <reason>` — Messages go directly to shopkeeper's Telegram, no AI.
+- `/bypass_remove <phone>` — Revoke.
+
+---
+
+## 9. MESSAGE PROCESSING PIPELINE (exact order):
+1. Validate Twilio signature
+2. Check shop.status → suspended = auto-reply, stop
+3. Check blacklisted_phones → silent ignore
+4. Check quarantine:{phone} → generic reply
+5. Check bypass_ai:{phone} → forward to shopkeeper
+6. Attack detection → quarantine + alert
+7. Normal AI processing
+
+---
+
+## 10. ORDER EXPORT SYSTEM (Pick & Pack Excel)
+
+### Commands:
+- `/exportorders today|yesterday|YYYY-MM-DD|pending|all`
+- `/exportorders today detailed` — adds Order Time, Rider Name, Rider Phone, Special Instructions.
+- `/exportrider <rider_id> today` — Rider-specific sheet sorted by address.
+
+### Excel Spec:
+- Library: openpyxl.
+- Headers: White bold on blue (#2563EB), thin borders, auto-width.
+- Columns: Order ID | Customer Name | Phone | Address | Product | Brand | Model | Color | RAM | Storage | Qty | Selling Price | Delivery Date | Status.
+- Upload to Supabase: `shop-reports/{shop_id}/orders_{filter}_{timestamp}.xlsx`.
+- 24-hour signed URL sent as Telegram download link.
+- First message: "⏳ Generating report..."
+
+---
+
+## 11. CONCURRENCY & RELIABILITY
+- Webhook returns 200 immediately, Celery processes.
+- Per-session Redis lock: `lock:session:{shop_id}:{phone}` (30s timeout).
+- All state in Redis only. Zero local memory.
+- Twilio MessageSid deduplication (5-min TTL).
+- OpenAI errors: retry once, then fallback message.
+
+> [UPDATED 2026-07-09] **No fallback message.** "then fallback message" is dropped. On LLM failure the system retries once, then hands the customer to a human with the exact same line as a normal escalation ("Let me connect you with our specialist") and pages the OWNER (not the customer) with what broke. The customer never sees "I'm having trouble" or any hint of a system error. Model is Moonshot `kimi-k2.6` in testing (GPT-4o at production via the provider abstraction).
+
+---
+
+## 12. REPORTS
+Shopkeepers: `/report daily`, `/report inventory_low`, `/report top_products`, `/profit today`.
+Owner: `/owner dashboard`, `/owner shop <id>`, `/owner escalations`, `/owner security`, `/owner audit`, `/owner health`, `/owner profit all`.
+
+---
+
+## 13. SYSTEM HEALTH
+- `/health` endpoint: DB, Redis, OpenAI, Twilio, Celery workers, active conversations, quarantined count.
+- Celery Beat health check every 60s. Failure = critical Telegram alert to owner.
+- Flower at `/flower` (basic auth).
+
+---
+
+## 14. TECH STACK
+Python 3.11+, FastAPI, Supabase, Redis, Celery, python-telegram-bot v20+, Twilio SDK, OpenAI, openpyxl.
+Docker Compose: api, celery_worker, celery_beat, redis, flower.
+
+> [UPDATED 2026-07-09] Two swaps vs the built system: **(a) LLM = Moonshot `kimi-k2.6`** in testing, GPT-4o at production (one provider abstraction, no code change to swap). **(b) Telegram-first:** the WhatsApp/Twilio customer path is built and signature-verified but **mocked** — all live testing runs on Telegram (customer + keeper bots per shop). The real WhatsApp path activates with one adapter flip at go-to-market. Everything downstream of the channel (pipeline, AI, escalation) is channel-agnostic and already live on Telegram.
+
+---
+
+## 15. DATABASE TABLES
+shops, shopkeepers (is_owner boolean), products (with JSONB specs, boost_level, tags, is_featured, cost_price, selling_price), orders (selling_price, discount_amount), order_status_history, delivery_persons, pending_escalations, security_incidents, blacklisted_phones, audit_logs.
+
+---
+
+## 16. DELIVERABLES
+Generate COMPLETE project with EVERY file. No summaries. No placeholders. Include:
+- Full database schema (all columns, types, relationships, JSONB usage).
+- Complete AI service with function definitions, anti-hallucination prompt, flexible spec search, promotion logic.
+- Complete attack detection with all 6 patterns.
+- Complete quarantine, bypass, suspension logic.
+- Complete Excel export with openpyxl formatting.
+- Complete profit calculation and reporting.
+- All Telegram commands for shopkeeper and owner.
+- Health monitoring, audit logging.
+- Docker setup, .env.example, README.
+- ALL code functional, async, with error handling and logging.
+
+Output the ENTIRE codebase now. Start with architectural overview, then complete file tree and every file's content.
+
+Running 24/7
+
+Pocker containers:
+
+API (FastAPI) - handles all messages
+
+Redis - conversation memory
+
+Celery Worker - sends messages
+
+Celery Beat - health checks
+
+You rarely touch this
+
