@@ -1,0 +1,12 @@
+# Normalize all text to LF in the repo (consistent diffs across Windows/Linux CI).
+* text=auto eol=lf
+
+# Shell scripts MUST stay LF even when checked out on Windows, or they break on Linux/CI.
+*.sh text eol=lf
+
+# Treat owner-supplied media + sessions as binary (belt-and-braces; also gitignored).
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.mp4 binary
+*.session binary
