@@ -25,6 +25,11 @@ venv/
 *.log
 *.sqlite3
 
+# Celery beat runtime state (regenerated on each run — never commit)
+celerybeat-schedule*
+*.pid
+dump.rdb
+
 # Telethon userbot sessions (secrets — ADR-005)
 *.session
 *.session-journal
