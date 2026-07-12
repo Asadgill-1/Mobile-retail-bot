@@ -1,6 +1,6 @@
 # Multi-Shop Chatbot
 
-> **Status:** 🟢 Stage 0 (Foundations) complete · application logic starts at Stage 1
+> **Status:** 🟢 Stages 0–12 core complete + full live QA audit + delivery/rider/COD (Stage 12b) · 235 tests passing · next: Stage 13 (WhatsApp/Twilio cutover)
 > **Spec:** [`docs/SPEC-source.md`](docs/SPEC-source.md) (immutable)
 > **Current state:** [`docs/07-CURRENT-STATE.md`](docs/07-CURRENT-STATE.md)
 

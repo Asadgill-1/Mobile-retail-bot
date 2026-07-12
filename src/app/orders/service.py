@@ -26,9 +26,39 @@ logger = logging.getLogger(__name__)
 # shop does thousands of orders a day.
 _CLEARANCE = "clearance"
 
+# Post-confirmation fulfilment chain (SPEC §6 delivery). A shopkeeper advances an order one step
+# at a time; the customer is told at each step. Statuses match the orders.status CHECK constraint.
+_DELIVERY_FLOW = ("confirmed", "packed", "shipped", "delivered")
+_DELIVERY_MSG = {
+    "packed": "📦 Order #{num} is packed and ready to go.",
+    "shipped": "🚚 Order #{num} is on its way to you!",
+    "delivered": "✅ Order #{num} has been delivered. Thank you for shopping with {shop}! 🙏",
+}
+
+
+def _is_next_step(current: str, target: str) -> bool:
+    """True iff `target` is the immediate next fulfilment step after `current` (SPEC §6).
+
+    Pure: no skipping (confirmed→delivered), no going backwards, nothing from outside the chain
+    (a draft/cancelled order). This is the whole delivery-transition rule, unit-testable.
+    """
+    return (
+        target in _DELIVERY_MSG
+        and current in _DELIVERY_FLOW
+        and _DELIVERY_FLOW.index(target) == _DELIVERY_FLOW.index(current) + 1
+    )
+
 
 class NoPendingDraft(Exception):
     """`/confirmorder` or `/rejectorder` for an order this shop has no pending draft of."""
+
+
+class OrderNotFound(Exception):
+    """No order with this number in this shop (unknown, or another shop's)."""
+
+
+class InvalidTransition(Exception):
+    """A delivery-status change that isn't the next step in the fulfilment chain."""
 
 
 class OutOfStock(Exception):
@@ -426,6 +456,75 @@ async def confirm_order(shop: Shop, order_number: int, client: Any | None = None
     return draft
 
 
+async def advance_delivery(
+    shop: Shop, order_number: int, new_status: str, client: Any | None = None
+) -> dict:
+    """`/deliveryupdate <#> packed|shipped|delivered` — move one order one step down the fulfilment
+    chain and tell the customer. Rejects any move that isn't the immediate next step (SPEC §6):
+    no skipping (confirmed→delivered), no going backwards, no touching a draft/cancelled order.
+    """
+    target = (new_status or "").strip().lower()
+    if target not in _DELIVERY_MSG:  # only packed|shipped|delivered are valid destinations
+        raise InvalidTransition("status must be one of: packed, shipped, delivered")
+    order = await _get_order(shop.id, order_number, client)
+    current = order["status"]
+    if not _is_next_step(current, target):
+        raise InvalidTransition(f"cannot move order #{order_number} from '{current}' to '{target}'")
+
+    await _set_status(order["id"], target, "shopkeeper", client)
+    msg = _DELIVERY_MSG[target].format(num=order_number, shop=shop.name)
+    await send_to_customer(shop, order["phone"], msg)
+    await _remember_to_customer(shop, order["phone"], msg)  # AI stays in sync with fulfilment state
+    return order
+
+
+# Statuses at which a rider may be assigned: the order is a real, confirmed order still in flight.
+# Not a draft (unconfirmed), not delivered (done), not cancelled.
+_ASSIGNABLE = ("confirmed", "packed", "shipped")
+
+
+async def assign_delivery(
+    shop: Shop, order_number: int, rider_id: UUID, client: Any | None = None
+) -> dict:
+    """`/assigndelivery <#> <rider_id>` — attach a rider to a confirmed order and push them the
+    delivery details. Both order and rider are tenant-guarded (must belong to this shop). Returns
+    `{rider, notified}` so the shopkeeper is told whether the rider has linked Telegram yet.
+    """
+    from app.riders.service import cod_balance, get_rider
+    from app.telegram_bot.notify import send_to_rider
+
+    order = await _get_order(shop.id, order_number, client)  # raises OrderNotFound
+    if order["status"] not in _ASSIGNABLE:
+        raise InvalidTransition(
+            f"order #{order_number} is '{order['status']}' — assign a rider to a confirmed order"
+        )
+    rider = await get_rider(shop.id, rider_id, client)  # raises RiderNotFound
+
+    # COD = the net charge; custody goes to 'offered' — the rider must /accept the pickup.
+    cod = Decimal(str(order["selling_price"])) - Decimal(str(order["discount_amount"]))
+    await _set_rider(order["id"], rider_id, cod, client)
+
+    notified = False
+    if rider.get("telegram_id"):
+        outstanding = await cod_balance(shop.id, rider_id, client)  # cash they already hold
+        p = order.get("products") or {}
+        name = f"{p.get('brand', '')} {p.get('model', '')}".strip() or "item"
+        text = (
+            f"🛵 New delivery — order #{order_number} ({shop.name})\n"
+            f"Customer: {order['customer_name']} ({order['phone']})\n"
+            f"Item: {name} ×{order['quantity']}\n"
+            f"Address: {order['address']}"
+            + (f"\nWhen: {order['delivery_date']}" if order.get("delivery_date") else "")
+            + (f"\nNote: {order['special_instructions']}" if order.get("special_instructions") else "")
+            + f"\n\n💵 Collect (COD): {cod} AED"
+            f"\n📊 Cash you already hold: {outstanding} AED"
+            f"\n\nGot the product?  /accept {order_number}"
+            f"\nNot handed to you?  /notreceived {order_number}"
+        )
+        notified = await send_to_rider(int(rider["telegram_id"]), text)
+    return {"rider": rider, "notified": notified, "cod": cod}
+
+
 async def reject_order(
     shop: Shop, order_number: int, reason: str | None = None, client: Any | None = None
 ) -> dict:
@@ -548,6 +647,24 @@ async def _get_draft(shop_id: UUID, order_number: int, client: Any | None) -> di
     return draft
 
 
+async def _get_order(shop_id: UUID, order_number: int, client: Any | None) -> dict:
+    """Fetch one order by number within this shop, any status (delivery updates act post-confirm)."""
+    sb = _sb(client)
+
+    def _q() -> dict | None:
+        rows = (
+            sb.table("orders").select(_DRAFT_SELECT)
+            .eq("shop_id", str(shop_id)).eq("order_number", order_number)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    order = await asyncio.to_thread(_q)
+    if order is None:
+        raise OrderNotFound(order_number)  # unknown or another shop's — same message either way
+    return order
+
+
 async def _cancel_pending_drafts(shop_id: UUID, identity: str, client: Any | None) -> None:
     sb = _sb(client)
 
@@ -567,6 +684,17 @@ async def _set_status(order_id: str, status: str, changed_by: str, client: Any |
         sb.table("order_status_history").insert(
             {"order_id": order_id, "status": status, "changed_by": changed_by}
         ).execute()
+
+    await asyncio.to_thread(_q)
+
+
+async def _set_rider(order_id: str, rider_id: UUID, cod: Decimal, client: Any | None) -> None:
+    sb = _sb(client)
+
+    def _q() -> None:
+        sb.table("orders").update(
+            {"rider_id": str(rider_id), "cod_amount": str(cod), "custody": "offered"}
+        ).eq("id", order_id).execute()
 
     await asyncio.to_thread(_q)
 

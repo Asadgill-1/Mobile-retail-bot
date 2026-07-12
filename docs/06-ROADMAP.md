@@ -91,7 +91,7 @@
 - [x] `orders.export_orders`/`export_rider` (+ `orders_for_export`/`rider_orders_for_export`, drafts excluded, `pending`=confirmed, reuses `parse_period`)
 - [x] `/exportorders [today|yesterday|YYYY-MM-DD|pending|all] [detailed]` + `/exportrider <rider_id> [period]` (sorted by address) on the keeper bot
 - [x] Module + tests (4 excel + `__main__` self-check; **168 total**); **live round-trip verified** (query→workbook→upload→download signed URL→valid xlsx→cleanup)
-- [ ] `/exportrider` ships **empty** until a flow assigns `orders.rider_id` (Q-006) — export is testable-but-empty like profit was pre-booking
+- [x] `/exportrider` now produces real data — `/assigndelivery` assigns `orders.rider_id` (Q-006 resolved, Stage 12b)
 
 ### Stage 10 — Reports + dashboards + health (§12, §13; ADR-006) — beat flush ✅
 > **`celery_beat` now schedules the usage-flush.** This stage is where beat and the real `/health` are born. See `07-CURRENT-STATE.md` → "Missing infrastructure".

@@ -1,12 +1,12 @@
 # Module: orders
 
 ## Responsibility
-Order model, status history, profit calculation (SPEC §6 formula). Owns `orders`, `order_status_history`, `delivery_persons` queries.
+Order model, status history, profit calculation (SPEC §6 formula), fulfilment + rider assignment. Owns `orders`, `order_status_history`.
 
 ## Boundaries
-- **Owns:** order writes, hybrid booking (draft/confirm/reject), profit math + aggregation.
-- **Exposes:** `create_order(...)`, `draft_order(...)`, `confirm_order(...)`, `reject_order(...)`, `list_drafts(...)`, `profit_summary(shop_id, start, end)`, `line_profit(...)`, `ProfitSummary`; export: `export_orders(...)`, `export_rider(...)`, `orders_for_export(...)`, `rider_orders_for_export(...)`.
-- **Does NOT touch:** report formatting (in `reports/`); Excel styling + Storage (in `utils/excel.py` + `utils/storage.py`); the LLM tool schema (in `llm/`, executed by `ai/orchestrator`).
+- **Owns:** order writes, hybrid booking (draft/confirm/reject), fulfilment status (`packed→shipped→delivered`), rider assignment (`orders.rider_id`/`cod_amount`/`custody`), profit math + aggregation.
+- **Exposes:** `create_order(...)`, `draft_order(...)`, `confirm_order(...)`, `reject_order(...)`, `advance_delivery(...)`, `assign_delivery(...)`, `list_drafts(...)`, `profit_summary(shop_id, start, end)`, `line_profit(...)`, `ProfitSummary`; export: `export_orders(...)`, `export_rider(...)`, `orders_for_export(...)`, `rider_orders_for_export(...)`.
+- **Does NOT touch:** report formatting (in `reports/`); Excel styling + Storage (in `utils/excel.py` + `utils/storage.py`); the LLM tool schema (in `llm/`, executed by `ai/orchestrator`); rider onboarding, Telegram linking, custody accept/reject, delivery finalization + COD ledger (all in `riders/service.py` — this module only *assigns* a rider to an order, `riders` owns everything after that).
 
 ## Hybrid booking (Q-017 → ADR-010)
 AI drafts, shopkeeper confirms. `draft_order` (from the `place_order` tool) checks stock, applies any
@@ -22,6 +22,16 @@ system tells the customer. `draft_order` uses only a shop-**approved** price (`_
 list. Per-shop `set_negotiation` (`/negotiation on|off`) — the off check is read **fresh** from the DB
 every haggle, so a shop that just turned it off gives no discount even before its bot restarts. The old
 secret `min_price` floor was removed in migration 004.
+
+## Fulfilment + rider assignment (SPEC §6/§10)
+`advance_delivery(shop, order_number, status)` moves a confirmed order one step down
+`confirmed→packed→shipped→delivered` — `_is_next_step` (pure) rejects any skip, backward move, or
+touch on a draft/cancelled order. Each step tells the customer. `assign_delivery(shop, order_number,
+rider_id)` attaches a rider to a `confirmed|packed|shipped` order: sets `cod_amount` (net =
+`selling_price − discount_amount`) and `custody='offered'`, then pushes the rider a card with the
+COD amount, the cash they already hold (`riders.cod_balance`), and `/accept`/`/notreceived`. Delivery
+finalization (cash, `delivered_at`, the `cod_ledger` 'collect' row) happens in `riders.deliver_order`
+once the rider accepts custody — see `riders/README.md` for the handshake + ledger rules.
 
 ## Excel export (SPEC §10 — Stage 9)
 `orders_for_export(shop_id, filter)` (`today|yesterday|YYYY-MM-DD|pending|all`; **drafts never
@@ -43,14 +53,14 @@ returning `(filename, 24h signed URL, row_count)`. Wired to keeper `/exportorder
 | Path | Role | Stage |
 |------|------|-------|
 | `models.py` | `ProfitSummary` + pure `line_profit` (money path) | 8 ✅ |
-| `service.py` | `create_order` (tenant-guarded) + `profit_summary` (range aggregation) | 8 ✅ |
+| `service.py` | `create_order`/booking/negotiation (tenant-guarded), `profit_summary`, `advance_delivery`, `assign_delivery` | 8/8b/10 ✅ |
 
 ## Status
-🟢 profit live (Stage 8). `create_order` is the **only** writer of `orders`; it reuses
-`products.service.get_product` as the tenant guard (product must belong to the shop). Aggregation
-fetches the range + embeds `products(cost_price,tags)` and sums in Python (`ponytail:` — RPC if a
-shop does thousands/day).
+🟢 done through fulfilment + rider assignment. `create_order` is the **only** writer of new `orders`
+rows; it reuses `products.service.get_product` as the tenant guard (product must belong to the shop).
+Aggregation fetches the range + embeds `products(cost_price,tags)` and sums in Python (`ponytail:` —
+RPC if a shop does thousands/day). Booking is AI-drafts/shop-confirms (ADR-010); negotiation is
+human-in-the-loop; fulfilment (`packed→shipped→delivered`) and rider assignment (with COD) are live
+— see `riders/README.md` for the delivery/COD/custody flow this hands off to.
 
-**Not built:** a customer/shopkeeper **order-placement flow** (SPEC never specs one — today orders
-exist only via `create_order()` in tests/seeds), `update_status`, `/productstats` (Q-014, no view
-data). Delivery model still under-specified (Q-006). Spec ref: §6, §15.
+**Not built:** `/productstats` (Q-014, no view data). Spec ref: §6, §10, §15.

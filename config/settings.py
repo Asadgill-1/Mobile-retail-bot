@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # `telegram_bot_token` = the OWNER control bot (admin commands).
     telegram_bot_token: str = Field(..., description="OWNER control bot token (admin commands)")
     owner_telegram_id: int = Field(..., description="Owner's Telegram user ID (owner-only commands)")
+    # One global rider bot (like the owner bot): riders across all shops link their Telegram to it
+    # and receive delivery assignments. Empty → rider bot not run (feature off).
+    telegram_rider_bot_token: str = Field("", description="Global rider bot token (delivery assignments)")
     telegram_webhook_secret: str = Field("", description="Optional webhook secret token")
     # JSON list of per-shop bots: [{shop_key, keeper_token, customer_token, customer_chat_id}, ...].
     # Used by the InMemoryTenantRepo seed (tests/offline). Live runs read tokens from the

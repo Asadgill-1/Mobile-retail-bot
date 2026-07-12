@@ -40,12 +40,12 @@
 - Resolution (2026-07-07): owner supplied an **OpenRouter** API key (OpenAI-compatible aggregator) which routes to `moonshotai/kimi-k2` — honoring "use Moonshot for testing" via a single OpenAI-compatible client. Wired into `.env` (`AI_PROVIDER=openrouter`). Verified: a real chat completion returns 200 + a completion. ADR-004 revised.
 - Status: resolved. `LLMClient.chat()` itself is still Stage 4 (function-calling + anti-hallucination), but the key is live and `is_configured=True`.
 
-### Q-006 — Rider / delivery model details?
-- Context: SPEC mentions `delivery_persons`, rider name/phone in Excel export (`/exportrider <rider_id>`), but the data model is thin (no zones, shift, capacity, geo).
-- Options: minimal model (id/name/phone) / richer model (zone, shift, vehicle).
-- Decision needed from: owner.
-- Status: open.
-- Blocking: Stage 8 (orders) and Stage 9 (Excel `/exportrider`). Propose minimal now, extend later.
+### Q-006 — Rider / delivery model details?  ✅ resolved (Stage 12b)
+- Context: SPEC mentions `delivery_persons`, rider name/phone in Excel export (`/exportrider <rider_id>`), but the data model is thin (no zones, shift, capacity, geo). No flow ever assigned a rider to an order, so `/exportrider` shipped testable-but-empty.
+- Resolution (2026-07-12, owner decided): **minimal model, owner-onboarded.** Owner runs `/addrider <shop> <phone> <name>`; a shop may have more than one rider. Rider links their own Telegram to one global rider bot by sharing their contact (phone-matched to their `delivery_persons` row(s) — migration 007 adds `telegram_id`). No zones/shift/vehicle — matches the "minimal now" option; extend later if the business needs it.
+- Built alongside: a **custody handshake** (rider must `/accept`/`/notreceived` a handover before `/deliver`, answer written once — an owner-specified audit mechanism so neither shop nor rider can dispute who had the product) and **COD tracking** (migration 008: `orders.cod_amount`/`cash_received`/`custody`/`delivered_at`; append-only `cod_ledger`; keeper `/reconcilecod` reconciles end-of-day cash by the owner's formula: previous balance + today's COD − handed over = remaining).
+- Full detail: `docs/07-CURRENT-STATE.md` Stage 12b, `src/app/riders/README.md`, `docs/10-DATA-MODEL.md`.
+- Status: **resolved.** `/exportrider` now produces real data — `orders.rider_id` is set by `/assigndelivery`.
 
 ### Q-007 — Currency: hardcode AED or support multi-currency?
 - Context: All reports/examples use AED (SPEC §6). Multi-currency adds a `currency` column + FX.

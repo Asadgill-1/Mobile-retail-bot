@@ -214,6 +214,7 @@ async def test_build_all_applications_yields_owner_plus_per_shop(monkeypatch):
     import app.core.config as cfg
 
     monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", _SHOP_BOTS_ENV)
+    monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "")  # rider bot off for this case
     from app.db.in_memory import InMemoryTenantRepo
     from app.tenants.service import TenantService
 
@@ -226,6 +227,23 @@ async def test_build_all_applications_yields_owner_plus_per_shop(monkeypatch):
     # owner app has no shop in bot_data; shop apps do
     assert "shop" not in apps[0].bot_data
     assert "shop" in apps[1].bot_data
+
+
+@pytest.mark.asyncio
+async def test_build_all_applications_appends_rider_bot_when_configured(monkeypatch):
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", _SHOP_BOTS_ENV)
+    monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "9:riderfake")
+    from app.db.in_memory import InMemoryTenantRepo
+    from app.tenants.service import TenantService
+
+    repo = InMemoryTenantRepo()
+    repo.seed_default()
+    apps = await bot._build_all_applications(TenantService(repo))
+    # owner + 2*(keeper+customer) + 1 global rider = 6; rider is last and shop-less
+    assert len(apps) == 6
+    assert "shop" not in apps[-1].bot_data
 
 
 # --- Stage 5: keeper bot gets REAL product commands, not stubs ---

@@ -3,10 +3,10 @@
 > **Most important file for an incoming LLM.** Says exactly where the project is.
 > Update at the end of every work session, before handoff.
 
-**Last updated:** 2026-07-10
-**Current stage:** Stage 12 — production hardening (§16): audit logging ✅ + structured logging ✅ (CI / provider-flip are deploy-time, deferred)
+**Last updated:** 2026-07-12
+**Current stage:** Stage 12 core + **full live QA audit** + delivery/rider/COD build-out (§6/§10). Next = Stage 13 (WhatsApp/Twilio cutover).
 **Stage #:** 12
-**Overall health:** 🟢 Stages 0–12 core complete (Stage 10 §12 tail minor); **185 tests passing** (no network in the suite); 5 bots polling live; SPEC §9 pipeline fully live. **Orders exist** (AI drafts → `/confirmorder` → customer told). **Excel export live.** **`celery_beat` runs two jobs.** **Real `/health` + owner dashboards.** **§11 hardening live** (per-session lock + MessageSid dedup + Celery acks_late). **§16 audit trail live:** every privileged owner/keeper command writes `audit_logs` (via the two command wrappers); `/owner audit` reads it back. **Structured logging** (`core.setup_logging`) on both the bot and API processes. All live-verified against the DB + real Redis + a real Celery worker on Memurai. Real Redis local (Memurai :6379).
+**Overall health:** 🟢 Stages 0–12 core complete + a full 8-goal live QA audit (see below) + the delivery lifecycle finished (fulfilment status, rider onboarding, custody handshake, COD ledger). **235 tests passing** (no network in the suite); 6 bots polling live (owner + per-shop keeper/customer + **global rider bot**). SPEC §9 pipeline fully live. **Orders exist end to end**: AI drafts → `/confirmorder` → `/deliveryupdate`/rider delivery → `delivered`. **Excel export live** (rider sheets now populated — Q-006 resolved). **`celery_beat` runs two jobs.** **Real `/health` + owner dashboards.** **§11 hardening live** (per-session lock + MessageSid dedup + Celery acks_late). **§16 audit trail live:** every privileged owner/keeper command writes `audit_logs` (via the two command wrappers); `/owner audit` reads it back. **Structured logging** (`core.setup_logging`) on both the bot and API processes. All live-verified against the DB + real Redis + a real Celery worker on Memurai. Real Redis local (Memurai :6379).
 **LLM:** official Moonshot `kimi-k2.6` direct (ADR-004 rev.2 — OpenRouter dropped). **`AI_TEMPERATURE` must be `1.0`**: `kimi-k2.*` 400s on any other value, which would silently degrade every reply to the fallback message.
 
 ---
@@ -179,7 +179,7 @@ Verified live on `kimi-k2.6`: simulated provider outage → customer sees only *
 - `migrations/005_reports_bucket.sql` (**applied live**) — creates the private `shop-reports` bucket (deferred from `002` until something wrote here). `config/settings.py` += `supabase_reports_bucket`.
 - **Live-verified** against the real project: `orders_for_export` (live query) → `orders_workbook` → `upload_report` → **downloaded the signed URL** → valid `.xlsx` (header `Order ID`, 5,325 bytes) → object deleted. Full round-trip through real Supabase Storage.
 - Tests: `tests/utils/test_excel.py` (4: header + `#2563EB` style, row mapping + net price, detailed rider columns, base sheet has no detail columns) + `excel.py` `__main__` self-check. **168 total green.** Storage upload is network → live-verified, not in the suite.
-- **Empty-but-real (ponytail):** `/exportrider` works today but nothing assigns `rider_id` to orders yet (the draft/confirm flow leaves it null), so rider sheets are empty until rider-assignment lands (Q-006). Export ships testable-but-empty, exactly like profit did before booking.
+- **Empty-but-real (ponytail):** `/exportrider` works today but nothing assigns `rider_id` to orders yet (the draft/confirm flow leaves it null), so rider sheets are empty until rider-assignment lands (Q-006). Export ships testable-but-empty, exactly like profit did before booking. *(As of Stage 12b: rider assignment is built — `/exportrider` now has real data. This note is historical, describing Stage 9 at the time.)*
 
 ### Stage 10 (in progress) — beat usage-flush (SPEC §12/§13; ADR-006)
 - `tasks/celery_app.py` — **`celery_app.conf.beat_schedule` is born.** `flush-usage-counters` runs `flush_usage_counters` hourly (`crontab(minute=15)`, `conf.timezone="UTC"`). `celery_beat` was booting and scheduling nothing; now it has a job.
@@ -213,17 +213,73 @@ Verified live on `kimi-k2.6`: simulated provider outage → customer sees only *
   - **Prod Docker** — `Dockerfile` + `docker-compose.yml` already exist (Stage 0) and are prod-usable; add an env-specific compose override at deploy.
   - **Error-handling sweep** — the ADR-009 posture already holds (notify/pipeline/orchestrator/audit never raise; DB-write failures still hold security blocks). No specific defect to fix — a blind sweep isn't a lazy-good task; revisit if a real gap surfaces.
 
+### Stage 12b — full live QA audit + delivery/rider/COD build-out (SPEC §6, §10), 2026-07-11/12
+
+**8-goal live audit** (customer chat · escalation/security · inventory · order/delivery · owner
+oversight · concurrency/edge · reports/accuracy · UX/errors), driven end-to-end against the live
+Telegram bots + live Supabase, not mocks. Found and fixed:
+
+- **[Found+fixed] Over-length false-quarantine.** A clean message >2000 chars (no injection content)
+  tripped `detect_attack`'s length rule and quarantined a paying customer. Root cause was one rule in
+  `security/detectors.py::detect_attack` (`len(text) > MAX_MESSAGE_CHARS` → `attack_type="injection"`).
+  Length alone no longer quarantines; injection phrases/base64/SQL are still caught *inside* a long
+  message. `messaging/pipeline.py` now handles the over-length case on its own terms — a friendly
+  "shorten it to a sentence or two" reply (`action="too_long"`), not a security block.
+- **[Built] Fulfilment status** — `orders.advance_delivery` + keeper `/deliveryupdate <#>
+  packed|shipped|delivered`, one step at a time (`_is_next_step`, pure, no skipping/backward/off-flow),
+  customer told at each step.
+- **[Decided+built] Timezone — UAE-only, no per-shop column.** Owner confirmed the business is UAE-only,
+  so `reports.service` uses a single `DUBAI = timezone(+4)` day boundary (`parse_period`/`_day`), not
+  UTC. A per-shop `timezone` column was considered and explicitly rejected — not needed for a
+  single-timezone business, would have been unused configurability.
+- **[Decided+built] Rider onboarding + assignment + COD (Q-006 resolved).** Owner decisions: owner
+  onboards riders (shop can have >1); one global rider bot (`@Rider001_bot`, token delivered via a
+  root file, wired into `.env`, file deleted); rider links Telegram by sharing their contact (phone
+  matched, `riders/service.py::_normalize_phone`, UAE 9-digit form). Built:
+  - `riders/service.py` (new module) + `migrations/007_rider_telegram.sql` (`delivery_persons.telegram_id`)
+    and `migrations/008_cod_custody.sql` (`orders` gains `cod_amount`/`cash_received`/`delivered_at`/
+    `custody`/`custody_at`/`cancel_remarks`; new `cod_ledger` table) — **both applied live**.
+  - Owner: `/addrider <shop> <phone> <name>`, `/riders <shop>`.
+  - Keeper: `/riders`, `/assigndelivery <order#> <rider_id>` (card shows COD + rider's running
+    balance), `/reconcilecod <rider|name> <amount>` (owner's exact formula: *previous balance + today
+    COD − handed over = remaining*; same trail pushed to the rider).
+  - Rider bot (`build_rider_application`, new global bot alongside owner/keeper/customer):
+    `/mydeliveries`, `/accept <#>` / `/notreceived <#>` (**custody handshake** — the audit mechanism
+    the owner asked for: rider can't claim "never got it," shop can't claim "we gave it"; the answer
+    is written once, `/deliver` is blocked until `/accept`), `/deliver <#>` (registers time, then asks
+    cash received, finalizes on the reply — status delivered, `cod_ledger` 'collect' row, customer +
+    shop notified), `/canceldelivery <#> <remarks>` (remarks mandatory, stock restored), `/myreport
+    [period | from to]`.
+  - Money is an **append-only ledger** (`collect`/`handover` rows), balance always `Σcollect −
+    Σhandover` — never a mutable counter that can drift.
+- **Live-verified** (not just unit-tested): full lifecycle on Shop 01 order #7 — assign (COD card
+  pushed) → `/accept` (re-deciding blocked) → `/deliver` (cash 1500) → `/myreport` shows it →
+  `/reconcilecod` (1650 handed over → 50 AED remaining) — every DB row checked byte-for-byte against
+  the formula. Owner's Telegram received the rider assignment card, the delivery confirmations, and a
+  summary — this is genuinely running on the live bots, not a demo.
+- Tests: `tests/riders/test_service.py` (new, 26: phone normalize, custody transitions incl.
+  write-once, deliverable matrix, cash parsing, report windows, COD trail math, deliver/cancel/
+  reconcile flows), `tests/orders/test_service.py` +COD-aware assignment tests, `tests/reports/
+  test_service.py` +Dubai-offset assertion, `tests/telegram_bot/test_bot.py` +rider-bot-in-runner.
+  **235 total green** (was 185 at Stage 12 close, +50 across the audit + delivery/rider/COD work).
+- **Low-severity, reported not fixed** (revisit if it matters): `delivery_date` isn't captured to a
+  structured column separately from free text; customer phone is absorbed into the address field on
+  some paths; the attack-forensics snapshot doesn't include the triggering message itself; no
+  DB-level `selling_price >= cost_price` guard (relies on app-layer discount bounds in
+  `approve_price`).
+
 ## 🔵 In progress
 
-- _(nothing — Stage 12 core complete, awaiting Stage 13)_
+- _(nothing — Stage 12 + audit + delivery/rider/COD complete, awaiting Stage 13)_
 
 ## ⏭️ Next up (Stage 13 — WhatsApp/Twilio cutover, §1; + small tails)
 
 1. **Stage 13:** activate the real Twilio path (was mocked, ADR-002) — **this is where `celery_worker` finally gets a producer**; Twilio **outbound** client (the worker currently discards `result.reply`, `ponytail:` at `tasks.py:42`); wire `self.retry` on the pipeline's `locked` action; run the 300+-concurrent load test; owner cutover checklist.
 2. **Deploy-time (Stage 12 tail):** flip `AI_PROVIDER=openai`; add CI once the repo exists.
 3. **Stage 10 §12 tail (optional):** `/owner usage` (Redis-today + `usage_daily`-past merge), `/owner shop <id>`, shopkeeper `/report daily|inventory_low|top_products`, `/productstats` (Q-014).
+4. **Reported, not built (low severity — see Stage 12b):** structured `delivery_date` column, customer phone separated from address, attack-forensics snapshot including the triggering message, DB-level `selling_price >= cost_price` guard.
 
-> **Q-012 / Q-013 / Q-014 are open** (`12-OPEN-QUESTIONS.md`): SPEC §4's ranking formula contradicts itself (boost as hard sort key vs relevance multiplier); SPEC §4 literally excludes brand/model from search; `/productstats` has no data source. All three implemented/deferred with the sensible reading — **don't silently re-decide them.**
+> **Q-012 / Q-013 / Q-014 are open** (`12-OPEN-QUESTIONS.md`): SPEC §4's ranking formula contradicts itself (boost as hard sort key vs relevance multiplier); SPEC §4 literally excludes brand/model from search; `/productstats` has no data source. All three implemented/deferred with the sensible reading — **don't silently re-decide them.** **Q-006 (rider model) is now resolved** — see Stage 12b above.
 
 > **Folder rule:** create whatever folders a capability needs (organized by purpose, no loose root files) and register each in `08-FILE-MAP.md`. See `AGENTS.md` §5.
 > **Pipeline naming:** SPEC §9 enumerates **7 ordered steps**, not 9 — docs historically said "9-step"; treat "SPEC §9 pipeline" as the 7-step list.
@@ -255,7 +311,7 @@ Notes for whoever builds these:
 - Q-003 Supabase creds ✅ resolved + migration applied — real project `uwlczgwlkqlflpveeykj`; `001_init.sql` pushed via the Supabase MCP server (`mcp_servers/supabase_server.py`, ADR-007); 12 tables + seed + RLS verified live; `SupabaseTenantRepo.list_shops()` reads 3 shops. **RLS still permissive scaffold** (ponytail marker — tighten later).
 - Q-005 LLM key ✅ resolved — OpenRouter key wired (`AI_PROVIDER=openrouter`, `AI_MODEL=moonshotai/kimi-k2`); `LLMClient.is_configured=True`; real chat verified 200. `chat()` impl still Stage 4.
 - 🟥 **Shopkeeper Telegram IDs are placeholders — escalations reach nobody.** The live `shopkeepers` table holds `telegram_id = 100000001` (from the `001_init.sql` dev seed). Verified live: `escalate()` wrote the row, froze the AI, and then reached **zero** staff — correctly firing the "no shopkeeper reachable" owner alert. Before any end-to-end escalation test, seed the real Telegram user ids of the people who will answer, and have each of them press `/start` on their shop's **keeper** bot (a bot cannot message a user who has never started it).
-- Q-006 rider model — **still open.** `/exportrider` (Stage 9) and the `orders.rider_id` FK exist, but no flow **assigns** a rider to an order yet, so rider sheets are empty. Needs a rider-assignment command/step before it produces data.
+- ~~Q-006 rider model~~ ✅ **resolved (Stage 12b, 2026-07-12)** — owner onboards riders (1+/shop), one global rider bot, `/assigndelivery` sets `orders.rider_id`; `/exportrider` now produces real data.
 - **Telethon `.session` files** — create the 2 account sessions once (one-time phone login) before Stage 2/3 end-to-end tests.
 
 ## Anti-patterns / pitfalls (don't redo these)
@@ -301,3 +357,6 @@ Notes for whoever builds these:
 | 2026-07-10 | live | **Three fixes from the Telegram walkthrough:** (1) `/productstats` stub said "Stage 8" → real keeper handler with an honest "not tracked yet (Q-014)" message. (2) **AI dumped the whole catalogue** on a vague ask → prompt rewritten to consultative selling: ask 1–2 qualifying questions first, then show ≤3 matched options, recommend when the customer is unsure. (3) **AI said it couldn't share photos** → new `show_product_media` tool + `products.media.signed_urls` + `answer_customer(media_sink=...)` out-param + `PipelineResult.media` + customer bot `send_photo`/`send_video`; bounded 3-round tool loop so it can search→show→answer. Media stays channel-agnostic (URLs; Telegram sends now, Twilio at Stage 13). Live-verified signed image fetch 200. +1 test (187 total) | live-fix |
 | 2026-07-10 | live | **Two beat-path bugs found running the full system on Telegram (owner got spammed "health check failed" every 60s):** (1) Celery tasks `asyncio.run` a new loop each tick but reused the **cached** async Redis client → `redis: down: Event loop is closed` after tick 1 → added `db.redis_client.new_redis()` (fresh, loop-local, closed in `finally`) used by `_health_task`/`_flush_task`. (2) `control.ping()` from **inside** a busy solo-pool worker returns 0 → `celery: down: no workers` → beat now calls `check_health(include_celery=False)` (a running beat task already proves a worker is alive; worker-liveness is the external `/health` poll's job). Verified: repeated ticks all `ok`, no page. +1 test (186 total) | live-fix |
 | 2026-07-08 | 5 | **LLM provider switched to official Moonshot (ADR-004 rev. 2)**: OpenRouter dropped (owner reported problems). `AI_MODEL=kimi-k2.6` on `api.moonshot.ai`. Probed the API rather than guessing: `.cn` 401s global keys; `kimi-k2.7-code*` are code-only; **`kimi-k2.*` rejects any temperature but 1** (`AI_TEMPERATURE=1.0`, also fixed as the code default). Zero changes to `llm_client.py`/`ai/` — the abstraction held. Re-verified live: tool-calling, escalation, and the full Q-015 suite. `key.txt` consumed into gitignored `.env` and deleted | Stage 5 |
+| 2026-07-11 | audit | **8-goal live QA audit** driven end-to-end against the live bots + live DB (not mocks): customer chat, escalation/security, inventory, order/delivery, owner oversight, concurrency/edge, reports/accuracy, UX/errors. Found + fixed the **over-length false-quarantine bug** (a clean >2000-char message tripped the injection detector's length rule — removed from `detect_attack`, handled instead as a friendly `too_long` pipeline reply). Built **fulfilment status**: `orders.advance_delivery` + keeper `/deliveryupdate <#> packed\|shipped\|delivered` (`_is_next_step` pure rule — no skip/backward/off-flow). All 8 goals live-tested on Telegram; results pushed to the owner's chat | audit |
+| 2026-07-12 | 12b | **Timezone decided + built**: owner confirmed UAE-only → `reports.service` uses one `DUBAI=+4` day boundary (`parse_period`/`_day`), no per-shop column (would be unused configurability for a single-timezone business) | live-fix |
+| 2026-07-12 | 12b | **Rider onboarding + assignment + COD (Q-006 resolved).** New `riders/` module + migrations 007 (`delivery_persons.telegram_id`) and 008 (`orders` COD/custody columns + new `cod_ledger`), both applied live. Owner onboards riders (`/addrider`, `/riders`); rider links Telegram by shared contact (phone-matched); keeper `/assigndelivery` (COD + balance on the card) and `/reconcilecod` (previous+today−handover=remaining, pushed to rider too); global rider bot with `/mydeliveries`, `/accept`\|`/notreceived` (**custody handshake**, write-once — neither side can dispute a handover after), `/deliver` (time→cash→finalize), `/canceldelivery` (remarks mandatory, restocks), `/myreport`. Money is an append-only ledger, balance always re-derived. Live-verified full lifecycle on order #7 (assign→accept→deliver 1500→reconcile 1650→50 AED remaining), every row checked against the formula. 50 new tests (235 total) | Stage 12b |

@@ -64,6 +64,17 @@ async def send_to_shopkeepers(shop: Shop, shopkeepers: Iterable[Shopkeeper], tex
     return reached
 
 
+async def send_to_rider(telegram_id: int, text: str) -> bool:
+    """Push a delivery assignment to a rider on the global rider bot. Best-effort (never raises).
+
+    Fails (returns False) if the rider bot token is unset or the rider hasn't pressed /start yet —
+    the caller tells the shopkeeper the rider wasn't reached, it never breaks the assignment.
+    """
+    return await _send(
+        settings.telegram_rider_bot_token, telegram_id, text, what="rider assignment"
+    )
+
+
 async def send_to_customer(shop: Shop, identity: str, text: str) -> bool:
     """Reach the customer on the shop's customer-facing channel.
 

@@ -49,6 +49,26 @@ def test_empty_range_is_a_zero_summary():
     assert s == ProfitSummary() and s.margin == 0.0
 
 
+# --- delivery transition rule (SPEC §6): only the immediate next step is allowed ---
+@pytest.mark.parametrize(
+    "current,target,ok",
+    [
+        ("confirmed", "packed", True),
+        ("packed", "shipped", True),
+        ("shipped", "delivered", True),
+        ("confirmed", "shipped", False),     # skip
+        ("confirmed", "delivered", False),   # skip
+        ("delivered", "shipped", False),     # backward
+        ("delivered", "confirmed", False),   # backward + not a valid destination
+        ("draft", "packed", False),          # not yet in the flow
+        ("cancelled", "packed", False),      # out of the flow
+        ("shipped", "shipped", False),       # no-op is not a step
+    ],
+)
+def test_delivery_only_next_step(current, target, ok):
+    assert svc._is_next_step(current, target) is ok
+
+
 # --- create_order (tenant guard reused from products) ---
 class _FakeSB:
     def __init__(self):
@@ -443,3 +463,90 @@ async def test_reject_order_cancels_without_messaging_customer(monkeypatch):
     # send_to_customer must NOT be called on reject (design #2) — leave it real; if called it'd try network
     await reject_order(_shop_obj(), 7, "too far")
     assert cap["status"] == "cancelled"
+
+
+# --- rider assignment (SPEC §10) ---
+from app.orders.service import assign_delivery  # noqa: E402
+
+
+def _order_row(status="confirmed"):
+    return {
+        "id": "o1", "status": status, "customer_name": "Ali", "phone": "p1", "address": "Marina",
+        "quantity": 1, "delivery_date": None, "special_instructions": None,
+        "selling_price": "3400", "discount_amount": "150",  # COD = net = 3250
+        "products": {"brand": "Samsung", "model": "S23", "color": "green"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_assign_delivery_notifies_linked_rider_with_cod(monkeypatch):
+    cap = {"set": None, "msg": None}
+
+    async def _get_order(shop_id, num, client):
+        return _order_row("confirmed")
+
+    async def _get_rider(shop_id, rider_id, client=None):
+        return {"id": str(rider_id), "name": "Sami", "telegram_id": 999}
+
+    async def _balance(shop_id, rider_id, client=None):
+        return Decimal("500")  # cash the rider already holds
+
+    async def _set_rider(oid, rid, cod, client):
+        cap["set"] = (oid, str(rid), cod)
+
+    async def _send_to_rider(tid, text):
+        cap["msg"] = (tid, text)
+        return True
+
+    monkeypatch.setattr(svc, "_get_order", _get_order)
+    monkeypatch.setattr(svc, "_set_rider", _set_rider)
+    monkeypatch.setattr("app.riders.service.get_rider", _get_rider)
+    monkeypatch.setattr("app.riders.service.cod_balance", _balance)
+    monkeypatch.setattr("app.telegram_bot.notify.send_to_rider", _send_to_rider)
+
+    rid = uuid4()
+    res = await assign_delivery(_shop_obj(), 8, rid)
+    assert res["notified"] is True and res["cod"] == Decimal("3250")  # net = 3400 − 150
+    assert cap["set"] == ("o1", str(rid), Decimal("3250"))
+    tid, text = cap["msg"]
+    assert tid == 999 and "#8" in text and "Marina" in text and "Samsung S23" in text
+    assert "COD): 3250 AED" in text          # cash to collect on this order
+    assert "already hold: 500 AED" in text   # running balance shown at assignment
+    assert "/accept 8" in text and "/notreceived 8" in text  # custody handshake offered
+
+
+@pytest.mark.asyncio
+async def test_assign_delivery_unlinked_rider_assigns_but_flags(monkeypatch):
+    async def _get_order(shop_id, num, client):
+        return _order_row("packed")
+
+    async def _get_rider(shop_id, rider_id, client=None):
+        return {"id": str(rider_id), "name": "Sami", "telegram_id": None}  # onboarded, not linked
+
+    async def _set_rider(oid, rid, cod, client):
+        pass
+
+    monkeypatch.setattr(svc, "_get_order", _get_order)
+    monkeypatch.setattr(svc, "_set_rider", _set_rider)
+    monkeypatch.setattr("app.riders.service.get_rider", _get_rider)
+
+    res = await assign_delivery(_shop_obj(), 8, uuid4())
+    assert res["notified"] is False  # assigned, but nothing pushed (rider hasn't linked Telegram)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["draft", "delivered", "cancelled"])
+async def test_assign_delivery_rejects_non_assignable_status(monkeypatch, status):
+    called = {"set": False}
+
+    async def _get_order(shop_id, num, client):
+        return _order_row(status)
+
+    async def _set_rider(oid, rid, cod, client):
+        called["set"] = True
+
+    monkeypatch.setattr(svc, "_get_order", _get_order)
+    monkeypatch.setattr(svc, "_set_rider", _set_rider)
+    with pytest.raises(svc.InvalidTransition):
+        await assign_delivery(_shop_obj(), 8, uuid4())
+    assert called["set"] is False  # rejected before any write — never assigns to a done/draft order

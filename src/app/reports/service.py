@@ -10,13 +10,19 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from app.orders.models import ProfitSummary
 
+# The business runs in the UAE only, so days are Asia/Dubai days (+4, no DST). A report for
+# "today" must end at Dubai midnight, not UTC midnight — otherwise the last 4h of local sales
+# land in the wrong day. created_at is timestamptz (UTC); comparing against +04:00 boundaries
+# lets Postgres map the local-day window to the right UTC instants.
+DUBAI = timezone(timedelta(hours=4))
+
 
 def parse_period(arg: str, today: date | None = None) -> tuple[datetime, datetime, str]:
-    """Map a /profit argument to a UTC [start, end) window + a human label.
+    """Map a /profit argument to an Asia/Dubai [start, end) window + a human label.
 
     today | yesterday | weekly (last 7d) | monthly (this month) | YYYY-MM-DD. Default: today.
     """
-    today = today or datetime.now(timezone.utc).date()
+    today = today or datetime.now(DUBAI).date()
     arg = (arg or "today").strip().lower()
 
     if arg in ("", "today"):
@@ -38,7 +44,7 @@ def parse_period(arg: str, today: date | None = None) -> tuple[datetime, datetim
 
 
 def _day(d: date) -> datetime:
-    return datetime.combine(d, time.min, tzinfo=timezone.utc)
+    return datetime.combine(d, time.min, tzinfo=DUBAI)
 
 
 def _aed(x) -> str:

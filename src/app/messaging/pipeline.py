@@ -20,7 +20,7 @@ from uuid import UUID
 from app.ai.orchestrator import answer_customer
 from app.escalations.context import remember
 from app.escalations.service import forward_to_shopkeepers, is_frozen
-from app.security.detectors import detect_attack
+from app.security.detectors import MAX_MESSAGE_CHARS, detect_attack
 from app.core.config import settings
 from app.security.service import bump_daily, bump_rate, is_blacklisted, is_bypassed, is_quarantined, quarantine
 from app.tenants.models import Shop, ShopStatus
@@ -48,6 +48,9 @@ def parse_usage_key(key: str) -> tuple[UUID, UUID, date, str] | None:
         return None
 
 _QUARANTINE_REPLY = "Your message could not be processed."
+_TOO_LONG_REPLY = (
+    "That's a lot to take in! Could you shorten it to a sentence or two so I can help you properly?"
+)
 
 # §11 concurrency/reliability. All state in Redis (no local memory).
 _LOCK_KEY = "lock:session:{shop_id}:{identity}"
@@ -148,6 +151,12 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
     if attack is not None:
         await quarantine(redis, shop, msg.identity, attack)
         return PipelineResult(_QUARANTINE_REPLY, "attack")
+
+    # Over-length but clean (detect_attack already ruled out injection payloads above): a verbose
+    # customer is not an attacker. Ask them to shorten instead of quarantining — and never send an
+    # oversized prompt to the LLM (bounds token cost at 30 shops × high volume).
+    if len(msg.text) > MAX_MESSAGE_CHARS:
+        return PipelineResult(_TOO_LONG_REPLY, "too_long")
 
     # Cost/abuse ceiling: a per-customer DAILY cap on AI-answered messages. Rapid-fire (step 6)
     # stops 60-second bursts; this stops a sustained flood just under that threshold from running up

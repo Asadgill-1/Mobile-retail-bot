@@ -15,6 +15,7 @@ import functools
 import logging
 import signal
 import uuid
+from decimal import Decimal
 from typing import Awaitable, Callable
 
 from telegram import Update
@@ -31,10 +32,14 @@ from telegram.ext import (
 
 from app.escalations.service import DeliveryFailed, NoPendingEscalation
 from app.orders.service import (
+    InvalidTransition,
     NoPendingDraft,
     NoPriceRequest,
+    OrderNotFound,
     OutOfStock,
+    advance_delivery,
     approve_price,
+    assign_delivery,
     confirm_order,
     deny_price,
     export_orders,
@@ -44,6 +49,7 @@ from app.orders.service import (
     reject_order,
     set_negotiation,
 )
+from app.riders.service import RiderNotFound, add_rider, list_riders
 from app.products.addproduct_flow import build_addproduct_handler
 from app.reports.service import format_owner_profit, format_profit, parse_period
 from app.products.service import (
@@ -165,6 +171,47 @@ async def shopstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🏪 {info.name}\nStatus: {info.status.value}\n"
         f"Reason: {info.suspension_reason or '—'}\nShopkeepers:\n{keepers}",
     )
+
+
+# --- owner rider onboarding (SPEC §10 delivery) ---
+def _format_riders(shop: Shop, riders: list[dict]) -> str:
+    """Shared rider list for owner `/riders <shop>` and keeper `/riders`."""
+    if not riders:
+        return f"No riders for {shop.name} yet. Owner onboards with /addrider <shop> <phone> <name>."
+    lines = [
+        f"• {r['name']} — {r['phone']} {'🟢 linked' if r.get('telegram_id') else '⚪ not linked'}\n"
+        f"  {r['id']}"
+        for r in riders
+    ]
+    return f"🛵 Riders — {shop.name}\n" + "\n".join(lines) + "\n\n/assigndelivery <order#> <rider_id>"
+
+
+@owner_only
+async def addrider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/addrider <shop_id|number> <phone> <name>` — onboard a delivery rider for a shop."""
+    parts = _split(update.message.text, maxsplit=3)
+    if len(parts) < 3:
+        await _reply(update, context, "Usage: /addrider <shop_id|number> <phone> <name>")
+        return
+    shop = await _resolve_shop(_service(context), parts[0])
+    rider = await add_rider(shop.id, parts[2], parts[1])
+    await _reply(
+        update, context,
+        f"🛵 Rider added to {shop.name}: {rider['name']} ({rider['phone']})\n"
+        f"id: {rider['id']}\n\n"
+        "Ask them to open the rider bot and tap “Share my phone” to start receiving deliveries.",
+    )
+
+
+@owner_only
+async def owner_riders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/riders <shop_id|number>` — list a shop's riders (owner view)."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /riders <shop_id|number>")
+        return
+    shop = await _resolve_shop(_service(context), parts[0])
+    await _reply(update, context, _format_riders(shop, await list_riders(shop.id)))
 
 
 # --- owner security commands (SPEC §7 investigation, §8 bypass) — Stage 7 ---
@@ -421,6 +468,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context,
             "Owner commands:\n/pauseshop <id|num> <reason>\n/resumeshop <id|num>\n"
             "/shopstatus <id|num>\n\n"
+            "Riders (§10):\n/addrider <shop> <phone> <name>\n/riders <shop>\n\n"
             "Dashboards (§12):\n/owner dashboard · /owner health\n"
             "/owner escalations · /owner security · /owner audit\n\n"
             "Profit (§6):\n/owner profit [all|compare|shop <id>] [period]\n\n"
@@ -500,6 +548,12 @@ def keeper_command(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaita
             await _reply(update, context, f"❌ No pending price request #{e} for this shop.")
         except OutOfStock as e:
             await _reply(update, context, f"⚠️ Order #{e} can't be confirmed — that item is now out of stock.")
+        except OrderNotFound as e:
+            await _reply(update, context, f"❌ No order #{e} in this shop.")
+        except RiderNotFound:
+            await _reply(update, context, "❌ No such rider in this shop. /riders to see them.")
+        except InvalidTransition as e:
+            await _reply(update, context, f"⚠️ {e}")
         except DeliveryFailed as e:
             await _reply(update, context, f"❌ Could not deliver to {e}. They may have blocked the bot.")
         except (InvalidBoostLevel, InvalidTag, ValueError) as e:
@@ -647,6 +701,79 @@ async def rejectorder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _reply(update, context, f"❌ Order #{num} rejected. Use /reply {num} … if you want to tell the customer.")
 
 
+@keeper_command
+async def deliveryupdate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/deliveryupdate <#> packed|shipped|delivered` — advance fulfilment one step; customer is told."""
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /deliveryupdate <order_number> packed|shipped|delivered")
+        return
+    num = _order_number(parts[0])
+    await advance_delivery(_shop_of(context), num, parts[1])
+    await _reply(update, context, f"🚚 Order #{num} → {parts[1].lower()}. Customer notified.")
+
+
+# --- shopkeeper rider assignment (SPEC §10 delivery) ---
+@keeper_command
+async def riders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/riders` — this shop's riders + their ids (for /assigndelivery)."""
+    shop = _shop_of(context)
+    await _reply(update, context, _format_riders(shop, await list_riders(shop.id)))
+
+
+@keeper_command
+async def assigndelivery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/assigndelivery <order#> <rider_id>` — attach a rider to a confirmed order + notify them."""
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /assigndelivery <order_number> <rider_id>")
+        return
+    num = _order_number(parts[0])
+    try:
+        rider_id = uuid.UUID(parts[1])
+    except ValueError:
+        raise ValueError(f"'{parts[1]}' is not a valid rider id")
+    res = await assign_delivery(_shop_of(context), num, rider_id)
+    tail = ("Rider notified. 📲" if res["notified"]
+            else "⚠️ Rider hasn't linked Telegram yet — ask them to /start the rider bot.")
+    await _reply(update, context,
+                 f"🛵 Order #{num} → {res['rider']['name']} (COD {res['cod']} AED). {tail}")
+
+
+async def _resolve_rider(shop: Shop, arg: str) -> dict:
+    """Rider by UUID or case-insensitive name within this shop (for /reconcilecod)."""
+    from app.riders.service import get_rider, list_riders
+
+    try:
+        return await get_rider(shop.id, uuid.UUID(arg))
+    except ValueError:
+        pass  # not a uuid — try by name
+    matches = [r for r in await list_riders(shop.id) if (r.get("name") or "").lower() == arg.lower()]
+    if not matches:
+        raise RiderNotFound(arg)
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} riders named '{arg}' — use the rider id from /riders")
+    return matches[0]
+
+
+@keeper_command
+async def reconcilecod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/reconcilecod <rider_id|name> <amount>` — end-of-day cash handover. Shows the full trail
+    (previous balance + today COD − handed over = remaining) and pushes the same trail to the rider."""
+    from app.riders.service import parse_cash, reconcile_cod
+
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /reconcilecod <rider_id|name> <amount_received>")
+        return
+    shop = _shop_of(context)
+    rider = await _resolve_rider(shop, parts[0])
+    trail = await reconcile_cod(shop, rider, parse_cash(parts[1]))
+    tail = ("\n\n📲 Trail sent to the rider." if rider.get("telegram_id")
+            else "\n\n⚠️ Rider hasn't linked Telegram — trail not pushed.")
+    await _reply(update, context, trail["text"] + tail)
+
+
 # --- shopkeeper price negotiation (ADR-010 rev.) — Stage 8 ---
 @keeper_command
 async def negotiation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -788,6 +915,11 @@ KEEPER_COMMANDS: dict[str, Callable] = {
     "orders": orders_cmd,
     "confirmorder": confirmorder_cmd,
     "rejectorder": rejectorder_cmd,
+    "deliveryupdate": deliveryupdate_cmd,
+    # SPEC §10 rider assignment + COD
+    "riders": riders_cmd,
+    "assigndelivery": assigndelivery_cmd,
+    "reconcilecod": reconcilecod_cmd,
     # ADR-010 rev. price negotiation (Stage 8)
     "negotiation": negotiation_cmd,
     "approveprice": approveprice_cmd,
@@ -832,6 +964,9 @@ def build_application(service: TenantService) -> Application:
     app.add_handler(CommandHandler("pauseshop", pauseshop))
     app.add_handler(CommandHandler("resumeshop", resumeshop))
     app.add_handler(CommandHandler("shopstatus", shopstatus))
+    # owner rider onboarding (§10)
+    app.add_handler(CommandHandler("addrider", addrider))
+    app.add_handler(CommandHandler("riders", owner_riders))
     # owner profit (§6)
     app.add_handler(CommandHandler("owner", owner_cmd))
     # owner security (§7, §8)
@@ -864,7 +999,11 @@ async def _shopkeeper_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "/reply <customer> <text> — answer them yourself\n"
         "/handover <customer> — give them back to the assistant\n\n"
         "Orders:\n/orders — drafts awaiting your OK\n"
-        "/confirmorder <#> · /rejectorder <#> [reason]\n\n"
+        "/confirmorder <#> · /rejectorder <#> [reason]\n"
+        "/deliveryupdate <#> packed|shipped|delivered\n\n"
+        "Delivery riders:\n/riders — list riders + ids\n"
+        "/assigndelivery <order#> <rider_id>\n"
+        "/reconcilecod <rider|name> <amount> — end-of-day cash\n\n"
         "Price requests:\n/approveprice <#> · /custom <#> <price> · /denyprice <#>\n"
         "/negotiation on|off\n\n"
         "Profit:\n/profit [today|yesterday|weekly|monthly|YYYY-MM-DD]\n\n"
@@ -970,6 +1109,291 @@ def build_customer_application(service: TenantService, shop: Shop) -> Applicatio
     return app
 
 
+# --- application factory: global RIDER bot (SPEC §10 delivery) ---
+_RIDER_HELP = (
+    "🛵 Rider commands:\n"
+    "/mydeliveries — your assignments + status\n"
+    "/accept <order#> — confirm you HAVE the product\n"
+    "/notreceived <order#> — product was NOT handed to you\n"
+    "/deliver <order#> — mark delivered (then reply with cash received)\n"
+    "/canceldelivery <order#> <remarks> — can't deliver (remarks required)\n"
+    "/myreport [today|yesterday|weekly|monthly|YYYY-MM-DD [YYYY-MM-DD]] — your deliveries + cash"
+)
+
+
+async def _rider_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rider bot /start — offer a Share-contact button so we can link their Telegram to their record."""
+    from telegram import KeyboardButton, ReplyKeyboardMarkup
+
+    from app.riders.service import riders_by_telegram
+
+    user = update.effective_user
+    if user and await riders_by_telegram(user.id):  # already linked → straight to work
+        await _reply(update, context, f"🛵 Welcome back!\n\n{_RIDER_HELP}")
+        return
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📲 Share my phone number", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🛵 Rider bot.\nTap below to link your Telegram — then you'll get delivery assignments here.",
+        reply_markup=kb,
+    )
+
+
+async def _rider_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rider shared their contact → match the phone to onboarded rider rows and store their chat id."""
+    from app.riders.service import link_telegram
+
+    contact = update.message.contact if update.message else None
+    user = update.effective_user
+    # Only accept the sender's OWN contact — a forwarded contact carries someone else's user_id.
+    if contact is None or (contact.user_id and user and contact.user_id != user.id):
+        await _reply(update, context, "Please tap the button and share YOUR own phone number.")
+        return
+    linked = await link_telegram(contact.phone_number, user.id)
+    if not linked:
+        await _reply(
+            update, context,
+            "❌ This number isn't registered as a rider yet. Ask the shop owner to add you first.",
+        )
+        return
+    await _reply(
+        update, context,
+        f"✅ Linked! You'll receive delivery assignments here ({len(linked)} shop(s)).\n\n{_RIDER_HELP}",
+    )
+
+
+def rider_command(handler: Callable) -> Callable:
+    """Wrap a rider command: auth by linked Telegram id, typed errors → safe replies."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        from app.riders.service import NotYourDelivery, riders_by_telegram
+
+        user = update.effective_user
+        rows = await riders_by_telegram(user.id) if user else []
+        if not rows:
+            await _reply(update, context,
+                         "⛔ You're not linked as a rider. Press /start and share your phone number.")
+            return
+        try:
+            await handler(update, context, rows)
+        except NotYourDelivery as e:
+            await _reply(update, context, f"❌ No delivery #{e} assigned to you. /mydeliveries to see yours.")
+        except ValueError as e:
+            await _reply(update, context, f"⚠️ {e}")
+        except Exception:
+            logger.exception("rider command failed")
+            await _reply(update, context, "❌ Internal error.")
+        else:
+            await _audit(update, context, handler.__name__)  # §16: rider actions are logged too
+
+    return wrapper
+
+
+@rider_command
+async def rider_help(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    await _reply(update, context, _RIDER_HELP)
+
+
+def _rider_status_icon(o: dict) -> str:
+    if o["status"] == "delivered":
+        return "✅ delivered"
+    custody = o.get("custody") or "none"
+    if custody == "disputed":
+        return "🚨 disputed"
+    if custody != "accepted":
+        return f"⏳ pending — confirm pickup: /accept {o['order_number']}"
+    return f"⏳ pending — /deliver {o['order_number']}"
+
+
+@rider_command
+async def rider_mydeliveries(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/mydeliveries` — every assignment with its status; pending ones show the next action."""
+    from app.riders.service import my_deliveries
+
+    orders = await my_deliveries([r["id"] for r in rows])
+    if not orders:
+        await _reply(update, context, "No deliveries assigned to you yet.")
+        return
+    lines = []
+    for o in orders:
+        p = o.get("products") or {}
+        item = f"{p.get('brand', '')} {p.get('model', '')}".strip()
+        cod = f" · COD {o['cod_amount']} AED" if o.get("cod_amount") is not None else ""
+        lines.append(f"#{o['order_number']} — {item} ×{o['quantity']} — {o['address']}{cod}\n"
+                     f"   {_rider_status_icon(o)}")
+    await _reply(update, context, "🛵 Your deliveries:\n\n" + "\n".join(lines))
+
+
+@rider_command
+async def rider_accept(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/accept <order#>` — 'yes, I have this product' (custody audit)."""
+    from app.riders.service import set_custody
+
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /accept <order_number>")
+        return
+    num = _order_number(parts[0])
+    await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=True)
+    await _reply(update, context,
+                 f"✅ Pickup confirmed for order #{num}. Shop notified.\nWhen done: /deliver {num}")
+
+
+@rider_command
+async def rider_notreceived(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/notreceived <order#>` — 'this product was NOT handed to me' (custody audit)."""
+    from app.riders.service import set_custody
+
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /notreceived <order_number>")
+        return
+    num = _order_number(parts[0])
+    await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=False)
+    await _reply(update, context, f"🚨 Recorded: order #{num} not received. The shop has been alerted.")
+
+
+@rider_command
+async def rider_deliver(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/deliver <order#>` — register the delivery time, then ask for the cash received.
+    The order finalizes (status/messages) when the rider replies with the amount."""
+    from datetime import datetime
+
+    from app.reports.service import DUBAI
+    from app.riders.service import _get_my_order, deliverable
+
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /deliver <order_number>")
+        return
+    num = _order_number(parts[0])
+    order = await _get_my_order([r["id"] for r in rows], num, None)  # raises NotYourDelivery
+    reason = deliverable(order["status"], order.get("custody") or "none")
+    if reason:
+        raise ValueError(reason)
+    now = datetime.now(DUBAI)
+    # ponytail: pending cash lives in chat_data (in-memory). Bot restart mid-flow → rider just
+    # re-runs /deliver. Finalize (status+messages) happens on the cash reply, delivery time = now.
+    context.chat_data["await_cash"] = {"order": num, "at": now.isoformat()}
+    cod = order.get("cod_amount")
+    await _reply(
+        update, context,
+        f"🕐 Delivery time registered for order #{num} ({now:%H:%M})."
+        + (f"\n💵 COD to collect: {cod} AED" if cod is not None else "")
+        + "\n\nHow much cash did you receive? Reply with the amount (0 if none).",
+    )
+
+
+async def _rider_cash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Plain-text reply on the rider bot = the cash amount for a pending /deliver."""
+    from datetime import datetime
+
+    from app.riders.service import NotYourDelivery, deliver_order, parse_cash, riders_by_telegram
+
+    pending = context.chat_data.get("await_cash")
+    if not pending:
+        await _reply(update, context, _RIDER_HELP)
+        return
+    user = update.effective_user
+    rows = await riders_by_telegram(user.id) if user else []
+    if not rows:
+        return
+    try:
+        cash = parse_cash(update.message.text or "")
+        order = await deliver_order(
+            [r["id"] for r in rows], rows[0]["name"], pending["order"],
+            cash, datetime.fromisoformat(pending["at"]),
+        )
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+        return
+    except NotYourDelivery:
+        context.chat_data.pop("await_cash", None)
+        await _reply(update, context, "❌ That delivery is no longer yours.")
+        return
+    context.chat_data.pop("await_cash", None)
+    cod = order.get("cod_amount")
+    diff = ""
+    if cod is not None and Decimal(str(cod)) != cash:
+        diff = f"\n⚠️ Note: COD was {cod} AED, you entered {cash} AED — the shop sees both."
+    await _reply(update, context,
+                 f"✅ Order #{pending['order']} delivered. Cash recorded: {cash} AED. "
+                 f"Customer and shop notified.{diff}")
+
+
+@rider_command
+async def rider_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/canceldelivery <order#> <remarks>` — remarks are mandatory."""
+    from app.riders.service import cancel_delivery
+
+    parts = _split(update.message.text, maxsplit=2)
+    if len(parts) < 2 or not parts[1].strip():
+        await _reply(update, context,
+                     "Usage: /canceldelivery <order_number> <remarks>\nRemarks are required.")
+        return
+    num = _order_number(parts[0])
+    await cancel_delivery([r["id"] for r in rows], rows[0]["name"], num, parts[1].strip())
+    await _reply(update, context,
+                 f"❌ Delivery #{num} cancelled. Shop and customer notified; stock restored.")
+
+
+@rider_command
+async def rider_myreport(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
+    """`/myreport [period]` or `/myreport <from> <to>` — deliveries done + cash collected."""
+    from app.riders.service import cod_balance, delivered_report, report_window
+
+    args = _split(update.message.text, maxsplit=2)
+    try:
+        start, end, label = report_window(args)
+    except ValueError:
+        await _reply(update, context,
+                     "Usage: /myreport [today|yesterday|weekly|monthly|YYYY-MM-DD] "
+                     "or /myreport <YYYY-MM-DD> <YYYY-MM-DD>")
+        return
+    orders = await delivered_report([r["id"] for r in rows], start, end)
+    cash = sum(Decimal(str(o["cash_received"] or 0)) for o in orders)
+    lines = [f"📊 Delivery report — {label}", "",
+             f"Delivered: {len(orders)}", f"Cash collected: {cash} AED"]
+    for o in orders:
+        t = (o.get("delivered_at") or "")[11:16]
+        lines.append(f"  #{o['order_number']} — {o['cash_received'] or 0} AED — {t}")
+    lines.append("")
+    from app.db.factory import get_tenant_repo
+
+    repo = get_tenant_repo()
+    for r in rows:  # a rider may hold cash for more than one shop — show each
+        shop = await repo.get_shop_by_id(uuid.UUID(r["shop_id"]))
+        bal = await cod_balance(r["shop_id"], r["id"])
+        lines.append(f"💰 Cash you hold — {shop.name if shop else 'shop'}: {bal} AED")
+    await _reply(update, context, "\n".join(lines))
+
+
+def build_rider_application(service: TenantService) -> Application:
+    """Global rider bot: link Telegram, receive assignments, work them (SPEC §10)."""
+    from app.core.config import settings
+
+    if not settings.telegram_rider_bot_token:
+        raise RuntimeError("TELEGRAM_RIDER_BOT_TOKEN not set (see .env.example).")
+    app = ApplicationBuilder().token(settings.telegram_rider_bot_token).build()
+    app.bot_data["tenant_service"] = service
+    app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
+    app.add_handler(CommandHandler("start", _rider_start))
+    app.add_handler(CommandHandler("help", rider_help))
+    app.add_handler(CommandHandler("mydeliveries", rider_mydeliveries))
+    app.add_handler(CommandHandler("accept", rider_accept))
+    app.add_handler(CommandHandler("notreceived", rider_notreceived))
+    app.add_handler(CommandHandler("deliver", rider_deliver))
+    app.add_handler(CommandHandler("canceldelivery", rider_cancel))
+    app.add_handler(CommandHandler("myreport", rider_myreport))
+    app.add_handler(MessageHandler(filters.CONTACT, _rider_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _rider_cash))
+    return app
+
+
 def _owner_token() -> str:
     from app.core.config import settings
 
@@ -986,7 +1410,9 @@ def run_polling(service: TenantService) -> None:
 
 # --- multi-bot runner: owner + every shop's keeper + customer bots (ADR-005) ---
 async def _build_all_applications(service: TenantService) -> list[Application]:
-    """Owner app + one shopkeeper app + one customer app per configured shop."""
+    """Owner app + one shopkeeper app + one customer app per shop + a global rider app."""
+    from app.core.config import settings
+
     apps = [build_application(service)]
     shops = await service.list_shops()
     for shop in shops:
@@ -994,6 +1420,8 @@ async def _build_all_applications(service: TenantService) -> list[Application]:
             apps.append(build_shopkeeper_application(service, shop))
         if shop.telegram_customer_bot_token:
             apps.append(build_customer_application(service, shop))
+    if settings.telegram_rider_bot_token:  # global rider bot (delivery assignments), added last
+        apps.append(build_rider_application(service))
     return apps
 
 

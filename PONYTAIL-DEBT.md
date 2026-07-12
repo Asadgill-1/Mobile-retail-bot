@@ -25,6 +25,7 @@
 - `src/app/messaging/pipeline.py` (process_message), session lock release is a plain `DEL`, no owner token. ceiling: if processing outlives the 30s lock TTL, another message can re-acquire the lock and this `DEL` frees that one too. upgrade: compare-and-delete with a per-hold token (Lua) if a session can legitimately run >30s.
 - `src/app/messaging/pipeline.py` (process_message), a lock-contended message returns `locked` and is dropped. ceiling: fine on Telegram (sequential per bot), but the Twilio/Celery path would drop it. upgrade: `self.retry` on the `locked` action once the Twilio producer is live (Stage 13).
 - `src/app/core/logging.py`, structured logs are a key=value line format, not JSON. ceiling: not machine-parseable by a log aggregator without a regex. upgrade: a JSON `Formatter` subclass (one class, no dep) when a log pipeline exists to consume it.
+- `src/app/telegram_bot/bot.py:1279`, a pending `/deliver` cash amount lives in `context.chat_data` (in-memory, PTB per-chat state). ceiling: a bot restart mid-flow loses the pending delivery — the rider just re-runs `/deliver`, no data is corrupted, but the time they registered is discarded. upgrade: persist the pending state (a Redis key, mirroring the session lock pattern) if bot restarts during active deliveries become frequent enough to annoy riders.
 
 ## Tags
 
@@ -32,6 +33,6 @@
 
 ## Stats
 
-- 17 markers. **Stage 7 resolved 2** (pipeline stubs). **Stage 8 added 1** (orders Python aggregation). **Stage 8b/9** added 0 code markers (shortcuts tracked in ADR-010 / Q-006). **Stage 10 resolved 1** (`main.py` `/health` placeholder — now a real checker) and **added 2** (hourly usage-flush >2-day-outage ceiling; health LLM = config-check not live ping). **Stage 11 added 2** (session-lock plain-DEL release; `locked`→`self.retry` deferred to Stage 13). **Stage 12 added 1** (key=value logs, JSON formatter deferred). 0 with no trigger.
+- 18 markers. **Stage 7 resolved 2** (pipeline stubs). **Stage 8 added 1** (orders Python aggregation). **Stage 8b/9** added 0 code markers (shortcuts tracked in ADR-010 / Q-006). **Stage 10 resolved 1** (`main.py` `/health` placeholder — now a real checker) and **added 2** (hourly usage-flush >2-day-outage ceiling; health LLM = config-check not live ping). **Stage 11 added 2** (session-lock plain-DEL release; `locked`→`self.retry` deferred to Stage 13). **Stage 12 added 1** (key=value logs, JSON formatter deferred). **Stage 12b added 1** (pending-cash in-memory chat_data). 0 with no trigger.
 
 > The debt ADR-009 created — *"every failure promises a specialist that nobody is told about"* — is **paid** (Stage 6). Stage 7 closed the pipeline's two remaining stubs. **Stage 10 closed the usage-counter leak** — `celery_beat` now drains `usage:*` → `usage_daily` on the hourly flush; the counters are no longer written-and-expiring. No step in the SPEC §9 pipeline is a placeholder anymore except step 1 (Twilio sig-verify, dormant until the WhatsApp cutover at Stage 13).

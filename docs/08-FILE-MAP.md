@@ -24,7 +24,9 @@ new retail v2/
 │   ├── 003_order_drafts.sql    # hybrid booking (Q-017/ADR-010): draft status, order_number, decrement_stock() RPC [APPLIED 2026-07-10]
 │   ├── 004_negotiation.sql     # human-in-loop pricing (ADR-010 rev.1): shops.negotiation_enabled, price_requests, drops products.min_price [APPLIED 2026-07-10]
 │   ├── 005_reports_bucket.sql  # private `shop-reports` storage bucket for Excel exports (SPEC §10) [APPLIED 2026-07-10]
-│   └── 006_rls_lockdown.sql    # security audit: RLS on all tables + drop scaffold policies + revoke anon (data API = service-role only) [APPLIED 2026-07-11]
+│   ├── 006_rls_lockdown.sql    # security audit: RLS on all tables + drop scaffold policies + revoke anon (data API = service-role only) [APPLIED 2026-07-11]
+│   ├── 007_rider_telegram.sql  # rider Telegram linking: delivery_persons.telegram_id [APPLIED 2026-07-12]
+│   └── 008_cod_custody.sql     # COD + custody audit: orders gains cod_amount/cash_received/delivered_at/custody/custody_at/cancel_remarks; new cod_ledger table [APPLIED 2026-07-12]
 ├── mcp_servers/
 │   ├── README.md               # how to run/wire the Supabase MCP server (ADR-007)
 │   └── supabase_server.py      # FastMCP server: list_tables / execute_sql / apply_migration / get_project_info
@@ -32,7 +34,7 @@ new retail v2/
 │                               #   = 2 real handsets (S23 Ultra green+black, iPhone 16 green)
 ├── scripts/
 │   ├── seed_dev.py             # (Stage 1)
-│   ├── run_bot.sh              # run all 5 Telegram bots (live Supabase DB; ADR-005)
+│   ├── run_bot.sh              # run all configured Telegram bots — owner + per-shop + global rider (live Supabase DB; ADR-005/12b)
 │   ├── apply_migration.py      # apply a migration to live Supabase via the MCP tooling
 │   ├── seed_shop_bots.py       # write per-shop bot tokens onto live shops rows (ADR-005)
 │   └── seed_test_catalog.py    # seed the 8-product scenario catalogue + media (--clean to remove)
@@ -57,12 +59,13 @@ new retail v2/
 │   │   ├── functions.py        # search_products + escalate_to_human tool schemas (Stage 4 ✅, ADR-008)
 │   │   └── prompts.py          # anti-hallucination + promotion prompt, fallback/escalation replies (Stage 4 ✅)
 │   ├── tenants/                # models/service/auth (Stage 1 ✅)
-│   ├── telegram_bot/           # bot.py: handlers+auth+build_application (2 ✅); notify.py: owner/shopkeeper/customer sends (6 ✅)
+│   ├── telegram_bot/           # bot.py: handlers+auth+build_application, incl. global rider bot (2/12b ✅); notify.py: owner/shopkeeper/customer/rider sends (6/12b ✅)
 │   ├── whatsapp/               # webhook.py: Twilio sig-verify + /webhook/whatsapp (Stage 3 ✅, mocked till Stage 13)
 │   ├── messaging/              # pipeline.py: SPEC §9 pipeline (3 ✅) + §11 per-session lock + MessageSid dedup (11 ✅)
 │   ├── ai/                     # orchestrator.py: chat loop + tool exec + escalation (Stage 4 ✅, ADR-008)
 │   ├── products/               # models.py, search.py (4 ✅), service.py (guard+CRUD), addproduct_flow.py (11-step ConversationHandler), media.py (Storage upload) — Stage 5 ✅
-│   ├── orders/                 # models.py (line_profit + ProfitSummary) + service.py (create_order, profit_summary, hybrid booking: draft/confirm/reject, negotiation, Excel export queries) — Stage 8/9 ✅ (Q-017/ADR-010)
+│   ├── orders/                 # models.py (line_profit + ProfitSummary) + service.py (create_order, profit_summary, hybrid booking: draft/confirm/reject, negotiation, fulfilment status, rider assignment, Excel export queries) — Stage 8/9/12b ✅ (Q-017/ADR-010)
+│   ├── riders/                 # service.py: onboarding, Telegram linking, custody handshake, delivery finalization, COD ledger (append-only) — Stage 12b ✅ (Q-006)
 │   ├── escalations/            # service.py (escalate/freeze/reply/handover/alert_owner) + context.py (Redis conversation memory) — Stage 6 ✅
 │   ├── security/               # detectors.py (6 pure attack patterns) + service.py (quarantine/blacklist/bypass/incident snapshot) — Stage 7 ✅
 │   ├── reports/                # service.py (parse_period + profit formatting, 8 ✅) + health.py (check_health §13, one checker for /health + beat, 10 ✅)
@@ -83,7 +86,8 @@ new retail v2/
 │   ├── tasks/                  # test_tasks.py (Stage 3 ✅)
 │   ├── escalations/            # test_service.py + test_context.py (Stage 6 ✅)
 │   ├── security/               # test_detectors.py + test_service.py (Stage 7 ✅)
-│   ├── orders/                 # test_service.py — profit agg + create_order tenant guard (Stage 8 ✅)
+│   ├── orders/                 # test_service.py — profit agg + create_order tenant guard + delivery transitions + rider assignment/COD (Stage 8/12b ✅)
+│   ├── riders/                 # test_service.py — phone normalize, custody, deliverable, cash parse, COD trail math, deliver/cancel/reconcile flows (Stage 12b ✅)
 │   ├── reports/                # test_service.py (period+format) + test_health.py — checker up/down/metrics + owner-alert (Stage 8/10 ✅)
 │   ├── audit/                  # test_service.py — record writes/defaults/swallows-failure + recent (Stage 12 ✅)
 │   ├── utils/                  # test_excel.py — pure workbook builder: headers/style/mapping (Stage 9 ✅)
@@ -109,12 +113,13 @@ new retail v2/
 | `src/app/db/` | Supabase + Redis clients + TenantRepo | 1 ✅ | `src/app/db/README.md` |
 | `src/app/llm/` | provider-agnostic LLM client + tool schemas + prompts | 4 ✅ | `src/app/llm/README.md` |
 | `src/app/tenants/` | shop, shopkeeper, suspension, auth | 1 ✅ | `src/app/tenants/README.md` |
-| `src/app/telegram_bot/` | command router, auth, owner cmds | 2 ✅ | `src/app/telegram_bot/README.md` |
+| `src/app/telegram_bot/` | command router, auth, owner cmds; 6 bots incl. global rider bot | 2/12b ✅ | `src/app/telegram_bot/README.md` |
 | `src/app/whatsapp/` | Twilio webhook + sig-verify | 3 ✅ | `src/app/whatsapp/README.md` |
 | `src/app/messaging/` | SPEC §9 pipeline + §11 session lock + MessageSid dedup | 3/11 ✅ | `src/app/messaging/README.md` |
 | `src/app/ai/` | anti-hallucination chat loop, tool exec, escalation | 4 ✅ | `src/app/ai/README.md` |
 | `src/app/products/` | ranking/search, inventory, `/addproduct`, boost/tags, media | 4/5 ✅ | `src/app/products/README.md` |
-| `src/app/orders/` | create_order (tenant-guarded), profit math + aggregation | 8 ✅ | `src/app/orders/README.md` |
+| `src/app/orders/` | create_order (tenant-guarded), profit math + aggregation, fulfilment + rider assignment | 8/12b ✅ | `src/app/orders/README.md` |
+| `src/app/riders/` | rider onboarding, Telegram linking, custody, delivery + COD ledger | 12b ✅ | `src/app/riders/README.md` |
 | `src/app/escalations/` | pending, reply, handover, Redis session, owner alerts | 6 ✅ | `src/app/escalations/README.md` |
 | `src/app/security/` | attack detection, quarantine, blacklist, bypass, incidents | 7 ✅ | `src/app/security/README.md` |
 | `src/app/reports/` | profit formatting (§6) + `health.check_health` (§13) + owner dashboards (§12) | 8/10 ✅ | `src/app/reports/README.md` |

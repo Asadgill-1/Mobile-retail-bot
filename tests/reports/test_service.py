@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -16,6 +16,9 @@ TODAY = date(2026, 7, 9)
 def test_parse_period_windows():
     s, e, label = parse_period("today", TODAY)
     assert (s.date(), e.date()) == (date(2026, 7, 9), date(2026, 7, 10)) and "Today" in label
+    # UAE-only: day boundaries are Asia/Dubai (+4), not UTC — so 20:00–24:00 local sales fall in
+    # the right day. Guards against a silent revert to UTC midnight.
+    assert s.utcoffset() == timedelta(hours=4)
 
     s, e, _ = parse_period("yesterday", TODAY)
     assert (s.date(), e.date()) == (date(2026, 7, 8), date(2026, 7, 9))

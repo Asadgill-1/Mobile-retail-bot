@@ -27,17 +27,24 @@
 - **Search:** `search_products` parses natural-language requirements → Postgres query on `specs` JSONB ILIKE + `tags`; sorts by boost_level DESC, relevance (spec matches + tag matches×2), is_featured DESC; relevance × (1 + boost_level/10) (§4).
 
 ### orders
-- **Key fields:** `id`, `shop_id` FK, `customer_name`, `phone`, `address`, `product_id` FK, `quantity`, `selling_price` DECIMAL (actual charged), `discount_amount` DECIMAL DEFAULT 0, `delivery_date`, `status`, `rider_id` FK?, `special_instructions`, `created_at`.
-- **Profit formula:** `profit = selling_price - discount_amount - product.cost_price`; `margin% = profit / product.cost_price × 100` (§6).
-- **Relations:** has `order_status_history`; belongs to shop + product + (optional) delivery_person.
+- **Key fields:** `id`, `shop_id` FK, `customer_name`, `phone`, `address`, `product_id` FK, `quantity`, `selling_price` DECIMAL (actual charged), `discount_amount` DECIMAL DEFAULT 0, `delivery_date`, `status`, `order_number` (human-friendly serial, migration 003), `rider_id` FK?, `special_instructions`, `created_at`. **Migration 008 (Stage 12b):** `cod_amount` DECIMAL? (COD to collect, set at assignment = net charge), `cash_received` DECIMAL? (what the rider actually collected), `delivered_at` TIMESTAMPTZ? (registered by rider `/deliver`), `custody` TEXT DEFAULT `'none'` (`none|offered|accepted|disputed` — the pickup handshake), `custody_at` TIMESTAMPTZ?, `cancel_remarks` TEXT? (mandatory on rider `/canceldelivery`).
+- **`status`** ∈ `draft|pending|confirmed|packed|shipped|delivered|cancelled` (migration 003 added `draft`). Fulfilment moves one step at a time `confirmed→packed→shipped→delivered` (`orders.service._is_next_step`, no skipping/backward).
+- **`custody`** is the audit handshake for rider handoff: assignment sets `'offered'`; the rider answers once (`'accepted'` = has the product, `'disputed'` = does not) and cannot re-answer. `/deliver` is refused unless `custody='accepted'`.
+- **Profit formula:** `profit = selling_price - discount_amount - product.cost_price × quantity`; `margin% = profit / cost × 100` (§6).
+- **Relations:** has `order_status_history`, `cod_ledger` (via `order_id`, collect rows only); belongs to shop + product + (optional) delivery_person.
 
 ### order_status_history
-- **Key fields:** `id`, `order_id` FK, `status`, `changed_at`, `changed_by`.
+- **Key fields:** `id`, `order_id` FK, `status`, `changed_at`, `changed_by` (`system|shopkeeper|rider`).
 - **Purpose:** audit trail of order status transitions.
 
-### delivery_persons
-- **Key fields:** `id`, `shop_id` FK, `name`, `phone`, `created_at`.
-- **Note:** model is minimal in spec — see Q-006 (under-specified). Stage 8 will finalize.
+### delivery_persons  ✅ Q-006 resolved (Stage 12b)
+- **Key fields:** `id`, `shop_id` FK, `name`, `phone`, `created_at`, `telegram_id` BIGINT? (migration 007 — set once the rider links via the rider bot's Share-contact flow; **not unique**, one person riding for several shops gets one row per shop, all sharing the same `telegram_id`).
+- **Model:** minimal, owner-onboarded (`/addrider`), no zones/shift/vehicle — matches the "minimal now, extend later" option from Q-006. A shop may have more than one rider.
+
+### cod_ledger  (migration 008, Stage 12b)
+- **Key fields:** `id`, `shop_id` FK, `rider_id` FK→delivery_persons, `order_id` FK→orders? (null on `handover` rows — not tied to one delivery), `entry` (`collect|handover`), `amount` DECIMAL, `note`, `created_at`.
+- **Purpose:** append-only cash-on-delivery audit. `'collect'` rows are written by `riders.deliver_order` (one per delivery); `'handover'` rows by the keeper's `/reconcilecod` (end-of-day cash-in).
+- **Invariant:** **balance is always `Σcollect − Σhandover` for a (shop, rider)**, re-derived from the row set — there is no mutable counter column that can drift out of sync with reality.
 
 ### pending_escalations
 - **Key fields:** `id`, `shop_id` FK, `phone`, `message`, `created_at`, `resolved_at`.
@@ -69,9 +76,10 @@ clients 1───* shops 1───* shopkeepers
               shops 1───* orders ──* order_status_history
                        orders *──1 products
                        orders *──?1 delivery_persons
+                       orders 1───* cod_ledger  (collect rows; handover rows have order_id=null)
               shops 1───* pending_escalations
               shops 1───* security_incidents
-              shops 1───* delivery_persons
+              shops 1───* delivery_persons ──* cod_ledger
               shops 1───* audit_logs
               shops 1───* usage_daily *──1 clients
 blacklisted_phones *──?1 shops
@@ -82,7 +90,7 @@ blacklisted_phones *──?1 shops
 - DB: **Supabase Postgres** (ADR-001).
 - Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open).
 - Naming: tables `snake_case`, columns `snake_case`.
-- **RLS enabled** on all tenant tables (`shopkeepers`, `products`, `orders`, `order_status_history`, `pending_escalations`, `security_incidents`, `audit_logs`, `usage_daily`), policies scoped by `shop_id`; backend uses service-role key (ADR-003). `clients` is owner-level (no RLS).
+- **RLS enabled** on all tenant tables (`shopkeepers`, `products`, `orders`, `order_status_history`, `pending_escalations`, `security_incidents`, `audit_logs`, `usage_daily`, `cod_ledger`), policies scoped by `shop_id`; backend uses service-role key (ADR-003). `clients` is owner-level (no RLS).
 
 ## Identity & types
 

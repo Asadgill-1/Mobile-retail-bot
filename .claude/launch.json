@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import sys; sys.path[:0]=['src','config','.']; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "flower",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import sys; sys.path[:0]=['src','config','.']; from celery.__main__ import main; sys.argv=['celery','-A','app.tasks.celery_app','flower','--port=5555']; main()"
+      ],
+      "port": 5555
+    }
+  ]
+}
