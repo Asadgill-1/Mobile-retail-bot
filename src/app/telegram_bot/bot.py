@@ -23,12 +23,15 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     TypeHandler,
     filters,
 )
+
+from app.telegram_bot import keyboards as kb
 
 from app.escalations.service import DeliveryFailed, NoPendingEscalation
 from app.orders.service import (
@@ -227,15 +230,15 @@ async def investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if inc is None:
         await _reply(update, context, "❌ No such incident.")
         return
+    await _reply(update, context, _format_incident(inc))
+
+
+def _format_incident(inc: dict) -> str:
     snap = inc.get("message_snapshot") or []
     lines = "\n".join(f"  {m.get('role', '?')}: {m.get('content', '')[:120]}" for m in snap) or "  (none)"
-    await _reply(
-        update,
-        context,
-        f"🛡 Incident {inc['id']}\nShop: {inc.get('shop_id')}\nCustomer: {inc['phone']}\n"
-        f"Type: {inc['attack_type']}  ·  Status: {inc['status']}\n"
-        f"When: {inc['created_at']}\n\nLast {len(snap)} message(s):\n{lines}",
-    )
+    return (f"🛡 Incident {inc['id']}\nShop: {inc.get('shop_id')}\nCustomer: {inc['phone']}\n"
+            f"Type: {inc['attack_type']}  ·  Status: {inc['status']}\n"
+            f"When: {inc['created_at']}\n\nLast {len(snap)} message(s):\n{lines}")
 
 
 @owner_only
@@ -457,6 +460,11 @@ async def _owner_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- common ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user and is_owner(user.id):
+        await context.bot.send_message(update.effective_chat.id, "👑 Owner controls — tap or /help",
+                                       reply_markup=kb.owner_menu())
+        return
     await _reply(update, context, "Multi-shop chatbot. Owner: /help. Shopkeepers: /help.")
 
 
@@ -466,6 +474,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(
             update,
             context,
+            "👉 /menu — do everything with buttons (no typing commands)\n\n"
             "Owner commands:\n/pauseshop <id|num> <reason>\n/resumeshop <id|num>\n"
             "/shopstatus <id|num>\n\n"
             "Riders (§10):\n/addrider <shop> <phone> <name>\n/riders <shop>\n\n"
@@ -529,6 +538,35 @@ def _product_id(raw: str) -> uuid.UUID:
         raise ValueError(f"'{raw}' is not a valid product id")
 
 
+async def _keeper_err(update: Update, context: ContextTypes.DEFAULT_TYPE, exc: Exception) -> None:
+    """Map a shopkeeper-action exception to a safe reply (shared by commands and buttons)."""
+    if isinstance(exc, ProductNotFound):
+        # Same message whether the id is unknown or owned by another shop —
+        # never confirm that another shop's product exists.
+        await _reply(update, context, "❌ No such product in this shop.")
+    elif isinstance(exc, NoPendingEscalation):
+        await _reply(update, context, f"❌ {exc} is not waiting for a reply from this shop.")
+    elif isinstance(exc, NoPendingDraft):
+        await _reply(update, context, f"❌ No pending order draft #{exc} for this shop.")
+    elif isinstance(exc, NoPriceRequest):
+        await _reply(update, context, f"❌ No pending price request #{exc} for this shop.")
+    elif isinstance(exc, OutOfStock):
+        await _reply(update, context, f"⚠️ Order #{exc} can't be confirmed — that item is now out of stock.")
+    elif isinstance(exc, OrderNotFound):
+        await _reply(update, context, f"❌ No order #{exc} in this shop.")
+    elif isinstance(exc, RiderNotFound):
+        await _reply(update, context, "❌ No such rider in this shop. /riders to see them.")
+    elif isinstance(exc, (InvalidTransition, DeliveryFailed)):
+        verb = "deliver to" if isinstance(exc, DeliveryFailed) else ""
+        await _reply(update, context,
+                     f"❌ Could not {verb} {exc}. They may have blocked the bot." if verb else f"⚠️ {exc}")
+    elif isinstance(exc, (InvalidBoostLevel, InvalidTag, ValueError)):
+        await _reply(update, context, f"⚠️ {exc}")
+    else:
+        logger.exception("keeper action failed", exc_info=exc)
+        await _reply(update, context, "❌ Internal error.")
+
+
 def keeper_command(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable]) -> Callable:
     """Wrap a shopkeeper command: typed errors → safe replies (CONVENTIONS)."""
 
@@ -536,31 +574,8 @@ def keeper_command(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaita
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await handler(update, context)
-        except ProductNotFound:
-            # Same message whether the id is unknown or owned by another shop —
-            # never confirm that another shop's product exists.
-            await _reply(update, context, "❌ No such product in this shop.")
-        except NoPendingEscalation as e:
-            await _reply(update, context, f"❌ {e} is not waiting for a reply from this shop.")
-        except NoPendingDraft as e:
-            await _reply(update, context, f"❌ No pending order draft #{e} for this shop.")
-        except NoPriceRequest as e:
-            await _reply(update, context, f"❌ No pending price request #{e} for this shop.")
-        except OutOfStock as e:
-            await _reply(update, context, f"⚠️ Order #{e} can't be confirmed — that item is now out of stock.")
-        except OrderNotFound as e:
-            await _reply(update, context, f"❌ No order #{e} in this shop.")
-        except RiderNotFound:
-            await _reply(update, context, "❌ No such rider in this shop. /riders to see them.")
-        except InvalidTransition as e:
-            await _reply(update, context, f"⚠️ {e}")
-        except DeliveryFailed as e:
-            await _reply(update, context, f"❌ Could not deliver to {e}. They may have blocked the bot.")
-        except (InvalidBoostLevel, InvalidTag, ValueError) as e:
-            await _reply(update, context, f"⚠️ {e}")
-        except Exception:
-            logger.exception("keeper command failed")
-            await _reply(update, context, "❌ Internal error.")
+        except Exception as e:  # mapped to a safe reply; never leak internals
+            await _keeper_err(update, context, e)
         else:
             await _audit(update, context, handler.__name__)  # §16: log the shop action
 
@@ -665,16 +680,14 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not drafts:
         await _reply(update, context, "No pending order drafts.")
         return
-    lines = []
+    await _reply(update, context, "📥 Pending order drafts:")
     for d in drafts:
         p = d.get("products") or {}
         net = float(d["selling_price"]) - float(d["discount_amount"])
-        lines.append(f"#{d['order_number']} — {d['customer_name']} — "
-                     f"{p.get('brand', '')} {p.get('model', '')} ×{d['quantity']} — {net:.0f} AED")
-    await _reply(
-        update, context,
-        "Pending drafts:\n" + "\n".join(lines) + "\n\n/confirmorder <#>  ·  /rejectorder <#> [reason]",
-    )
+        text = (f"#{d['order_number']} — {d['customer_name']} — "
+                f"{p.get('brand', '')} {p.get('model', '')} ×{d['quantity']} — {net:.0f} AED")
+        await context.bot.send_message(update.effective_chat.id, text,
+                                       reply_markup=kb.keeper_order_actions(d["order_number"]))
 
 
 @keeper_command
@@ -824,6 +837,24 @@ async def denyprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply(update, context, "❌ Declined. Customer told the list price stands.")
 
 
+@keeper_command
+async def pricerequests_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/pricerequests` — pending haggles, each with Approve/Counter/Decline buttons."""
+    from app.orders.service import list_price_requests
+
+    reqs = await list_price_requests(_shop_of(context).id)
+    if not reqs:
+        await _reply(update, context, "No pending price requests.")
+        return
+    await _reply(update, context, "💰 Pending price requests:")
+    for r in reqs:
+        p = r.get("products") or {}
+        text = (f"#{r['request_number']} — {r['identity']} — {p.get('brand', '')} {p.get('model', '')}\n"
+                f"Offer {r['requested_price']} AED · List {p.get('selling_price', '?')} AED")
+        await context.bot.send_message(update.effective_chat.id, text,
+                                       reply_markup=kb.keeper_price_actions(r["request_number"]))
+
+
 # --- shopkeeper Excel export (SPEC §10) — Stage 9 ---
 @keeper_command
 async def exportorders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -925,6 +956,7 @@ KEEPER_COMMANDS: dict[str, Callable] = {
     "approveprice": approveprice_cmd,
     "custom": custom_cmd,
     "denyprice": denyprice_cmd,
+    "pricerequests": pricerequests_cmd,
     # SPEC §10 Excel export (Stage 9)
     "exportorders": exportorders_cmd,
     "exportrider": exportrider_cmd,
@@ -948,6 +980,168 @@ async def _log_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 update.effective_chat.id, (m.text or "")[:200])
 
 
+async def owner_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/menu` — the owner's button menu."""
+    user = update.effective_user
+    if not (user and is_owner(user.id)):
+        await _reply(update, context, "⛔ Owner only.")
+        return
+    await context.bot.send_message(update.effective_chat.id, "👑 Owner controls",
+                                   reply_markup=kb.owner_menu())
+
+
+# Security button → the prompt shown before the owner types the value.
+_OSEC_PROMPT = {
+    "oinv": "🔎 Reply with the incident id.", "oblk": "🚫 Reply with:  <phone> [reason]",
+    "oqlift": "🔓 Reply with the phone to lift.", "oqext": "⏲ Reply with the phone to extend.",
+    "ofwd": "📨 Reply with:  <phone> <shop_id|number>", "obyp": "🤖 Reply with the phone to bypass.",
+    "obypr": "↩️ Reply with the phone to un-bypass.",
+}
+
+
+async def _owner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-button dispatcher for the owner bot."""
+    q = update.callback_query
+    await q.answer()
+    user = update.effective_user
+    if not (user and is_owner(user.id)):
+        await _reply(update, context, "⛔ Owner only.")
+        return
+    service = _service(context)
+    action, args = kb.parse_cb(q.data)
+    try:
+        if action == "omenu":
+            await q.edit_message_text("👑 Owner controls", reply_markup=kb.owner_menu())
+        elif action == "oshops":
+            shops = await service.list_shops()
+            if not shops:
+                await _reply(update, context, "No shops yet.")
+            else:
+                picker = [{"id": str(s.id), "name": s.name} for s in shops]
+                await q.edit_message_text("🏪 Which shop?", reply_markup=kb.owner_shop_picker(picker))
+        elif action == "oshop":
+            await q.edit_message_text("🏪 Shop actions:", reply_markup=kb.owner_shop_actions(args[0]))
+        elif action == "odash":
+            await _owner_dashboard(update, context)
+        elif action == "ohealth":
+            await _owner_health(update, context)
+        elif action == "oesc":
+            await _owner_escalations(update, context)
+        elif action == "oaudit":
+            await _owner_audit(update, context)
+        elif action == "osecmenu":
+            await q.edit_message_text("🛡 Security:", reply_markup=kb.owner_security_menu())
+        elif action == "oprofmenu":
+            await q.edit_message_text("💰 Profit for…", reply_markup=kb.owner_profit_menu())
+        elif action == "oprof":
+            await _owner_profit(update, context, args)  # ['today'|…|'compare']
+        elif action == "oresume":
+            resumed = await service.resume_shop(uuid.UUID(args[0]))
+            await _reply(update, context, f"✅ Resumed: {resumed.name} ({resumed.status.value})")
+        elif action == "ostatus":
+            info = await service.shop_status(uuid.UUID(args[0]))
+            keepers = "\n".join(f"  - {sk.name or '—'}{' (owner)' if sk.is_owner else ''} [{sk.telegram_id}]"
+                                for sk in info.shopkeepers) or "  (none)"
+            await _reply(update, context, f"🏪 {info.name}\nStatus: {info.status.value}\n"
+                         f"Reason: {info.suspension_reason or '—'}\nShopkeepers:\n{keepers}")
+        elif action == "oriders":
+            shop = await service.get_shop(uuid.UUID(args[0]))
+            await _reply(update, context, _format_riders(shop, await list_riders(shop.id)))
+        elif action == "opause":
+            context.chat_data["pending"] = {"do": "opause", "args": args}
+            await _reply(update, context, "⏸ Reply with the suspension reason.")
+        elif action == "oaddr":
+            context.chat_data["pending"] = {"do": "oaddr", "args": args}
+            await _reply(update, context, "➕ Reply with:  <phone> <name>")
+        elif action in _OSEC_PROMPT:
+            context.chat_data["pending"] = {"do": action, "args": []}
+            await _reply(update, context, _OSEC_PROMPT[action])
+        else:
+            await _reply(update, context, "Unknown action. /menu")
+    except (ShopNotFound, ClientNotFound) as e:
+        await _reply(update, context, f"❌ Not found: {e}")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+    except Exception:
+        logger.exception("owner button failed")
+        await _reply(update, context, "❌ Internal error.")
+
+
+async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Consume a free-text reply an owner button asked for (pause reason, add-rider, security value)."""
+    pending = context.chat_data.get("pending")
+    user = update.effective_user
+    if not pending or not (user and is_owner(user.id)):
+        return
+    context.chat_data.pop("pending", None)
+    service = _service(context)
+    do, args = pending["do"], pending["args"]
+    text = (update.message.text or "").strip()
+    try:
+        if do == "opause":
+            if not text:
+                await _reply(update, context, "A reason is required. Tap ⏸ Pause again.")
+                return
+            s = await service.suspend_shop(uuid.UUID(args[0]), text)
+            await _reply(update, context, f"✅ Suspended: {s.name}\nReason: {s.suspension_reason}")
+        elif do == "oaddr":
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await _reply(update, context, "Need <phone> <name>. Tap ➕ Add rider again.")
+                return
+            shop = await service.get_shop(uuid.UUID(args[0]))
+            rider = await add_rider(shop.id, parts[1], parts[0])
+            await _reply(update, context, f"🛵 Rider added to {shop.name}: {rider['name']} ({rider['phone']})\n"
+                         f"id: {rider['id']}\nAsk them to open the rider bot and tap “Share my phone”.")
+        else:
+            await _owner_security_text(update, context, do, text)
+    except (ShopNotFound, ClientNotFound) as e:
+        await _reply(update, context, f"❌ Not found: {e}")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+    except Exception:
+        logger.exception("owner text action failed")
+        await _reply(update, context, "❌ Internal error.")
+
+
+async def _owner_security_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               do: str, text: str) -> None:
+    """The security buttons' typed values → the same security-service calls the slash commands use."""
+    from app.db.redis_client import get_redis
+    from app.security import service as sec
+
+    if not text:
+        await _reply(update, context, "Nothing entered.")
+        return
+    if do == "oinv":
+        inc = await sec.get_incident(text)
+        await _reply(update, context, _format_incident(inc) if inc else "❌ No such incident.")
+    elif do == "oqlift":
+        await sec.lift_quarantine(get_redis(), text)
+        await _reply(update, context, f"✅ Quarantine lifted for {text}.")
+    elif do == "oqext":
+        await sec.extend_quarantine(get_redis(), text)
+        await _reply(update, context, f"⏳ Quarantine extended to 24h for {text}.")
+    elif do == "oblk":
+        parts = text.split(maxsplit=1)
+        await sec.blacklist(get_redis(), parts[0], None, parts[1] if len(parts) > 1 else "owner blacklist")
+        await _reply(update, context, f"⛔ {parts[0]} blacklisted. Their messages are now silently ignored.")
+    elif do == "ofwd":
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await _reply(update, context, "Need <phone> <shop_id|number>.")
+            return
+        shop = await _resolve_shop(_service(context), parts[1])
+        await sec.forward_to_shop(get_redis(), parts[0])
+        await _reply(update, context, f"➡️ {parts[0]} now routed straight to {shop.name}'s staff.")
+    elif do == "obyp":
+        await sec.set_bypass(get_redis(), text)
+        await _reply(update, context, f"➡️ {text} bypasses the AI — messages go straight to the shop's staff.")
+    elif do == "obypr":
+        await sec.remove_bypass(get_redis(), text)
+        await _reply(update, context, f"✅ Bypass removed for {text} — the AI handles them again.")
+
+
 def build_application(service: TenantService) -> Application:
     """Owner control bot: admin commands (/pauseshop, /shopstatus, ...)."""
     app = (
@@ -960,6 +1154,7 @@ def build_application(service: TenantService) -> Application:
     app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", owner_menu_cmd))
     # owner (§2)
     app.add_handler(CommandHandler("pauseshop", pauseshop))
     app.add_handler(CommandHandler("resumeshop", resumeshop))
@@ -975,13 +1170,17 @@ def build_application(service: TenantService) -> Application:
     # shopkeeper stubs (§3/§5/§6/§10/§12)
     for name, (stage, _alias) in SHOPKEEPER_STUBS.items():
         app.add_handler(CommandHandler(name, _stub(name, stage)))
+    app.add_handler(CallbackQueryHandler(_owner_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _owner_text))
     return app
 
 
 # --- application factory: per-shop SHOPKEEPER bot (ADR-005) ---
 async def _shopkeeper_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     shop: Shop = context.application.bot_data["shop"]
-    await _reply(update, context, f"🏪 {shop.name} — shopkeeper bot. Commands: /help")
+    await context.bot.send_message(update.effective_chat.id,
+                                   f"🏪 {shop.name} — shopkeeper bot. Tap below or /help",
+                                   reply_markup=kb.keeper_menu())
 
 
 async def _shopkeeper_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -990,6 +1189,7 @@ async def _shopkeeper_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         update,
         context,
         f"🏪 {shop.name} — shopkeeper commands\n\n"
+        "👉 /menu — do everything with buttons (no typing commands)\n\n"
         "Products:\n"
         "/addproduct — add a product (11 steps, /cancel any time)\n"
         "/boost <id> <1-10> · /unboost <id>\n"
@@ -1042,6 +1242,171 @@ async def _keeper_auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     raise ApplicationHandlerStop  # stop ALL further handlers for this unauthorized update
 
 
+async def keeper_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/menu` — the shopkeeper's button menu."""
+    await context.bot.send_message(update.effective_chat.id,
+                                   f"🏪 {_shop_of(context).name}", reply_markup=kb.keeper_menu())
+
+
+# Which slash prompt each product button maps to (button → guided '<id> <value>' reply).
+_KPROD_PROMPT = {
+    "kboost": "Reply with:  <product_id> <1-10>", "kunboost": "Reply with:  <product_id>",
+    "ktag": "Reply with:  <product_id> <tag1,tag2>", "kuntag": "Reply with:  <product_id> <tag>",
+    "kcleartags": "Reply with:  <product_id>", "kfeature": "Reply with:  <product_id>",
+}
+
+
+async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-button dispatcher for the keeper bot. Auth already enforced by the group -10 gate.
+    Reuses the same service calls as the slash commands — a button is a second entry point only."""
+    q = update.callback_query
+    await q.answer()
+    shop = _shop_of(context)
+    action, args = kb.parse_cb(q.data)
+    try:
+        if action == "kmenu":
+            await q.edit_message_text(f"🏪 {shop.name}", reply_markup=kb.keeper_menu())
+        elif action == "korders":
+            await orders_cmd(update, context)
+        elif action == "kpr":
+            await pricerequests_cmd(update, context)
+        elif action == "kriders":
+            await riders_cmd(update, context)
+        elif action == "kstats":
+            await productstats_cmd(update, context)
+        elif action == "kprofmenu":
+            await q.edit_message_text("📈 Profit for…", reply_markup=kb.keeper_profit_menu())
+        elif action == "kexpmenu":
+            await q.edit_message_text("📤 Export which orders?", reply_markup=kb.keeper_export_menu())
+        elif action == "knegmenu":
+            await q.edit_message_text("💬 Price negotiation:", reply_markup=kb.keeper_negotiation_menu())
+        elif action == "kprodmenu":
+            await q.edit_message_text("🏷 Product tools:", reply_markup=kb.keeper_product_menu())
+        elif action == "krecmenu":
+            riders = await list_riders(shop.id)
+            if not riders:
+                await _reply(update, context, "No riders yet. /addrider via the owner bot.")
+            else:
+                await q.edit_message_text("💵 Reconcile which rider?",
+                                          reply_markup=kb.keeper_reconcile_picker(riders))
+        elif action == "kconf":
+            num = _order_number(args[0])
+            await confirm_order(shop, num)
+            await context.bot.send_message(update.effective_chat.id,
+                                           f"✅ Order #{num} confirmed. Stock updated, customer notified.",
+                                           reply_markup=kb.keeper_delivery_menu(num))
+        elif action == "krej":
+            context.chat_data["pending"] = {"do": "krej", "args": args}
+            await _reply(update, context,
+                         f"❌ Rejecting #{args[0]}. Reply with a reason, or send '-' for none.")
+        elif action == "kdup":
+            await advance_delivery(shop, _order_number(args[0]), args[1])
+            await _reply(update, context, f"🚚 Order #{args[0]} → {args[1]}. Customer notified.")
+        elif action == "kappr":
+            price = await approve_price(shop, _order_number(args[0]))
+            await _reply(update, context, f"✅ Approved at {price} AED. Customer notified.")
+        elif action == "kcust":
+            context.chat_data["pending"] = {"do": "kcust", "args": args}
+            await _reply(update, context, f"✏️ Counter for request #{args[0]} — reply with your price (AED).")
+        elif action == "kdeny":
+            await deny_price(shop, _order_number(args[0]))
+            await _reply(update, context, "❌ Declined. Customer told the list price stands.")
+        elif action == "kasg":
+            riders = await list_riders(shop.id)
+            if not riders:
+                await _reply(update, context, "No riders yet. /addrider via the owner bot.")
+            else:
+                await q.edit_message_text(f"🛵 Assign order #{args[0]} to…",
+                                          reply_markup=kb.keeper_rider_picker(_order_number(args[0]), riders))
+        elif action == "kasgr":
+            res = await assign_delivery(shop, _order_number(args[0]), uuid.UUID(args[1]))
+            tail = ("Rider notified. 📲" if res["notified"]
+                    else "⚠️ Rider hasn't linked Telegram yet.")
+            await _reply(update, context,
+                         f"🛵 Order #{args[0]} → {res['rider']['name']} (COD {res['cod']} AED). {tail}")
+        elif action == "krec":
+            context.chat_data["pending"] = {"do": "krec", "args": args}
+            await _reply(update, context, "💵 Reply with the cash amount the rider handed over (AED).")
+        elif action == "kprof":
+            start, end, label = parse_period(args[0])
+            s = await profit_summary(shop.id, start, end)
+            await _reply(update, context, format_profit(s, label))
+        elif action in ("kexp", "kexpd"):
+            name, url, n = await export_orders(shop, args[0], action == "kexpd")
+            await _reply(update, context, f"📄 {n} order(s) — {name}\n{url}\n(link valid 24h)")
+        elif action == "kneg":
+            await set_negotiation(shop.id, args[0] == "on")
+            await _reply(update, context,
+                         "💬 Negotiation ON." if args[0] == "on" else "🔒 Negotiation OFF — no discounts.")
+        elif action in _KPROD_PROMPT:
+            context.chat_data["pending"] = {"do": action, "args": []}
+            await _reply(update, context, _KPROD_PROMPT[action])
+        else:
+            await _reply(update, context, "Unknown action. /menu")
+    except Exception as e:
+        await _keeper_err(update, context, e)
+
+
+async def _keeper_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Consume a free-text reply that a button asked for (reject reason, counter price, COD amount,
+    product edit). No pending prompt → ignore (keeps the bot silent on stray text)."""
+    pending = context.chat_data.get("pending")
+    if not pending:
+        return
+    context.chat_data.pop("pending", None)
+    shop = _shop_of(context)
+    do, args = pending["do"], pending["args"]
+    text = (update.message.text or "").strip()
+    try:
+        if do == "krej":
+            reason = None if text in ("", "-") else text
+            await reject_order(shop, _order_number(args[0]), reason)
+            await _reply(update, context, f"❌ Order #{args[0]} rejected.")
+        elif do == "kcust":
+            price = await approve_price(shop, _order_number(args[0]), parse_price(text))
+            await _reply(update, context, f"✅ Offered {price} AED to the customer.")
+        elif do == "krec":
+            from app.riders.service import parse_cash, reconcile_cod
+
+            rider = await _resolve_rider(shop, args[0])
+            trail = await reconcile_cod(shop, rider, parse_cash(text))
+            tail = ("\n\n📲 Trail sent to the rider." if rider.get("telegram_id")
+                    else "\n\n⚠️ Rider hasn't linked Telegram — trail not pushed.")
+            await _reply(update, context, trail["text"] + tail)
+        elif do in _KPROD_PROMPT:
+            await _keeper_product_edit(update, context, shop, do, text)
+    except Exception as e:
+        await _keeper_err(update, context, e)
+
+
+async def _keeper_product_edit(update, context, shop, do: str, text: str) -> None:
+    """Apply a product button's '<id> <value>' reply via the existing product-service calls."""
+    parts = text.split(maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Nothing entered.")
+        return
+    pid = _product_id(parts[0])
+    rest = parts[1] if len(parts) > 1 else ""
+    if do == "kboost":
+        p = await set_boost(shop.id, pid, parse_boost_level(rest))
+        await _reply(update, context, f"🚀 {p.brand} {p.model} — boost {p.boost_level}/10.")
+    elif do == "kunboost":
+        p = await set_boost(shop.id, pid, 0)
+        await _reply(update, context, f"✅ {p.brand} {p.model} — boost cleared.")
+    elif do == "ktag":
+        p = await add_tags(shop.id, pid, parse_tags(rest))
+        await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
+    elif do == "kuntag":
+        p = await remove_tag(shop.id, pid, rest)
+        await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
+    elif do == "kcleartags":
+        p = await clear_tags(shop.id, pid)
+        await _reply(update, context, f"🏷 {p.brand} {p.model} — all tags removed.")
+    elif do == "kfeature":
+        p = await toggle_featured(shop.id, pid)
+        await _reply(update, context, f"{'⭐' if p.is_featured else '☆'} {p.brand} {p.model} — featured: {p.is_featured}")
+
+
 def build_shopkeeper_application(service: TenantService, shop: Shop) -> Application:
     """Per-shop shopkeeper bot: staff-side commands scoped to one shop."""
     if not shop.telegram_keeper_bot_token:
@@ -1053,6 +1418,7 @@ def build_shopkeeper_application(service: TenantService, shop: Shop) -> Applicat
     app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
     app.add_handler(CommandHandler("start", _shopkeeper_start))
     app.add_handler(CommandHandler("help", _shopkeeper_help))
+    app.add_handler(CommandHandler("menu", keeper_menu_cmd))
     # Stage 5: real product commands (SPEC §5) + the /addproduct flow (SPEC §4).
     app.add_handler(build_addproduct_handler())
     for name, handler in KEEPER_COMMANDS.items():
@@ -1060,6 +1426,10 @@ def build_shopkeeper_application(service: TenantService, shop: Shop) -> Applicat
     for name, (stage, _alias) in SHOPKEEPER_STUBS.items():
         if name not in KEEPER_REAL_COMMANDS:
             app.add_handler(CommandHandler(name, _stub(name, stage)))
+    app.add_handler(CallbackQueryHandler(_keeper_cb))
+    # Runs AFTER the /addproduct conversation, so an active add-flow keeps its text; otherwise a
+    # pending button-prompt (reject reason, counter price, COD amount) claims the reply.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _keeper_text))
     return app
 
 
@@ -1104,14 +1474,21 @@ def build_customer_application(service: TenantService, shop: Shop) -> Applicatio
     app.bot_data["tenant_service"] = service
     app.bot_data["shop"] = shop
     app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
-    app.add_handler(CommandHandler("start", _shopkeeper_start))
+    app.add_handler(CommandHandler("start", _customer_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _customer_message))
     return app
+
+
+async def _customer_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Customer bot greeting — no staff buttons here; the customer just chats (LLM handles it)."""
+    shop: Shop = context.application.bot_data["shop"]
+    await _reply(update, context, f"👋 Welcome to {shop.name}! How can I help you today?")
 
 
 # --- application factory: global RIDER bot (SPEC §10 delivery) ---
 _RIDER_HELP = (
     "🛵 Rider commands:\n"
+    "👉 /menu — buttons for everything (no typing)\n"
     "/mydeliveries — your assignments + status\n"
     "/accept <order#> — confirm you HAVE the product\n"
     "/notreceived <order#> — product was NOT handed to you\n"
@@ -1129,16 +1506,17 @@ async def _rider_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user = update.effective_user
     if user and await riders_by_telegram(user.id):  # already linked → straight to work
-        await _reply(update, context, f"🛵 Welcome back!\n\n{_RIDER_HELP}")
+        await context.bot.send_message(update.effective_chat.id, "🛵 Welcome back!",
+                                       reply_markup=kb.rider_menu())
         return
-    kb = ReplyKeyboardMarkup(
+    contact_kb = ReplyKeyboardMarkup(  # local name must not shadow the module alias `kb` (keyboards)
         [[KeyboardButton("📲 Share my phone number", request_contact=True)]],
         resize_keyboard=True, one_time_keyboard=True,
     )
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="🛵 Rider bot.\nTap below to link your Telegram — then you'll get delivery assignments here.",
-        reply_markup=kb,
+        reply_markup=contact_kb,
     )
 
 
@@ -1159,9 +1537,10 @@ async def _rider_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "❌ This number isn't registered as a rider yet. Ask the shop owner to add you first.",
         )
         return
-    await _reply(
-        update, context,
-        f"✅ Linked! You'll receive delivery assignments here ({len(linked)} shop(s)).\n\n{_RIDER_HELP}",
+    await context.bot.send_message(
+        update.effective_chat.id,
+        f"✅ Linked! You'll receive delivery assignments here ({len(linked)} shop(s)).",
+        reply_markup=kb.rider_menu(),
     )
 
 
@@ -1218,14 +1597,16 @@ async def rider_mydeliveries(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not orders:
         await _reply(update, context, "No deliveries assigned to you yet.")
         return
-    lines = []
+    await _reply(update, context, "🛵 Your deliveries:")
     for o in orders:
         p = o.get("products") or {}
         item = f"{p.get('brand', '')} {p.get('model', '')}".strip()
         cod = f" · COD {o['cod_amount']} AED" if o.get("cod_amount") is not None else ""
-        lines.append(f"#{o['order_number']} — {item} ×{o['quantity']} — {o['address']}{cod}\n"
-                     f"   {_rider_status_icon(o)}")
-    await _reply(update, context, "🛵 Your deliveries:\n\n" + "\n".join(lines))
+        text = (f"#{o['order_number']} — {item} ×{o['quantity']} — {o['address']}{cod}\n"
+                f"   {_rider_status_icon(o)}")
+        # Per-order message so its action buttons (accept/deliver/…) map to THIS order.
+        markup = kb.rider_delivery_actions(o["order_number"], o.get("custody") or "none", o["status"])
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=markup)
 
 
 @rider_command
@@ -1261,16 +1642,21 @@ async def rider_notreceived(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def rider_deliver(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
     """`/deliver <order#>` — register the delivery time, then ask for the cash received.
     The order finalizes (status/messages) when the rider replies with the amount."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /deliver <order_number>")
+        return
+    await _do_rider_deliver(update, context, rows, _order_number(parts[0]))
+
+
+async def _do_rider_deliver(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            rows: list[dict], num: int) -> None:
+    """Shared by /deliver and the 🚚 Deliver button: register time, then prompt for cash."""
     from datetime import datetime
 
     from app.reports.service import DUBAI
     from app.riders.service import _get_my_order, deliverable
 
-    parts = _split(update.message.text, maxsplit=1)
-    if not parts:
-        await _reply(update, context, "Usage: /deliver <order_number>")
-        return
-    num = _order_number(parts[0])
     order = await _get_my_order([r["id"] for r in rows], num, None)  # raises NotYourDelivery
     reason = deliverable(order["status"], order.get("custody") or "none")
     if reason:
@@ -1293,6 +1679,28 @@ async def _rider_cash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from datetime import datetime
 
     from app.riders.service import NotYourDelivery, deliver_order, parse_cash, riders_by_telegram
+
+    # A 🚫 Cancel button asks for remarks next — consume this text as those remarks.
+    remarks_for = context.chat_data.get("await_remarks")
+    if remarks_for is not None:
+        context.chat_data.pop("await_remarks", None)
+        text = (update.message.text or "").strip()
+        if not text:
+            await _reply(update, context, "Remarks are required. Cancel aborted — tap 🚫 again.")
+            return
+        user = update.effective_user
+        rows = await riders_by_telegram(user.id) if user else []
+        if not rows:
+            return
+        from app.riders.service import cancel_delivery
+        try:
+            await cancel_delivery([r["id"] for r in rows], rows[0]["name"], remarks_for, text)
+        except Exception as e:
+            await _reply(update, context, f"⚠️ {e}")
+            return
+        await _reply(update, context,
+                     f"❌ Delivery #{remarks_for} cancelled. Shop and customer notified; stock restored.")
+        return
 
     pending = context.chat_data.get("await_cash")
     if not pending:
@@ -1344,9 +1752,14 @@ async def rider_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, rows:
 @rider_command
 async def rider_myreport(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: list[dict]) -> None:
     """`/myreport [period]` or `/myreport <from> <to>` — deliveries done + cash collected."""
+    await _do_rider_report(update, context, rows, _split(update.message.text, maxsplit=2))
+
+
+async def _do_rider_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           rows: list[dict], args: list[str]) -> None:
+    """Shared by /myreport and the report-period buttons."""
     from app.riders.service import cod_balance, delivered_report, report_window
 
-    args = _split(update.message.text, maxsplit=2)
     try:
         start, end, label = report_window(args)
     except ValueError:
@@ -1372,6 +1785,62 @@ async def rider_myreport(update: Update, context: ContextTypes.DEFAULT_TYPE, row
     await _reply(update, context, "\n".join(lines))
 
 
+async def rider_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/menu` — the rider's button menu (works only once they're linked)."""
+    from app.riders.service import riders_by_telegram
+
+    user = update.effective_user
+    if not (user and await riders_by_telegram(user.id)):
+        await _reply(update, context, "⛔ Press /start and share your phone number first.")
+        return
+    await context.bot.send_message(update.effective_chat.id, "🛵 What next?", reply_markup=kb.rider_menu())
+
+
+async def _rider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-button dispatcher for the rider bot. Reuses the same service calls as the commands."""
+    from app.riders.service import NotYourDelivery, riders_by_telegram, set_custody
+
+    q = update.callback_query
+    await q.answer()  # stop Telegram's button spinner
+    user = update.effective_user
+    rows = await riders_by_telegram(user.id) if user else []
+    if not rows:
+        await _reply(update, context, "⛔ Press /start and share your phone number first.")
+        return
+    action, args = kb.parse_cb(q.data)
+    rider_ids = [r["id"] for r in rows]
+    try:
+        if action == "rmenu":
+            await q.edit_message_text("🛵 What next?", reply_markup=kb.rider_menu())
+        elif action == "rmydel":
+            await rider_mydeliveries(update, context)
+        elif action == "rrepmenu":
+            await q.edit_message_text("📊 Report for…", reply_markup=kb.rider_report_menu())
+        elif action == "rrep":
+            await _do_rider_report(update, context, rows, args)
+        elif action == "racc":
+            num = int(args[0])
+            await set_custody(rider_ids, rows[0]["name"], num, accept=True)
+            await _reply(update, context,
+                         f"✅ Pickup confirmed for #{num}. Shop notified. When done, tap 🚚 Deliver.")
+        elif action == "rnrx":
+            num = int(args[0])
+            await set_custody(rider_ids, rows[0]["name"], num, accept=False)
+            await _reply(update, context, f"🚨 Recorded: #{num} not received. The shop has been alerted.")
+        elif action == "rdel":
+            await _do_rider_deliver(update, context, rows, int(args[0]))
+        elif action == "rcan":
+            context.chat_data["await_remarks"] = int(args[0])
+            await _reply(update, context,
+                         f"🚫 Cancelling #{args[0]}. Reply with the reason (remarks are required).")
+        else:
+            await _reply(update, context, "Unknown action. /menu")
+    except NotYourDelivery as e:
+        await _reply(update, context, f"❌ No delivery #{e} assigned to you.")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+
+
 def build_rider_application(service: TenantService) -> Application:
     """Global rider bot: link Telegram, receive assignments, work them (SPEC §10)."""
     from app.core.config import settings
@@ -1383,12 +1852,14 @@ def build_rider_application(service: TenantService) -> Application:
     app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
     app.add_handler(CommandHandler("start", _rider_start))
     app.add_handler(CommandHandler("help", rider_help))
+    app.add_handler(CommandHandler("menu", rider_menu_cmd))
     app.add_handler(CommandHandler("mydeliveries", rider_mydeliveries))
     app.add_handler(CommandHandler("accept", rider_accept))
     app.add_handler(CommandHandler("notreceived", rider_notreceived))
     app.add_handler(CommandHandler("deliver", rider_deliver))
     app.add_handler(CommandHandler("canceldelivery", rider_cancel))
     app.add_handler(CommandHandler("myreport", rider_myreport))
+    app.add_handler(CallbackQueryHandler(_rider_cb))
     app.add_handler(MessageHandler(filters.CONTACT, _rider_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _rider_cash))
     return app

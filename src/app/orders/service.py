@@ -224,6 +224,8 @@ async def draft_order(
     colour = f" {product.color}" if product.color else ""
     cost_total = product.cost_price * quantity
     charge = unit * quantity
+    from app.telegram_bot.keyboards import keeper_order_actions as _draft_actions
+
     await _notify_shop(
         shop,
         f"🧾 New order draft #{num}\n"
@@ -237,7 +239,8 @@ async def draft_order(
         f"Deliver: {address}"
         + (f"\nWhen: {delivery_date}" if delivery_date else "")
         + (f"\nNote: {special_instructions}" if special_instructions else "")
-        + f"\n\nAccept:  /confirmorder {num}\nReject:  /rejectorder {num} [reason]",
+        + f"\n\nTap below — or /confirmorder {num} / /rejectorder {num} [reason]",
+        _draft_actions(num),
     )
     return {"status": "submitted_to_shop"}
 
@@ -272,6 +275,8 @@ async def request_price(
 
     row = await _open_price_request(shop.id, identity, product.id, requested_price, client)
     num = row["request_number"]
+    from app.telegram_bot.keyboards import keeper_price_actions
+
     await _notify_shop(
         shop,
         f"💰 Price request #{num}\n"
@@ -280,9 +285,9 @@ async def request_price(
         f"List: {product.selling_price} AED\n"
         f"Buy (cost): {product.cost_price} AED\n"
         f"Margin if approved: {requested_price - product.cost_price} AED\n\n"
-        f"Approve:  /approveprice {num}\n"
-        f"Counter:  /custom {num} <price>\n"
-        f"Decline:  /denyprice {num}",
+        f"Tap below (Counter asks your price) — or /approveprice {num} / /custom {num} <price> "
+        f"/ /denyprice {num}",
+        keeper_price_actions(num),
     )
     return {"status": "asked_shop"}
 
@@ -491,6 +496,7 @@ async def assign_delivery(
     `{rider, notified}` so the shopkeeper is told whether the rider has linked Telegram yet.
     """
     from app.riders.service import cod_balance, get_rider
+    from app.telegram_bot.keyboards import rider_delivery_actions
     from app.telegram_bot.notify import send_to_rider
 
     order = await _get_order(shop.id, order_number, client)  # raises OrderNotFound
@@ -518,10 +524,12 @@ async def assign_delivery(
             + (f"\nNote: {order['special_instructions']}" if order.get("special_instructions") else "")
             + f"\n\n💵 Collect (COD): {cod} AED"
             f"\n📊 Cash you already hold: {outstanding} AED"
-            f"\n\nGot the product?  /accept {order_number}"
-            f"\nNot handed to you?  /notreceived {order_number}"
+            f"\n\nTap below — or /accept {order_number} / /notreceived {order_number}"
         )
-        notified = await send_to_rider(int(rider["telegram_id"]), text)
+        notified = await send_to_rider(
+            int(rider["telegram_id"]), text,
+            reply_markup=rider_delivery_actions(order_number, "offered", order["status"]),
+        )
     return {"rider": rider, "notified": notified, "cod": cod}
 
 
@@ -544,6 +552,21 @@ async def list_drafts(shop_id: UUID, client: Any | None = None) -> list[dict]:
             sb.table("orders").select(_DRAFT_SELECT)
             .eq("shop_id", str(shop_id)).eq("status", "draft")
             .order("order_number").execute().data or []
+        )
+
+    return await asyncio.to_thread(_q)
+
+
+async def list_price_requests(shop_id: UUID, client: Any | None = None) -> list[dict]:
+    """Pending price requests for the keeper's 💰 button (joins the product for a readable line)."""
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("price_requests")
+            .select("request_number,identity,requested_price,products(brand,model,selling_price)")
+            .eq("shop_id", str(shop_id)).eq("status", "pending")
+            .order("request_number").execute().data or []
         )
 
     return await asyncio.to_thread(_q)
@@ -712,9 +735,9 @@ async def _decrement_stock(shop_id: UUID, product_id: str, qty: int, client: Any
     return await asyncio.to_thread(_q)
 
 
-async def _notify_shop(shop: Shop, text: str) -> None:
+async def _notify_shop(shop: Shop, text: str, reply_markup=None) -> None:
     """Best-effort staff notification (never raises — mirrors escalations)."""
     try:
-        await send_to_shopkeepers(shop, await _shopkeepers(shop.id), text)
+        await send_to_shopkeepers(shop, await _shopkeepers(shop.id), text, reply_markup)
     except Exception:
         logger.exception("draft notify failed shop=%s", shop.id)

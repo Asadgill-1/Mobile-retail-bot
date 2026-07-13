@@ -203,10 +203,16 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data.pop(_DRAFT, None)
+    # brand/model are shopkeeper free-text: a name like 'Galaxy_S24' or 'Note*' would break
+    # Markdown parsing (400 Bad Request → no confirmation shown). Use Telegram HTML with the
+    # dynamic parts escaped so any characters render literally and the send can never 400.
+    from app.telegram_bot.format import escape_html
+
     await update.message.reply_text(
-        f"✅ Saved.\n{product.brand} {product.model}\nid: `{product.id}`\n"
+        f"✅ Saved.\n{escape_html(product.brand)} {escape_html(product.model)}\n"
+        f"id: <code>{product.id}</code>\n"
         f"Use it with /boost, /tag, /feature.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     return ConversationHandler.END
 

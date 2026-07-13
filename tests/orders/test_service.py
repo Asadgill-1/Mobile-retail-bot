@@ -176,7 +176,7 @@ def draft_wire(monkeypatch):
         cap["created"] = kw
         return {"order_number": 7, "id": "o1"}
 
-    async def _notify(shop, text):
+    async def _notify(shop, text, reply_markup=None):
         cap["notified"] = text
 
     async def _approved(shop_id, identity, product_id, client):
@@ -251,7 +251,7 @@ def price_wire(monkeypatch):
         cap["opened"] = price
         return {"request_number": 4, "id": "pr1"}
 
-    async def _notify(shop, text):
+    async def _notify(shop, text, reply_markup=None):
         cap["notified"] = text
 
     async def _get_req(shop_id, num, client):
@@ -494,7 +494,7 @@ async def test_assign_delivery_notifies_linked_rider_with_cod(monkeypatch):
     async def _set_rider(oid, rid, cod, client):
         cap["set"] = (oid, str(rid), cod)
 
-    async def _send_to_rider(tid, text):
+    async def _send_to_rider(tid, text, reply_markup=None):
         cap["msg"] = (tid, text)
         return True
 

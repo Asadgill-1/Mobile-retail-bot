@@ -17,4 +17,9 @@ target-version = ["py311"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"  # silence pytest-asyncio's unset-scope deprecation
 testpaths = ["tests"]
+filterwarnings = [
+    # third-party: supabase still imports the deprecated `gotrue` package; nothing we can fix here.
+    "ignore:The `gotrue` package is deprecated:DeprecationWarning",
+]

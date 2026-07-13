@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from app.core.config import settings
@@ -26,7 +26,8 @@ from app.tenants.models import Shop, Shopkeeper
 logger = logging.getLogger(__name__)
 
 
-async def _send(token: str | None, chat_id: int | str, text: str, *, what: str) -> bool:
+async def _send(token: str | None, chat_id: int | str, text: str, *, what: str,
+                reply_markup: InlineKeyboardMarkup | None = None) -> bool:
     """Send one message. Returns success; never raises."""
     if not token:
         logger.error("cannot send %s: no bot token configured", what)
@@ -35,7 +36,7 @@ async def _send(token: str | None, chat_id: int | str, text: str, *, what: str) 
         # ponytail: a fresh Bot per send (one HTTP session each). ceiling: wasteful under load.
         # upgrade: hold long-lived Bot instances once notification volume justifies it.
         async with Bot(token) as bot:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         return True
     except TelegramError as e:
         # 403 "chat not found" is normal until the recipient has pressed /start on that bot.
@@ -53,25 +54,29 @@ async def send_to_owner(text: str) -> bool:
     )
 
 
-async def send_to_shopkeepers(shop: Shop, shopkeepers: Iterable[Shopkeeper], text: str) -> int:
+async def send_to_shopkeepers(shop: Shop, shopkeepers: Iterable[Shopkeeper], text: str,
+                              reply_markup: InlineKeyboardMarkup | None = None) -> int:
     """Notify a shop's staff on that shop's keeper bot. Returns how many were reached."""
     reached = 0
     for sk in shopkeepers:
-        if await _send(shop.telegram_keeper_bot_token, sk.telegram_id, text, what="shopkeeper notice"):
+        if await _send(shop.telegram_keeper_bot_token, sk.telegram_id, text,
+                       what="shopkeeper notice", reply_markup=reply_markup):
             reached += 1
     if reached == 0:
         logger.error("no shopkeeper reached for shop=%s (%s)", shop.id, shop.name)
     return reached
 
 
-async def send_to_rider(telegram_id: int, text: str) -> bool:
+async def send_to_rider(telegram_id: int, text: str,
+                        reply_markup: InlineKeyboardMarkup | None = None) -> bool:
     """Push a delivery assignment to a rider on the global rider bot. Best-effort (never raises).
 
     Fails (returns False) if the rider bot token is unset or the rider hasn't pressed /start yet —
     the caller tells the shopkeeper the rider wasn't reached, it never breaks the assignment.
     """
     return await _send(
-        settings.telegram_rider_bot_token, telegram_id, text, what="rider assignment"
+        settings.telegram_rider_bot_token, telegram_id, text, what="rider assignment",
+        reply_markup=reply_markup,
     )
 
 
