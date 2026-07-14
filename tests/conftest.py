@@ -23,6 +23,17 @@ from app.db.in_memory import InMemoryTenantRepo  # noqa: E402
 from app.tenants.service import TenantService  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_message_persist(monkeypatch):
+    """remember() archives every turn to the messages table (migration 009); tests must not
+    hit real HTTP. Tests of the archive itself re-monkeypatch with a spy."""
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr("app.messaging.store.save_message", _noop)
+
+
 @pytest.fixture
 def tenant_repo() -> InMemoryTenantRepo:
     repo = InMemoryTenantRepo()

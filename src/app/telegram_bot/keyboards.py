@@ -1,4 +1,4 @@
-"""Inline keyboards + callback-data vocabulary for the owner / keeper / rider bots.
+"""Inline keyboards + callback-data vocabulary for the owner / keeper / rider / shop-owner bots.
 
 Pure builders — no handlers, no bot state, no I/O. Imports only `telegram`, so both the
 handler layer (`bot.py`, attaching keyboards to menus and lists) and the outbound senders
@@ -152,7 +152,8 @@ def owner_menu() -> M:
          B("🩺 Health", callback_data=cb("ohealth"))],
         [B("🚦 Escalations", callback_data=cb("oesc")),
          B("🛡 Security", callback_data=cb("osecmenu"))],
-        [B("📋 Audit", callback_data=cb("oaudit"))],
+        [B("📋 Audit", callback_data=cb("oaudit")),
+         B("🧹 Messages", callback_data=cb("omsgmenu"))],
     ])
 
 
@@ -192,20 +193,121 @@ def owner_security_menu() -> M:
     ])
 
 
+# --- SHOP OWNER (prefix `s`; the client who owns 1+ shops, ADR-006) ----------
+def shopowner_menu() -> M:
+    return M([
+        [B("🏪 My shops", callback_data=cb("sshops")),
+         B("📊 Analytics", callback_data=cb("sanmenu"))],
+        [B("💬 Messages", callback_data=cb("smsgs"))],
+    ])
+
+
+def shopowner_shop_picker(shops: list[dict], action: str = "sshop") -> M:
+    """One button per owned shop. `action` reuses the picker for messages ("smsg")."""
+    rows = [[B(f"🏪 {s['name']}", callback_data=cb(action, s["id"]))] for s in shops]
+    return M(rows + [[B("⬅️ Menu", callback_data=cb("smenu"))]])
+
+
+def shopowner_shop_actions(shop_id: str) -> M:
+    return M([
+        [B("📈 Profit", callback_data=cb("sprofmenu", shop_id)),
+         B("📦 Orders", callback_data=cb("sordmenu", shop_id))],
+        [B("🗃 Inventory", callback_data=cb("sinv", shop_id)),
+         B("🛵 Riders & COD", callback_data=cb("scod", shop_id))],
+        [B("📤 Export Excel", callback_data=cb("sexpmenu", shop_id)),
+         B("💬 Messages", callback_data=cb("smsg", shop_id))],
+        [B("⬅️ Shops", callback_data=cb("sshops"))],
+    ])
+
+
+def shopowner_shop_period_menu(action: str, shop_id: str, back: str) -> M:
+    """Period buttons that carry a shop id (e.g. sprof:<sid>:today)."""
+    rows = [[B(label, callback_data=cb(action, shop_id, val))] for label, val in _PERIODS]
+    return M(rows + [[B("⬅️ Back", callback_data=back)]])
+
+
+def shopowner_period_menu(action: str, back: str) -> M:
+    """Period buttons without a shop id (analytics across all owned shops)."""
+    return M(_period_rows(action) + [[B("⬅️ Back", callback_data=back)]])
+
+
+def shopowner_orders_menu(shop_id: str) -> M:
+    filts = [("Today", "today"), ("Yesterday", "yesterday"), ("Pending", "pending"), ("All", "all")]
+    rows = [[B(label, callback_data=cb("sord", shop_id, val))] for label, val in filts]
+    return M(rows + [[B("⬅️ Back", callback_data=cb("sshop", shop_id))]])
+
+
+def shopowner_export_menu(shop_id: str) -> M:
+    filts = [("Today", "today"), ("Yesterday", "yesterday"), ("Pending", "pending"), ("All", "all")]
+    rows = [[B(label, callback_data=cb("sexp", shop_id, val)),
+             B(f"{label} (detailed)", callback_data=cb("sexpd", shop_id, val))]
+            for label, val in filts]
+    return M(rows + [[B("⬅️ Back", callback_data=cb("sshop", shop_id))]])
+
+
+def shopowner_analytics_menu() -> M:
+    return M([
+        [B("↔️ Compare shops", callback_data=cb("scmpmenu")),
+         B("🏆 Top products", callback_data=cb("stopmenu"))],
+        [B("🕵️ Cancels & discounts", callback_data=cb("scanmenu")),
+         B("💵 COD outstanding", callback_data=cb("scodall"))],
+        [B("⬅️ Menu", callback_data=cb("smenu"))],
+    ])
+
+
+def shopowner_conversations_kb(shop_id: str, convs: list[dict]) -> M:
+    """One button per recent conversation. An identity too long for 64 bytes is skipped
+    (never happens with phone/Telegram-id identities; fail safe, not loud, in production)."""
+    rows = []
+    for c in convs:
+        data = f"smsgc:{shop_id}:{c['identity']}"
+        if len(data.encode()) <= CB_LIMIT:
+            rows.append([B(f"👤 {c['identity']}", callback_data=data)])
+    return M(rows + [[B("⬅️ Back", callback_data=cb("sshop", shop_id))]])
+
+
+# --- OWNER (platform) message-deletion menu ----------------------------------
+def owner_messages_menu() -> M:
+    """Platform-owner-only: delete the permanent chat archive (migration 009)."""
+    return M([
+        [B("🗑 Delete ALL", callback_data=cb("omdel", "all"))],
+        [B("🗑 Delete by shop", callback_data=cb("omdelshop"))],
+        [B("🗓 Delete date range", callback_data=cb("omdel", "range"))],
+        [B("⬅️ Menu", callback_data=cb("omenu"))],
+    ])
+
+
+def owner_msg_shop_picker(shops: list[dict]) -> M:
+    rows = [[B(f"🏪 {s['name']}", callback_data=cb("omdel", "shop", s["id"]))] for s in shops]
+    return M(rows + [[B("⬅️ Back", callback_data=cb("omsgmenu"))]])
+
+
 if __name__ == "__main__":
     # self-check: round-trip + every builder stays under the 64-byte callback limit.
     assert parse_cb(cb("kasgr", 7, "550e8400-e29b-41d4-a716-446655440000")) == (
         "kasgr", ["7", "550e8400-e29b-41d4-a716-446655440000"])
     assert parse_cb("kmenu") == ("kmenu", [])
     fake = [{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Ali"}]
+    uid = fake[0]["id"]
+    convs = [{"identity": "+971501234567"}, {"identity": "x" * 60}]  # 2nd too long → skipped
     for kb in (rider_menu(), rider_report_menu(), keeper_menu(), keeper_profit_menu(),
                keeper_export_menu(), keeper_negotiation_menu(), keeper_product_menu(),
                keeper_order_actions(7), keeper_delivery_menu(7), keeper_price_actions(3),
                keeper_rider_picker(7, fake), keeper_reconcile_picker(fake), owner_menu(),
                owner_profit_menu(), owner_shop_picker(fake), owner_shop_actions(fake[0]["id"]),
-               owner_security_menu(), rider_delivery_actions(7, "offered", "shipped")):
+               owner_security_menu(), rider_delivery_actions(7, "offered", "shipped"),
+               shopowner_menu(), shopowner_shop_picker(fake), shopowner_shop_picker(fake, "smsg"),
+               shopowner_shop_actions(uid),
+               shopowner_shop_period_menu("sprof", uid, cb("sshop", uid)),
+               shopowner_period_menu("scmp", cb("sanmenu")), shopowner_orders_menu(uid),
+               shopowner_export_menu(uid), shopowner_analytics_menu(),
+               shopowner_conversations_kb(uid, convs), owner_messages_menu(),
+               owner_msg_shop_picker(fake)):
         for row in kb.inline_keyboard:
             for btn in row:
                 assert len(btn.callback_data.encode()) <= CB_LIMIT, btn.callback_data
     assert rider_delivery_actions(7, "none", "delivered") is None
+    # 60-char identity dropped, phone identity kept, back row always present
+    assert len(shopowner_conversations_kb(uid, convs).inline_keyboard) == 2
+    assert parse_cb(cb("sprof", uid, "today")) == ("sprof", [uid, "today"])
     print("keyboards self-check ok")

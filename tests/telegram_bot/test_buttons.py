@@ -63,12 +63,14 @@ class _Query:
         self.data = data
         self.answered = False
         self.edits: list[str] = []
+        self.markups: list = []
 
     async def answer(self) -> None:
         self.answered = True
 
     async def edit_message_text(self, text, reply_markup=None) -> None:
         self.edits.append(text)
+        self.markups.append(reply_markup)
 
 
 class _Bot:
@@ -250,3 +252,176 @@ async def test_owner_button_denied_for_non_owner():
     ctx = _Ctx(service=None)
     await bot._owner_cb(_cb_update("odash", user_id=42), ctx)
     assert "owner only" in ctx.bot.sent[-1].lower()
+
+
+# --- shop-owner keyboards ---------------------------------------------------
+def test_shopowner_menu_and_shop_actions_cover_everything():
+    menu = {kb.parse_cb(b.callback_data)[0]
+            for row in kb.shopowner_menu().inline_keyboard for b in row}
+    assert {"sshops", "sanmenu", "smsgs"} <= menu
+    actions = {kb.parse_cb(b.callback_data)[0]
+               for row in kb.shopowner_shop_actions("u" * 36).inline_keyboard for b in row}
+    assert {"sprofmenu", "sordmenu", "sinv", "scod", "sexpmenu", "smsg"} <= actions
+    ana = {kb.parse_cb(b.callback_data)[0]
+           for row in kb.shopowner_analytics_menu().inline_keyboard for b in row}
+    assert {"scmpmenu", "stopmenu", "scanmenu", "scodall"} <= ana
+
+
+def test_shopowner_conversations_kb_worst_case_fits():
+    sid = "11111111-1111-1111-1111-111111111111"
+    m = kb.shopowner_conversations_kb(sid, [{"identity": "+971501234567"}])
+    data = m.inline_keyboard[0][0].callback_data
+    assert len(data.encode()) <= kb.CB_LIMIT
+    assert kb.parse_cb(data) == ("smsgc", [sid, "+971501234567"])
+
+
+# --- shop-owner dispatch ----------------------------------------------------
+from uuid import UUID, uuid4  # noqa: E402
+
+
+class _SoSvc:
+    """Fake TenantService for the shop-owner dispatcher: one linked client + their shops."""
+
+    def __init__(self, client_id=None, shops=None, linked=True):
+        self.client_id = client_id or uuid4()
+        self.client = SimpleNamespace(id=self.client_id, name="TechStore Group")
+        self.shops = shops or []
+        self.linked = linked
+
+    async def client_by_telegram(self, tid):
+        return self.client if self.linked else None
+
+    async def get_shop(self, sid: UUID):
+        for s in self.shops:
+            if s.id == sid:
+                return s
+        from app.tenants.service import ShopNotFound
+        raise ShopNotFound(str(sid))
+
+    async def list_shops_by_client(self, cid):
+        return [s for s in self.shops if s.client_id == cid]
+
+
+def _own(svc, name="Shop 01"):
+    s = SimpleNamespace(id=uuid4(), client_id=svc.client_id, name=name)
+    svc.shops.append(s)
+    return s
+
+
+def _foreign(svc, name="Rival"):
+    s = SimpleNamespace(id=uuid4(), client_id=uuid4(), name=name)
+    svc.shops.append(s)
+    return s
+
+
+@pytest.mark.asyncio
+async def test_shopowner_profit_button_routes_to_profit_summary(monkeypatch):
+    from app.orders.models import ProfitSummary
+    calls = {}
+
+    async def _profit(shop_id, start, end, client=None):
+        calls["profit"] = shop_id
+        return ProfitSummary()
+
+    monkeypatch.setattr(bot, "profit_summary", _profit)
+    svc = _SoSvc()
+    shop = _own(svc)
+    ctx = _Ctx(service=svc)
+    await bot._shopowner_cb(_cb_update(f"sprof:{shop.id}:today", user_id=999), ctx)
+    assert calls["profit"] == shop.id
+    assert "Profit Report" in ctx.bot.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_shopowner_unlinked_user_denied(monkeypatch):
+    async def _profit(*a, **k):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(bot, "profit_summary", _profit)
+    svc = _SoSvc(linked=False)
+    shop = _own(svc)
+    ctx = _Ctx(service=svc)
+    await bot._shopowner_cb(_cb_update(f"sprof:{shop.id}:today", user_id=999), ctx)
+    assert "not linked" in ctx.bot.sent[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_shopowner_foreign_shop_fails_closed(monkeypatch):
+    async def _profit(*a, **k):
+        raise AssertionError("cross-tenant data call must never happen")
+
+    monkeypatch.setattr(bot, "profit_summary", _profit)
+    svc = _SoSvc()
+    rival = _foreign(svc)  # exists, but belongs to another client
+    ctx = _Ctx(service=svc)
+    await bot._shopowner_cb(_cb_update(f"sprof:{rival.id}:today", user_id=999), ctx)
+    assert "not found" in ctx.bot.sent[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_shopowner_shop_picker_lists_only_own_shops():
+    svc = _SoSvc()
+    _own(svc, "Shop 01")
+    _own(svc, "Shop 02")
+    _foreign(svc, "Rival Shop")
+    ctx = _Ctx(service=svc)
+    upd = _cb_update("sshops", user_id=999)
+    await bot._shopowner_cb(upd, ctx)
+    q = upd.callback_query
+    labels = [b.text for row in q.markups[-1].inline_keyboard for b in row]
+    assert any("Shop 01" in x for x in labels) and any("Shop 02" in x for x in labels)
+    assert not any("Rival" in x for x in labels)
+
+
+# --- owner delete-messages flow ----------------------------------------------
+@pytest.mark.asyncio
+async def test_owner_delete_range_flow(monkeypatch):
+    calls = {}
+
+    async def _del(shop_id=None, start=None, end=None):
+        calls["del"] = (shop_id, start, end)
+        return 4
+
+    monkeypatch.setattr(bot, "delete_messages", _del)
+    ctx = _Ctx(service=None)
+    await bot._owner_cb(_cb_update("omdel:range"), ctx)
+    assert ctx.chat_data["pending"] == {"do": "omdel", "args": ["range"]}
+    await bot._owner_text(_text_update("2026-01-01 2026-01-31"), ctx)
+    shop_id, start, end = calls["del"]
+    assert shop_id is None and start is not None and end is not None
+    assert start.date().isoformat() == "2026-01-01"
+    assert "4 message(s) deleted" in ctx.bot.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_owner_delete_all_requires_yes(monkeypatch):
+    calls = {"n": 0}
+
+    async def _del(**kw):
+        calls["n"] += 1
+        return 0
+
+    monkeypatch.setattr(bot, "delete_messages", _del)
+    ctx = _Ctx(service=None)
+    await bot._owner_cb(_cb_update("omdel:all"), ctx)
+    await bot._owner_text(_text_update("no"), ctx)
+    assert calls["n"] == 0 and "cancelled" in ctx.bot.sent[-1].lower()
+    await bot._owner_cb(_cb_update("omdel:all"), ctx)
+    await bot._owner_text(_text_update("YES"), ctx)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_delete_by_shop(monkeypatch):
+    calls = {}
+
+    async def _del(shop_id=None, start=None, end=None):
+        calls["del"] = shop_id
+        return 2
+
+    monkeypatch.setattr(bot, "delete_messages", _del)
+    sid = "11111111-1111-1111-1111-111111111111"
+    ctx = _Ctx(service=None)
+    await bot._owner_cb(_cb_update(f"omdel:shop:{sid}"), ctx)
+    await bot._owner_text(_text_update("YES"), ctx)
+    assert str(calls["del"]) == sid

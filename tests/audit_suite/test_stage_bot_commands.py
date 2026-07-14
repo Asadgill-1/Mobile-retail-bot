@@ -131,18 +131,47 @@ async def test_customer_bot_builds_and_start_replies(offline):
 
 
 @pytest.mark.asyncio
-async def test_six_bot_topology_builds(offline):
-    """1 owner + 1 rider + (keeper + customer) per token-bearing shop = the live topology.
+async def test_shopowner_bot_every_command_runs(offline, monkeypatch):
+    """The 7th bot: a linked client owner runs every registered command without crashing."""
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "7:ownerfake")
+    linked = await offline.repo.link_client_telegram("+971500000001", 111222333)  # Client A
+    assert linked, "seed Client A phone must link"
+    app = bot.build_shopowner_application(offline.svc)
+    ran = await _run_all_commands(app, 111222333)
+    assert {"start", "help", "menu"} <= set(ran)
+
+
+@pytest.mark.asyncio
+async def test_shopowner_unlinked_user_denied_every_command(offline, monkeypatch):
+    """An unlinked Telegram user gets a safe denial (or the link prompt on /start), never data."""
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "7:ownerfake")
+    app = bot.build_shopowner_application(offline.svc)
+    ran = await _run_all_commands(app, 424242)  # nobody linked this id
+    assert {"start", "help", "menu"} <= set(ran)  # all reply; none crash, none leak
+
+
+@pytest.mark.asyncio
+async def test_seven_bot_topology_builds(offline, monkeypatch):
+    """1 owner + 1 rider + 1 shop-owner + (keeper + customer) per token-bearing shop.
 
     Only shops with configured bot tokens run bots (a suspended/unconfigured shop has none), which
-    is exactly the 6-bot layout when two shops are provisioned: owner + rider + 2×(keeper+customer).
+    is the 7-bot layout when two shops are provisioned: 3 globals + 2×(keeper+customer).
     """
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "9:riderfake")
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "7:ownerfake")
     shops = await offline.repo.list_shops()
     tokened = [s for s in shops if s.telegram_keeper_bot_token and s.telegram_customer_bot_token]
-    apps = [bot.build_application(offline.svc), bot.build_rider_application(offline.svc)]
+    apps = [bot.build_application(offline.svc), bot.build_rider_application(offline.svc),
+            bot.build_shopowner_application(offline.svc)]
     for s in tokened:
         apps.append(bot.build_shopkeeper_application(offline.svc, s))
         apps.append(bot.build_customer_application(offline.svc, s))
-    assert len(apps) == 2 + 2 * len(tokened)
+    assert len(apps) == 3 + 2 * len(tokened)
     assert all(a.handlers for a in apps)
     assert len(tokened) >= 1  # conftest provisions shop bot tokens; at least one shop runs bots

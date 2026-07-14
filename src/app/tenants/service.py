@@ -40,6 +40,14 @@ class TenantService:
         await self.get_client(client_id)  # raises if unknown
         return await self._repo.list_shops(client_id=client_id)
 
+    async def client_by_telegram(self, telegram_id: int) -> Client | None:
+        """Shop-owner bot auth: resolve a Telegram user to their client (None = not linked)."""
+        return await self._repo.get_client_by_telegram_id(telegram_id)
+
+    async def link_client_telegram(self, phone: str, telegram_id: int) -> list[Client]:
+        """Shop-owner bot linking: stamp telegram_id on clients matching this phone."""
+        return await self._repo.link_client_telegram(phone, telegram_id)
+
     async def get_usage(self, client_id: UUID, day: date) -> list[UsageDailyPoint]:
         """Owner usage/billing insight for a client on a day (ADR-006)."""
         return await self._repo.get_usage(client_id, day)

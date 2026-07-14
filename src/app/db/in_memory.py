@@ -111,6 +111,22 @@ class InMemoryTenantRepo(TenantRepo):
     ) -> Client:
         return self.create_client_sync(name, contact_name, contact_phone, email)
 
+    async def get_client_by_telegram_id(self, telegram_id: int) -> Client | None:
+        return next((c for c in self._clients.values() if c.telegram_id == telegram_id), None)
+
+    async def link_client_telegram(self, phone: str, telegram_id: int) -> list[Client]:
+        from app.riders.service import _normalize_phone  # same UAE rule as rider linking
+
+        target = _normalize_phone(phone)
+        matched = [
+            c
+            for c in self._clients.values()
+            if target and c.contact_phone and _normalize_phone(c.contact_phone) == target
+        ]
+        for c in matched:
+            self._clients[c.id] = c.model_copy(update={"telegram_id": telegram_id})
+        return [self._clients[c.id] for c in matched]
+
     # --- shops ---
     async def get_shop_by_id(self, shop_id: UUID) -> Shop | None:
         return self._shops.get(shop_id)

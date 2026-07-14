@@ -35,6 +35,12 @@ async def remember(redis: Any, shop_id: UUID, identity: str, role: str, content:
     await redis.rpush(key, json.dumps({"role": role, "content": content}))
     await redis.ltrim(key, -SESSION_MAX, -1)
     await redis.expire(key, SESSION_TTL_SECONDS)
+    try:  # permanent archive (migration 009) — best-effort, never breaks the chat flow
+        from app.messaging.store import save_message
+
+        await save_message(shop_id, identity, role, content)
+    except Exception:
+        logger.exception("message persist failed shop=%s identity=%s", shop_id, identity)
 
 
 async def history(redis: Any, shop_id: UUID, identity: str, limit: int = SESSION_MAX) -> list[dict]:

@@ -46,6 +46,7 @@ def _row_to_client(row: dict) -> Client:
         contact_phone=row.get("contact_phone"),
         email=row.get("email"),
         status=ClientStatus(row.get("status", "active")),
+        telegram_id=row.get("telegram_id"),
         created_at=row.get("created_at"),
     )
 
@@ -121,6 +122,41 @@ class SupabaseTenantRepo(TenantRepo):
                 payload["email"] = email
             r = self.sb.table("clients").insert(payload).execute()
             return _row_to_client(r.data[0])
+
+        return await asyncio.to_thread(_q)
+
+    async def get_client_by_telegram_id(self, telegram_id: int) -> Client | None:
+        def _q() -> Client | None:
+            # ponytail: first match; a person owning two client rows gets the first — upgrade if real.
+            r = self.sb.table("clients").select("*").eq("telegram_id", telegram_id).limit(1).execute()
+            return _row_to_client(r.data[0]) if r.data else None
+
+        return await asyncio.to_thread(_q)
+
+    async def link_client_telegram(self, phone: str, telegram_id: int) -> list[Client]:
+        from app.riders.service import _normalize_phone  # same UAE rule as rider linking
+
+        def _q() -> list[Client]:
+            target = _normalize_phone(phone)
+            if not target:
+                return []
+            # Python-side phone match over ~30 clients (formats vary), same as rider link_telegram.
+            rows = self.sb.table("clients").select("*").execute().data or []
+            matched = [
+                row
+                for row in rows
+                if row.get("contact_phone") and _normalize_phone(row["contact_phone"]) == target
+            ]
+            out: list[Client] = []
+            for row in matched:
+                r = (
+                    self.sb.table("clients")
+                    .update({"telegram_id": telegram_id})
+                    .eq("id", row["id"])
+                    .execute()
+                )
+                out.append(_row_to_client(r.data[0] if r.data else {**row, "telegram_id": telegram_id}))
+            return out
 
         return await asyncio.to_thread(_q)
 

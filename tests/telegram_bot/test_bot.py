@@ -215,6 +215,7 @@ async def test_build_all_applications_yields_owner_plus_per_shop(monkeypatch):
 
     monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", _SHOP_BOTS_ENV)
     monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "")  # rider bot off for this case
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "")  # shop-owner bot off too
     from app.db.in_memory import InMemoryTenantRepo
     from app.tenants.service import TenantService
 
@@ -235,6 +236,7 @@ async def test_build_all_applications_appends_rider_bot_when_configured(monkeypa
 
     monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", _SHOP_BOTS_ENV)
     monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "9:riderfake")
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "")  # isolate the rider case
     from app.db.in_memory import InMemoryTenantRepo
     from app.tenants.service import TenantService
 

@@ -32,6 +32,8 @@ class Client(BaseModel):
     contact_phone: str | None = None
     email: str | None = None
     status: ClientStatus = ClientStatus.ACTIVE
+    # Linked on the global shop-owner bot via contact share (migration 009; mirrors riders).
+    telegram_id: int | None = None
     created_at: datetime | None = None
 
 

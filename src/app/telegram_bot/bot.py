@@ -34,6 +34,13 @@ from telegram.ext import (
 from app.telegram_bot import keyboards as kb
 
 from app.escalations.service import DeliveryFailed, NoPendingEscalation
+from app.messaging.store import (
+    conversations,
+    delete_messages,
+    format_conversations,
+    format_transcript,
+    transcript,
+)
 from app.orders.service import (
     InvalidTransition,
     NoPendingDraft,
@@ -43,24 +50,36 @@ from app.orders.service import (
     advance_delivery,
     approve_price,
     assign_delivery,
+    cancelled_orders,
     confirm_order,
     deny_price,
+    discounted_orders,
     export_orders,
     export_rider,
     list_drafts,
+    orders_for_export,
     profit_summary,
     reject_order,
     set_negotiation,
 )
-from app.riders.service import RiderNotFound, add_rider, list_riders
+from app.riders.service import RiderNotFound, add_rider, cod_balance, list_riders
 from app.products.addproduct_flow import build_addproduct_handler
-from app.reports.service import format_owner_profit, format_profit, parse_period
+from app.reports.service import (
+    format_audit_report,
+    format_cod_outstanding,
+    format_inventory,
+    format_owner_profit,
+    format_profit,
+    format_top_products,
+    parse_period,
+)
 from app.products.service import (
     InvalidBoostLevel,
     InvalidTag,
     ProductNotFound,
     add_tags,
     clear_tags,
+    list_inventory,
     parse_boost_level,
     parse_price,
     parse_tags,
@@ -69,7 +88,7 @@ from app.products.service import (
     toggle_featured,
 )
 from app.tenants.auth import is_owner
-from app.tenants.models import Shop, ShopStatus
+from app.tenants.models import Client, Shop, ShopStatus
 from app.tenants.service import ClientNotFound, ShopNotFound, TenantService
 
 logger = logging.getLogger(__name__)
@@ -1053,6 +1072,23 @@ async def _owner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif action == "oaddr":
             context.chat_data["pending"] = {"do": "oaddr", "args": args}
             await _reply(update, context, "➕ Reply with:  <phone> <name>")
+        elif action == "omsgmenu":
+            await q.edit_message_text("🧹 Messages (permanent chat archive):",
+                                      reply_markup=kb.owner_messages_menu())
+        elif action == "omdelshop":
+            shops = await service.list_shops()
+            picker = [{"id": str(s.id), "name": s.name} for s in shops]
+            await q.edit_message_text("🏪 Delete messages of which shop?",
+                                      reply_markup=kb.owner_msg_shop_picker(picker))
+        elif action == "omdel":
+            context.chat_data["pending"] = {"do": "omdel", "args": args}
+            if args[0] == "range":
+                await _reply(update, context, "🗓 Reply with:  YYYY-MM-DD YYYY-MM-DD  (inclusive)")
+            elif args[0] == "shop":
+                await _reply(update, context,
+                             "⚠️ Reply YES to permanently delete ALL messages of this shop.")
+            else:
+                await _reply(update, context, "⚠️ Reply YES to permanently delete ALL chat messages.")
         elif action in _OSEC_PROMPT:
             context.chat_data["pending"] = {"do": action, "args": []}
             await _reply(update, context, _OSEC_PROMPT[action])
@@ -1093,6 +1129,8 @@ async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             rider = await add_rider(shop.id, parts[1], parts[0])
             await _reply(update, context, f"🛵 Rider added to {shop.name}: {rider['name']} ({rider['phone']})\n"
                          f"id: {rider['id']}\nAsk them to open the rider bot and tap “Share my phone”.")
+        elif do == "omdel":
+            await _owner_delete_messages(update, context, args, text)
         else:
             await _owner_security_text(update, context, do, text)
     except (ShopNotFound, ClientNotFound) as e:
@@ -1102,6 +1140,27 @@ async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         logger.exception("owner text action failed")
         await _reply(update, context, "❌ Internal error.")
+
+
+async def _owner_delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 args: list[str], text: str) -> None:
+    """🧹 Messages deletions — platform owner only (the permanent archive is his to purge).
+    all/shop need a typed YES; range takes two dates via the riders' report_window parser."""
+    from app.riders.service import report_window
+
+    if args[0] == "range":
+        start, end, label = report_window(text.split())  # ValueError on junk → safe ⚠️ reply
+        n = await delete_messages(start=start, end=end)
+        await _reply(update, context, f"🗑 {n} message(s) deleted — {label}.")
+        return
+    if text.strip().upper() != "YES":
+        await _reply(update, context, "Cancelled — nothing deleted.")
+        return
+    if args[0] == "shop":
+        n = await delete_messages(shop_id=uuid.UUID(args[1]))
+    else:
+        n = await delete_messages()
+    await _reply(update, context, f"🗑 {n} message(s) deleted.")
 
 
 async def _owner_security_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1865,6 +1924,257 @@ def build_rider_application(service: TenantService) -> Application:
     return app
 
 
+# --- application factory: global SHOP-OWNER bot (ADR-006 clients) ---
+# The client who owns 1+ shops watches them remotely: profit, orders, inventory, riders' COD,
+# exports, and customer messages — so nobody in the shop can hide cancellations or discounts.
+# Deliberately NO security/escalation views: those are platform-owner business (owner bot).
+_SHOPOWNER_HELP = (
+    "🏢 Shop-owner bot — remote oversight of YOUR shops.\n"
+    "/menu — buttons for everything:\n"
+    "• My shops → per-shop profit, orders, inventory, riders' COD, Excel export, messages\n"
+    "• Analytics → compare shops, top products, cancellations & discounts, COD outstanding\n"
+    "• Messages → read your shops' customer conversations"
+)
+
+_SHOPOWNER_DENY = "⛔ You're not linked as a shop owner. Press /start and share your phone number."
+
+
+async def _shopowner_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shop-owner bot /start — offer a Share-contact button to link their Telegram to their client row."""
+    from telegram import KeyboardButton, ReplyKeyboardMarkup
+
+    user = update.effective_user
+    client = await _service(context).client_by_telegram(user.id) if user else None
+    if client:  # already linked → straight to work
+        await context.bot.send_message(update.effective_chat.id, f"🏢 Welcome back, {client.name}!",
+                                       reply_markup=kb.shopowner_menu())
+        return
+    contact_kb = ReplyKeyboardMarkup(  # local name must not shadow the module alias `kb` (keyboards)
+        [[KeyboardButton("📲 Share my phone number", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🏢 Shop-owner bot.\nTap below to link your Telegram — then you can watch your shops from here.",
+        reply_markup=contact_kb,
+    )
+
+
+async def _shopowner_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner shared their contact → match the phone to their client row and store their chat id."""
+    contact = update.message.contact if update.message else None
+    user = update.effective_user
+    # Only accept the sender's OWN contact — a forwarded contact carries someone else's user_id.
+    if contact is None or (contact.user_id and user and contact.user_id != user.id):
+        await _reply(update, context, "Please tap the button and share YOUR own phone number.")
+        return
+    linked = await _service(context).link_client_telegram(contact.phone_number, user.id)
+    if not linked:
+        await _reply(update, context,
+                     "❌ This number isn't registered as a client. Ask the platform owner to add you first.")
+        return
+    await context.bot.send_message(update.effective_chat.id,
+                                   f"✅ Linked! Welcome, {linked[0].name}. Your shops are below.",
+                                   reply_markup=kb.shopowner_menu())
+
+
+def shopowner_command(handler: Callable) -> Callable:
+    """Wrap a shop-owner command: auth by linked client Telegram id, typed errors → safe replies."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        client = await _service(context).client_by_telegram(user.id) if user else None
+        if client is None:
+            await _reply(update, context, _SHOPOWNER_DENY)
+            return
+        try:
+            await handler(update, context, client)
+        except (ShopNotFound, ClientNotFound):
+            await _reply(update, context, "❌ Not found.")
+        except ValueError as e:
+            await _reply(update, context, f"⚠️ {e}")
+        except Exception:
+            logger.exception("shop-owner command failed")
+            await _reply(update, context, "❌ Internal error.")
+        else:
+            await _audit(update, context, handler.__name__)  # §16: owner reads are logged too
+
+    return wrapper
+
+
+@shopowner_command
+async def shopowner_help(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client) -> None:
+    await _reply(update, context, _SHOPOWNER_HELP)
+
+
+@shopowner_command
+async def shopowner_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client) -> None:
+    await context.bot.send_message(update.effective_chat.id, f"🏢 {client.name}",
+                                   reply_markup=kb.shopowner_menu())
+
+
+async def _own_shop(service: TenantService, client: Client, sid: str) -> Shop:
+    """THE tenant guard: resolve a callback's shop id WITHIN this client. Unknown and foreign
+    shops fail identically — never confirm another client's shop exists."""
+    try:
+        shop = await service.get_shop(uuid.UUID(sid))
+    except ValueError:
+        raise ShopNotFound(sid) from None
+    if shop.client_id != client.id:
+        raise ShopNotFound(sid)
+    return shop
+
+
+def _format_owner_orders(shop: Shop, rows: list[dict], filt: str) -> str:
+    """One line per order for the 📦 Orders button; cancelled rows show their remarks."""
+    if not rows:
+        return f"📦 {shop.name} — no orders ({filt})."
+    lines = [f"📦 {shop.name} — {len(rows)} order(s) ({filt}):", ""]
+    for o in rows[:30]:
+        p = o.get("products") or {}
+        item = f"{p.get('brand', '')} {p.get('model', '')}".strip()
+        net = float(o.get("selling_price") or 0) - float(o.get("discount_amount") or 0)
+        line = (f"#{o['order_number']} · {o.get('customer_name', '?')} · {item}"
+                f" ×{o.get('quantity', 1)} · {net:,.0f} AED · {o.get('status', '?')}")
+        if o.get("status") == "cancelled" and o.get("cancel_remarks"):
+            line += f"\n   ❌ {o['cancel_remarks']}"
+        lines.append(line)
+    if len(rows) > 30:
+        lines.append(f"… {len(rows) - 30} more — use 📤 Export Excel")
+    return "\n".join(lines)
+
+
+async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-button dispatcher for the shop-owner bot. Every shop-id-carrying action resolves
+    the shop through `_own_shop` first — a crafted foreign shop_id gets '❌ Not found'."""
+    q = update.callback_query
+    await q.answer()
+    user = update.effective_user
+    service = _service(context)
+    client = await service.client_by_telegram(user.id) if user else None
+    if client is None:
+        await _reply(update, context, _SHOPOWNER_DENY)
+        return
+    action, args = kb.parse_cb(q.data)
+    try:
+        if action == "smenu":
+            await q.edit_message_text(f"🏢 {client.name}", reply_markup=kb.shopowner_menu())
+        elif action in ("sshops", "smsgs"):
+            shops = await service.list_shops_by_client(client.id)
+            if not shops:
+                await _reply(update, context, "No shops yet.")
+            else:
+                picker = [{"id": str(s.id), "name": s.name} for s in shops]
+                pick = "smsg" if action == "smsgs" else "sshop"
+                await q.edit_message_text("🏪 Which shop?",
+                                          reply_markup=kb.shopowner_shop_picker(picker, pick))
+        elif action == "sshop":
+            shop = await _own_shop(service, client, args[0])
+            await q.edit_message_text(f"🏪 {shop.name}:",
+                                      reply_markup=kb.shopowner_shop_actions(args[0]))
+        elif action == "sprofmenu":
+            shop = await _own_shop(service, client, args[0])
+            await q.edit_message_text(f"📈 {shop.name} — profit for…",
+                                      reply_markup=kb.shopowner_shop_period_menu(
+                                          "sprof", args[0], kb.cb("sshop", args[0])))
+        elif action == "sprof":
+            shop = await _own_shop(service, client, args[0])
+            start, end, label = parse_period(args[1])
+            s = await profit_summary(shop.id, start, end)
+            await _reply(update, context, format_profit(s, f"{shop.name} — {label}"))
+        elif action == "sordmenu":
+            shop = await _own_shop(service, client, args[0])
+            await q.edit_message_text(f"📦 {shop.name} — orders:",
+                                      reply_markup=kb.shopowner_orders_menu(args[0]))
+        elif action == "sord":
+            shop = await _own_shop(service, client, args[0])
+            rows = await orders_for_export(shop.id, args[1])
+            await _reply(update, context, _format_owner_orders(shop, rows, args[1]))
+        elif action == "sinv":
+            shop = await _own_shop(service, client, args[0])
+            await _reply(update, context, format_inventory(shop.name, await list_inventory(shop.id)))
+        elif action == "scod":
+            shop = await _own_shop(service, client, args[0])
+            riders = await list_riders(shop.id)
+            pairs = [(r["name"], await cod_balance(shop.id, r["id"])) for r in riders]
+            await _reply(update, context, format_cod_outstanding([(shop.name, pairs)]))
+        elif action == "sexpmenu":
+            shop = await _own_shop(service, client, args[0])
+            await q.edit_message_text(f"📤 {shop.name} — export:",
+                                      reply_markup=kb.shopowner_export_menu(args[0]))
+        elif action in ("sexp", "sexpd"):
+            shop = await _own_shop(service, client, args[0])
+            name, url, count = await export_orders(shop, args[1], detailed=(action == "sexpd"))
+            await _reply(update, context, f"📄 {count} order(s) — {name}\n{url}\n(link valid 24h)")
+        elif action == "smsg":
+            shop = await _own_shop(service, client, args[0])
+            convs = await conversations(shop.id)
+            await context.bot.send_message(update.effective_chat.id,
+                                           format_conversations(shop.name, convs),
+                                           reply_markup=kb.shopowner_conversations_kb(args[0], convs))
+        elif action == "smsgc":
+            shop = await _own_shop(service, client, args[0])
+            identity = ":".join(args[1:])  # identities are phones/tg ids; join defensively
+            await _reply(update, context, format_transcript(identity, await transcript(shop.id, identity)))
+        elif action == "sanmenu":
+            await q.edit_message_text("📊 Analytics — all your shops:",
+                                      reply_markup=kb.shopowner_analytics_menu())
+        elif action in ("scmpmenu", "stopmenu", "scanmenu"):
+            titles = {"scmpmenu": "↔️ Compare shops for…", "stopmenu": "🏆 Top products for…",
+                      "scanmenu": "🕵️ Cancels & discounts for…"}
+            await q.edit_message_text(titles[action],
+                                      reply_markup=kb.shopowner_period_menu(action[:-4], kb.cb("sanmenu")))
+        elif action in ("scmp", "stop"):
+            start, end, label = parse_period(args[0])
+            shops = await service.list_shops_by_client(client.id)
+            items = [(s.name, await profit_summary(s.id, start, end)) for s in shops]
+            text = (format_owner_profit(items, label) if action == "scmp"
+                    else format_top_products(items, label))
+            await _reply(update, context, text)
+        elif action == "scan":
+            start, end, label = parse_period(args[0])
+            shops = await service.list_shops_by_client(client.id)
+            per_shop = [(s.name,
+                         await cancelled_orders(s.id, start, end),
+                         await discounted_orders(s.id, start, end)) for s in shops]
+            await _reply(update, context, format_audit_report(per_shop, label))
+        elif action == "scodall":
+            shops = await service.list_shops_by_client(client.id)
+            per_shop = []
+            for s in shops:
+                riders = await list_riders(s.id)
+                per_shop.append((s.name, [(r["name"], await cod_balance(s.id, r["id"])) for r in riders]))
+            await _reply(update, context, format_cod_outstanding(per_shop))
+        else:
+            await _reply(update, context, "Unknown action. /menu")
+    except (ShopNotFound, ClientNotFound):
+        await _reply(update, context, "❌ Not found.")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+    except Exception:
+        logger.exception("shop-owner button failed")
+        await _reply(update, context, "❌ Internal error.")
+
+
+def build_shopowner_application(service: TenantService) -> Application:
+    """Global shop-owner bot: client owners watch their shops remotely (ADR-006).
+    All-button UX — no free-text handler; every input is a tap."""
+    from app.core.config import settings
+
+    if not settings.telegram_shopowner_bot_token:
+        raise RuntimeError("TELEGRAM_SHOPOWNER_BOT_TOKEN not set (see .env.example).")
+    app = ApplicationBuilder().token(settings.telegram_shopowner_bot_token).build()
+    app.bot_data["tenant_service"] = service
+    app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
+    app.add_handler(CommandHandler("start", _shopowner_start))
+    app.add_handler(CommandHandler("help", shopowner_help))
+    app.add_handler(CommandHandler("menu", shopowner_menu_cmd))
+    app.add_handler(CallbackQueryHandler(_shopowner_cb))
+    app.add_handler(MessageHandler(filters.CONTACT, _shopowner_contact))
+    return app
+
+
 def _owner_token() -> str:
     from app.core.config import settings
 
@@ -1891,8 +2201,10 @@ async def _build_all_applications(service: TenantService) -> list[Application]:
             apps.append(build_shopkeeper_application(service, shop))
         if shop.telegram_customer_bot_token:
             apps.append(build_customer_application(service, shop))
-    if settings.telegram_rider_bot_token:  # global rider bot (delivery assignments), added last
+    if settings.telegram_rider_bot_token:  # global rider bot (delivery assignments)
         apps.append(build_rider_application(service))
+    if settings.telegram_shopowner_bot_token:  # global shop-owner bot (client reports, ADR-006)
+        apps.append(build_shopowner_application(service))
     return apps
 
 

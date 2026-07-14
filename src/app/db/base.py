@@ -37,6 +37,14 @@ class TenantRepo(ABC):
         email: str | None = None,
     ) -> Client: ...
 
+    @abstractmethod
+    async def get_client_by_telegram_id(self, telegram_id: int) -> Client | None:
+        """Authenticate a Telegram user → client (shop-owner bot). First match wins."""
+
+    @abstractmethod
+    async def link_client_telegram(self, phone: str, telegram_id: int) -> list[Client]:
+        """Stamp telegram_id on every client whose contact_phone matches (normalized). Returns them."""
+
     # --- shops ---
     @abstractmethod
     async def get_shop_by_id(self, shop_id: UUID) -> Shop | None: ...

@@ -573,6 +573,47 @@ async def list_price_requests(shop_id: UUID, client: Any | None = None) -> list[
 
 
 # ---------------------------------------------------------------------------
+# Shop-owner anti-corruption reads: cancellations (with remarks) + discounts.
+# The owner audits remotely; these expose exactly what a keeper could hide.
+# ---------------------------------------------------------------------------
+async def cancelled_orders(
+    shop_id: UUID, start: datetime, end: datetime, client: Any | None = None
+) -> list[dict]:
+    """Cancelled orders in a window. Remarks live in TWO places: orders.cancel_remarks (rider
+    cancels) and the 'cancelled' history row's changed_by (shop rejections via _set_status)."""
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("orders")
+            .select("*, products(brand,model), order_status_history(status,changed_by,changed_at)")
+            .eq("shop_id", str(shop_id)).eq("status", "cancelled")
+            .gte("created_at", start.isoformat()).lt("created_at", end.isoformat())
+            .order("order_number").execute().data or []
+        )
+
+    return await asyncio.to_thread(_q)
+
+
+async def discounted_orders(
+    shop_id: UUID, start: datetime, end: datetime, client: Any | None = None
+) -> list[dict]:
+    """Every non-draft order with a discount in a window (who gave money away, and how much)."""
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("orders")
+            .select("*, products(brand,model)")
+            .eq("shop_id", str(shop_id)).neq("status", "draft").gt("discount_amount", 0)
+            .gte("created_at", start.isoformat()).lt("created_at", end.isoformat())
+            .order("order_number").execute().data or []
+        )
+
+    return await asyncio.to_thread(_q)
+
+
+# ---------------------------------------------------------------------------
 # Excel export (SPEC §10): fetch the shop's orders → workbook → signed URL.
 # ---------------------------------------------------------------------------
 _EXPORT_SELECT = "*, products(category,brand,model,color,specs)"

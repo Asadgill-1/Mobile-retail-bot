@@ -257,3 +257,22 @@ async def toggle_featured(shop_id: UUID, product_id: UUID, client: Any | None = 
     """`/feature` — toggle is_featured (SPEC §5)."""
     product = await get_product(shop_id, product_id, client)
     return await _update(shop_id, product_id, {"is_featured": not product.is_featured}, client)
+
+
+async def list_inventory(shop_id: UUID, client: Any | None = None) -> list[dict]:
+    """Stock list for the shop-owner bot's 🗃 Inventory button — low stock first."""
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("products")
+            .select("brand,model,color,quantity,selling_price,cost_price")
+            .eq("shop_id", str(shop_id))
+            .order("quantity")
+            .limit(100)
+            .execute()
+            .data
+            or []
+        )
+
+    return await asyncio.to_thread(_q)
