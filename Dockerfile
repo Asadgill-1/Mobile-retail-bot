@@ -1,5 +1,5 @@
 # Multi-shop chatbot — API/worker image (ADR-001)
-FROM python:3.11-slim
+FROM python:3.15-rc-alpine
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
