@@ -868,7 +868,7 @@ async def pricerequests_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _reply(update, context, "💰 Pending price requests:")
     for r in reqs:
         p = r.get("products") or {}
-        text = (f"#{r['request_number']} — {r['identity']} — {p.get('brand', '')} {p.get('model', '')}\n"
+        text = (f"#{r['request_number']} — {r['phone']} — {p.get('brand', '')} {p.get('model', '')}\n"
                 f"Offer {r['requested_price']} AED · List {p.get('selling_price', '?')} AED")
         await context.bot.send_message(update.effective_chat.id, text,
                                        reply_markup=kb.keeper_price_actions(r["request_number"]))
@@ -1814,6 +1814,36 @@ async def rider_myreport(update: Update, context: ContextTypes.DEFAULT_TYPE, row
     await _do_rider_report(update, context, rows, _split(update.message.text, maxsplit=2))
 
 
+def _format_rider_report(orders: list[dict], label: str, cash: Decimal) -> str:
+    """Deliveries grouped by Dubai date, each with the detail a rider needs to recall the drop:
+    order number, item, qty, ADDRESS, cash, time. Pure — the report's whole layout, testable."""
+    from datetime import datetime
+
+    from app.reports.service import DUBAI
+
+    lines = [f"📊 Delivery report — {label}", "",
+             f"Delivered: {len(orders)}", f"Cash collected: {cash} AED"]
+    day = None
+    for o in orders:
+        stamp = o.get("delivered_at") or ""
+        try:
+            local = datetime.fromisoformat(stamp).astimezone(DUBAI)
+        except ValueError:  # a malformed timestamp must not kill the report
+            local = None
+        d = f"{local:%b %d}" if local else "—"
+        if d != day:  # date header, then that date's deliveries
+            day, _ = d, lines.append("")
+            lines.append(f"🗓 {d}")
+        p = o.get("products") or {}
+        item = f"{p.get('brand', '')} {p.get('model', '')}".strip() or "item"
+        lines.append(f"  #{o['order_number']} — {item} ×{o.get('quantity', 1)}")
+        if o.get("address"):
+            lines.append(f"     📍 {o['address']}")
+        t = f"{local:%H:%M}" if local else stamp[11:16]
+        lines.append(f"     💵 {o.get('cash_received') or 0} AED · {t}")
+    return "\n".join(lines)
+
+
 async def _do_rider_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            rows: list[dict], args: list[str]) -> None:
     """Shared by /myreport and the report-period buttons."""
@@ -1828,12 +1858,7 @@ async def _do_rider_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     orders = await delivered_report([r["id"] for r in rows], start, end)
     cash = sum(Decimal(str(o["cash_received"] or 0)) for o in orders)
-    lines = [f"📊 Delivery report — {label}", "",
-             f"Delivered: {len(orders)}", f"Cash collected: {cash} AED"]
-    for o in orders:
-        t = (o.get("delivered_at") or "")[11:16]
-        lines.append(f"  #{o['order_number']} — {o['cash_received'] or 0} AED — {t}")
-    lines.append("")
+    lines = [_format_rider_report(orders, label, cash), ""]
     from app.db.factory import get_tenant_repo
 
     repo = get_tenant_repo()

@@ -550,3 +550,37 @@ async def test_assign_delivery_rejects_non_assignable_status(monkeypatch, status
     with pytest.raises(svc.InvalidTransition):
         await assign_delivery(_shop_obj(), 8, uuid4())
     assert called["set"] is False  # rejected before any write — never assigns to a done/draft order
+
+
+# --- price requests: the live column is `phone`, not `identity` (regression: "Internal error") ---
+@pytest.mark.asyncio
+async def test_list_price_requests_selects_phone_column():
+    """Guards the bug where the select named a nonexistent `identity` column → PostgREST error.
+    Assert the query asks for `phone` and hands the renderer a `phone` field."""
+    captured = {}
+
+    class _SelSB:
+        def table(self, n):
+            captured["table"] = n
+            return self
+
+        def select(self, cols):
+            captured["cols"] = cols
+            return self
+
+        def eq(self, *a):
+            return self
+
+        def order(self, *a):
+            return self
+
+        def execute(self):
+            class _R:
+                data = [{"request_number": 1, "phone": "501234567",
+                         "requested_price": "3400",
+                         "products": {"brand": "Samsung", "model": "S23", "selling_price": "3600"}}]
+            return _R()
+
+    rows = await svc.list_price_requests(uuid4(), client=_SelSB())
+    assert "phone" in captured["cols"] and "identity" not in captured["cols"]
+    assert rows[0]["phone"] == "501234567"  # renderer reads r['phone']

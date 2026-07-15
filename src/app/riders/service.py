@@ -234,15 +234,27 @@ async def _get_my_order(rider_ids: list[str], order_number: int, client: Any | N
 
 
 async def my_deliveries(rider_ids: list[str], client: Any | None = None) -> list[dict]:
-    """The rider's assignments: everything in flight + recent delivered (newest first)."""
+    """Today's work: everything still in flight (any age — an old undelivered order is still the
+    rider's job) plus what they delivered TODAY. Older delivered orders are report material,
+    not a work list — they live in /myreport."""
     sb = _sb(client)
+    today = _day(datetime.now(DUBAI).date()).isoformat()
 
     def _q() -> list[dict]:
-        return (
+        # Two queries, not one .or_: PostgREST's nested or/and syntax is easy to get subtly wrong,
+        # and the merge is three lines. ponytail: swap to one .or_ query if round-trips ever matter.
+        flight = (
             sb.table("orders").select(_ORDER_SELECT)
-            .in_("rider_id", rider_ids).in_("status", list(_ACTIVE) + ["delivered"])
+            .in_("rider_id", rider_ids).in_("status", list(_ACTIVE))
             .order("created_at", desc=True).limit(15).execute().data or []
         )
+        done = (
+            sb.table("orders").select(_ORDER_SELECT)
+            .in_("rider_id", rider_ids).eq("status", "delivered")
+            .gte("delivered_at", today)
+            .order("delivered_at", desc=True).limit(15).execute().data or []
+        )
+        return flight + done
 
     return await asyncio.to_thread(_q)
 

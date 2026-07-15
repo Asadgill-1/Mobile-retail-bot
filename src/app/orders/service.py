@@ -564,7 +564,7 @@ async def list_price_requests(shop_id: UUID, client: Any | None = None) -> list[
     def _q() -> list[dict]:
         return (
             sb.table("price_requests")
-            .select("request_number,identity,requested_price,products(brand,model,selling_price)")
+            .select("request_number,phone,requested_price,products(brand,model,selling_price)")
             .eq("shop_id", str(shop_id)).eq("status", "pending")
             .order("request_number").execute().data or []
         )

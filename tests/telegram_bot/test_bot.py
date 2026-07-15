@@ -271,3 +271,34 @@ def test_keeper_bot_registers_real_product_commands(tenant_service):
 
     # commands whose stage hasn't landed are still stubs
     assert {"profit", "exportorders", "productstats"} <= set(registered)
+
+
+# --- rider report: date-grouped layout with address + item + cash (pure) ---
+def test_format_rider_report_groups_by_dubai_date_with_detail():
+    from decimal import Decimal
+
+    orders = [
+        {"order_number": 11, "quantity": 2, "address": "Marina",
+         "cash_received": "3250", "delivered_at": "2026-07-11T10:00:00+00:00",
+         "products": {"brand": "Samsung", "model": "S23"}},
+        {"order_number": 12, "quantity": 1, "address": "JLT",
+         "cash_received": "1500", "delivered_at": "2026-07-12T09:00:00+00:00",
+         "products": {"brand": "Apple", "model": "iPhone 15"}},
+    ]
+    out = bot._format_rider_report(orders, "This week", Decimal("4750"))
+
+    assert "Delivered: 2" in out and "Cash collected: 4750 AED" in out
+    assert "🗓 Jul 11" in out and "🗓 Jul 12" in out          # two date headers
+    assert "#11 — Samsung S23 ×2" in out and "#12 — Apple iPhone 15 ×1" in out
+    assert "📍 Marina" in out and "📍 JLT" in out
+    assert "💵 3250 AED · 14:00" in out                        # Dubai time (UTC+4)
+
+
+def test_format_rider_report_survives_bad_timestamp():
+    from decimal import Decimal
+
+    orders = [{"order_number": 9, "quantity": 1, "address": "",
+               "cash_received": None, "delivered_at": "not-a-date",
+               "products": {}}]
+    out = bot._format_rider_report(orders, "Today", Decimal("0"))
+    assert "#9 — item ×1" in out and "💵 0 AED" in out          # no crash, sane fallbacks
