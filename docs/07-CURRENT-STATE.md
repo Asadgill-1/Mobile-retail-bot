@@ -3,11 +3,11 @@
 > **Most important file for an incoming LLM.** Says exactly where the project is.
 > Update at the end of every work session, before handoff.
 
-**Last updated:** 2026-07-12
-**Current stage:** Stage 12 core + **full live QA audit** + delivery/rider/COD build-out (§6/§10). Next = Stage 13 (WhatsApp/Twilio cutover).
+**Last updated:** 2026-07-16
+**Current stage:** Stage 12 core + full live QA audit + delivery/rider/COD + **shop-owner bot (7th bot)** + **inline-button UX + security audit suite (all bots)** + **gap-fix wave (6 phases + migration 010)**. Next = Stage 13 (WhatsApp/Twilio cutover).
 **Stage #:** 12
-**Overall health:** 🟢 Stages 0–12 core complete + a full 8-goal live QA audit (see below) + the delivery lifecycle finished (fulfilment status, rider onboarding, custody handshake, COD ledger). **235 tests passing** (no network in the suite); 6 bots polling live (owner + per-shop keeper/customer + **global rider bot**). SPEC §9 pipeline fully live. **Orders exist end to end**: AI drafts → `/confirmorder` → `/deliveryupdate`/rider delivery → `delivered`. **Excel export live** (rider sheets now populated — Q-006 resolved). **`celery_beat` runs two jobs.** **Real `/health` + owner dashboards.** **§11 hardening live** (per-session lock + MessageSid dedup + Celery acks_late). **§16 audit trail live:** every privileged owner/keeper command writes `audit_logs` (via the two command wrappers); `/owner audit` reads it back. **Structured logging** (`core.setup_logging`) on both the bot and API processes. All live-verified against the DB + real Redis + a real Celery worker on Memurai. Real Redis local (Memurai :6379).
-**LLM:** official Moonshot `kimi-k2.6` direct (ADR-004 rev.2 — OpenRouter dropped). **`AI_TEMPERATURE` must be `1.0`**: `kimi-k2.*` 400s on any other value, which would silently degrade every reply to the fallback message.
+**Overall health:** 🟢 Stages 0–12 core complete + full 8-goal live QA audit + delivery lifecycle (fulfilment status, rider onboarding, custody handshake, COD ledger) + a global **shop-owner bot** (remote oversight for clients owning 1+ shops, ADR-006) + a **permanent chat archive** (`messages` table, dual-written alongside the Redis session) + **inline buttons on every bot** (slash commands stay the primary entry, buttons are a second path into the same service calls) + a **live 6-phase gap-fix wave**: friendly reference codes (`PR0001`/`rider001`, migration 010) replacing raw UUIDs everywhere a human types one, real `/productstats` (was a stub), low-stock alerts, a printable counter-sale sheet, platform-owner onboarding (`/addclient`/`/addshop`/`/setshoptokens`/`/addkeeper` — previously repo-only, unreachable), owner analytics (top products/cancels+discounts/COD across all shops) + an escalation ✔️ Resolve button (`/reply` alone never closed a row), shop-owner date-range orders + a 📋 activity log (button presses are now audited, not just slash commands), and **counter (walk-in) sales** — a hand-filled sheet photographed by the shop owner, read by a vision model, confirmed by a human before anything is written (man-in-the-middle by design), folded into `/profit`. **487 tests passing** (no network in the suite); **7 bots** polling live (owner + per-shop keeper/customer + global rider bot + **global shop-owner bot**). SPEC §9 pipeline fully live. **Orders exist end to end**: AI drafts → `/confirmorder` → `/deliveryupdate`/rider delivery → `delivered`. **Excel export live** (rider sheets populated, plus a new printable counter-sale sheet). **`celery_beat` runs two jobs.** **Real `/health` + owner dashboards + owner analytics.** **§11 hardening live** (per-session lock + MessageSid dedup + Celery acks_late). **§16 audit trail live:** every privileged owner/keeper command writes `audit_logs` (command wrappers **and** the mutating inline buttons); `/owner audit` and the shop-owner's 📋 Logs both read it. **Structured logging** (`core.setup_logging`) on both the bot and API processes. All live-verified against the DB + real Redis + a real Celery worker on Memurai — **including migration 010's live apply and a real vision-model round trip** (see Stage 12d below). Real Redis local (Memurai :6379).
+**LLM:** official Moonshot `kimi-k2.6` direct (ADR-004 rev.2 — OpenRouter dropped) for chat; `moonshot-v1-32k-vision-preview` for counter-sale sheet reading (`AI_VISION_MODEL`, Stage 12d). **`AI_TEMPERATURE` must be `1.0`**: `kimi-k2.*` 400s on any other value, which would silently degrade every reply to the fallback message.
 
 ---
 
@@ -268,18 +268,194 @@ Telegram bots + live Supabase, not mocks. Found and fixed:
   DB-level `selling_price >= cost_price` guard (relies on app-layer discount bounds in
   `approve_price`).
 
+### Stage 12c — inline-button UX (all bots) + security audit suite + shop-owner bot (7th bot), 2026-07-13/14
+
+- **Inline buttons on every bot.** `telegram_bot/keyboards.py` (new) — `cb()`/`parse_cb()` build/parse
+  `action:arg1:arg2` callback data (`≤64` bytes, asserted at build time), one prefix per bot (`o`=owner,
+  `k`=keeper, `r`=rider, `s`=shop-owner). Every menu button calls the **same service function** the
+  matching slash command calls — a button is a second entry point, never a second implementation.
+  `telegram_bot/format.py` (new) — `to_telegram_html`/`escape_html`, used at the `/addproduct`
+  confirmation (shopkeeper-typed brand/model could contain Markdown special chars → Telegram 400;
+  now Telegram HTML with the dynamic parts escaped, can't 400). `whatsapp/format.py` (new, Stage 13
+  prep) — Markdown → WhatsApp-native scrubber, self-checked, not wired into a channel yet.
+- **`tests/audit_suite/` (new)** — a security/correctness audit distinct from the unit suite: Category 1
+  tenant isolation vs prompt injection (model-supplied `shop_id` never reaches a query — the *active*
+  shop is passed positionally), Category 2 webhook MessageSid dedup under concurrency, Category 3
+  atomic-stock-decrement race (two confirmations, stock=1 → exactly one wins, never negative), Category 4
+  WhatsApp text sanitization, Stage-1 Telegram HTML-safety, Stage-2 callback tenant isolation (a foreign
+  shop/rider id in callback data fails closed), Stage-3 checkout race, `test_stage_bot_commands.py`
+  (every registered command on every bot actually runs without crashing — the harness that catches "a
+  new bot was wired but a command was forgotten").
+- **Two bugs found and fixed while building the button layer:** `/addproduct` confirmation 400'd on a
+  brand/model containing Markdown special characters (fixed above); rider bot `/start` crashed with
+  `UnboundLocalError` — a local variable named `kb` shadowed the `keyboards` module alias.
+- **Shop-owner bot (7th bot, ADR-006) — remote oversight for a client owning 1+ shops.** Owner directive:
+  *"if owner even not come on shop he knows everything from this bot and no one can make him fool or do
+  corruption in shops"* — but *"security incident and escalation… is subject to me [the platform owner],
+  it just focus on his business… if he see these type of things he get scared and stop using system."*
+  Built accordingly: **deliberately no security/escalation views** on this bot; full financial/operational
+  visibility instead.
+  - `migrations/009_shopowner_messages.sql` (**applied live**) — `clients.telegram_id` (nullable, NOT
+    unique — matched by normalized phone like `delivery_persons.telegram_id`, migration 007 precedent);
+    new `messages` table (shop_id, identity, role `customer|assistant|shopkeeper`, content, created_at) —
+    a **permanent chat archive**, dual-written alongside the existing Redis session
+    (`escalations/context.py::remember()` gained a best-effort second write via
+    `messaging/store.py::save_message`). Redis stays the AI's 25-message/24h working memory; `messages`
+    is the durable, shop-owner-facing record. Deletion is **platform-owner-only** (the owner bot's new
+    🧹 Messages menu: delete all / one shop / a date range, typed-`YES` confirmed).
+  - `messaging/store.py` (new) — `save_message` (never raises), `conversations` (distinct recent
+    identities), `transcript` (last 25 turns), `delete_messages(shop_id=None, start=None, end=None)`
+    (always has a WHERE clause — no bare `DELETE FROM messages`), pure formatters.
+  - `tenants/service.py` — `client_by_telegram`/`link_client_telegram` passthroughs; both repos
+    implement `get_client_by_telegram_id`/`link_client_telegram` (phone-matched, first-match-wins).
+  - Bot: `_own_shop(service, client, shop_id)` is **the** tenant guard — resolves a shop and rejects with
+    the identical "not found" whether the id is unknown or belongs to another client, called on every
+    shop-id-carrying button. Menu: 🏪 My shops → profit / orders (today/yesterday/pending/all) /
+    inventory / riders & COD balance / Excel export / message transcripts; 📊 Analytics → compare shops /
+    top products / cancels+discounts / COD outstanding across every owned shop.
+  - Owner-provided bot token was delivered as a root `api.txt` file, wired into gitignored `.env`, file
+    deleted (same consume-and-delete pattern as every other credential in this project).
+  - `scripts/run_bots_live.sh` (new) — pins `.venv/Scripts/python.exe` explicitly (bare `python` on PATH
+    lacks project deps) so the live 7-bot launch actually starts here; `.claude/settings.local.json`
+    (gitignored) allow-lists running it.
+- **Live-verified:** real Client A linked to a real Telegram id via contact-share, `client_by_telegram`
+  resolved to the correct 2 owned shops; all 7 bots confirmed polling with real inbound traffic.
+- Tests: `tests/audit_suite/test_shopowner_isolation.py` (new, cross-client isolation),
+  `tests/messaging/test_store.py` (new), `tests/audit_suite/test_stage_bot_commands.py` extended to a
+  7-bot topology + shop-owner command coverage, `tests/telegram_bot/test_buttons.py` (new, keyboard
+  builders + dispatch routing for every button on every bot). **306 total green** after 12c
+  (`tests/audit_suite/` alone: 52 tests, zero warnings).
+
+### Stage 12d — gap-fix wave: friendly IDs, keeper/owner/shop-owner features, counter sales, 2026-07-16
+
+A structured 14-item gap report from live use of the 7-bot system, worked as a 6-phase plan (planned,
+verified against code by 2 Explore agents + a Plan agent before a line was written — see
+`Plan.txt`/the archived plan `there-are-some-gaps-floofy-falcon.md`). One item was a real bug; the rest
+were missing features, each resolved with an explicit owner decision where the plan branched.
+
+- **`migrations/010_friendly_ids_counter_sales.sql` (applied live)** — `products.product_number` /
+  `delivery_persons.rider_number` (`bigint generated by default as identity` + unique index each,
+  same auto-backfill mechanism as `orders.order_number`/migration 003 — **verified live: 10 products
+  → PR0001–PR0010, 1 rider → rider001, zero nulls**); `products.min_qty` (low-stock threshold, default
+  0 = alerts off — no behaviour change until a keeper sets one); new `counter_sales` table (per-unit
+  price, Dubai `sold_on` date, photo proof path, `recorded_by`, durable `discrepancy` flag).
+- **Phase 1 — bug fix + rider report.** `list_price_requests` selected a column named `identity` that
+  never existed (live column is `phone`) → every keeper `/pricerequests` press returned "Internal
+  error." Fixed at both the query and the renderer. `my_deliveries` had no date filter and a flat
+  15-row cap (an old undelivered order could silently vanish off the bottom); rewritten as in-flight
+  (any age — it's still the rider's job) + delivered-today, two queries merged in Python
+  (`ponytail:` — swap to one PostgREST `.or_()` if round-trips ever matter). `/myreport` was a flat
+  `#num — cash — time` list; now grouped under a `🗓 date` header per Dubai day with item/qty/address.
+- **Phase 2 — friendly reference codes.** `utils/codes.py` (new, pure) — `product_code`/`rider_code`
+  render `PR0001`/`rider001`; `parse_product_code`/`parse_rider_code` accept `PR0001`, `pr1`, or a
+  plain int and return `None` (not an exception) on junk, so the caller folds it into the same
+  "not found" a wrong UUID gets. `products.service.get_product_by_ref` and `bot._resolve_product` /
+  `bot._resolve_rider` are now **the** choke points every keeper-facing command routes through
+  (boost/tag/untag/cleartags/feature, `/assigndelivery`, `/exportrider`, the button-prompt edits) —
+  one place, not one guard per caller. Callback data still carries UUIDs (a code would waste the
+  64-byte budget); displays (rider list, `/addrider` replies, `/addproduct` confirmation, a new 🆔
+  ID list button) show codes.
+- **Phase 3 — keeper features.** Real `/productstats [period]` (was Q-014's honest stub) — folds
+  orders (same exclusions as `profit_summary`, so the two reports can never disagree) against the
+  full catalogue; unsold products list with zeros, because dead stock is the point of the report.
+  `notify.send_to_shopowner` (mirrors `send_to_rider`) + `orders.notify_low_stock` — fires only after
+  a successful **positive** stock decrement (never on a restock), pings the shop **and** the client
+  owner if linked, best-effort. `/addproduct` grew a 12th step (MINQTY, after QUANTITY) and a second
+  entry point — a ➕ Add product button now starts the same `ConversationHandler` a slash command does.
+  `utils/excel.py` gained a generic `sheet_workbook(title, headers, rows)`; `orders_workbook` is now a
+  thin wrapper over it (signature unchanged — every existing caller and test kept working). New 🧾
+  Counter sheet button/`​/countersheet` — an Excel of the catalogue with empty "Price sold"/"Qty sold"
+  columns for the shop to fill by hand.
+- **Phase 4 — platform-owner onboarding + analytics + escalation resolve.** `create_client`/
+  `create_shop`/`create_shopkeeper` existed only as **repo methods with zero callers** — no bot command,
+  no UI, reachable only from a hardcoded seed script. Now a real ➕ Onboarding menu (add client → shop →
+  bot tokens → shopkeeper, semicolon-separated typed prompts) plus `/addclient` `/addshop`
+  `/setshoptokens` `/addkeeper`; `update_shop_tokens` added to `TenantRepo` (both repos), `None` per
+  field = leave it unchanged. Token-set replies are honest that a shop's bots only start polling on the
+  **next process restart** (applications are built once at boot; hot-reload was explicitly not built —
+  YAGNI for a single-operator system). Owner analytics: 🏆 Top products / 🕵️ Cancels+discounts / 💵 COD
+  outstanding across every shop — the same formatters the shop-owner bot already used, just called over
+  `service.list_shops()` instead of one client's shops (the period-menu builder was already
+  prefix-agnostic, no new keyboard code needed). `escalations.resolve_escalation` is now **public**
+  (`/reply` answered a customer but never closed the row — escalations piled up forever); the owner's
+  escalation list now renders one message per row with a ✔️ Resolve button, and `/handover` routes
+  through the same function instead of duplicating it.
+- **Phase 5 — shop-owner date range + activity logs.** `orders.orders_in_range` (range twin of
+  `orders_for_export`, ordered by `created_at` so the view can group by day) + a 🗓 Date range button —
+  the shop-owner bot's **first free-text consumer** (`_shopowner_text`; fails silent with no pending
+  prompt, and **re-guards the shop id when the text lands** — a pending prompt is not a capability).
+  Anti-corruption logging: only slash commands were audited before this phase, so a keeper working
+  entirely through buttons left **no trail at all**. `_audit` gained a `detail`/`shop_id` override;
+  the mutating inline buttons (confirm/reject/deliver-step/approve/counter/deny/assign/reconcile/
+  negotiation/counter-sheet) are now audited on success, same rule `keeper_command` already used for
+  slash commands; read-only button presses stay unaudited (they'd bury the real actions in noise).
+  Rider actions carry the shop of the order they touched, because the rider bot is global (no shop in
+  `bot_data`) — without that, the rows would land `shop_id=NULL` and never reach that shop's owner.
+  `format_activity` + a `_HUMAN_ACTIONS` map render rows as sentences ("14:22 · Ali — confirmed order
+  #7"); slash and button map to identical phrasing; an unmapped action still shows (raw name + text
+  snippet) rather than vanishing. New 📋 Logs button — the first caller of `audit.recent`'s `shop_id`
+  filter (it existed with zero callers before this phase).
+- **Phase 6 — counter (walk-in) sales.** The system was blind to counter sales entirely, so `/profit`
+  only ever described half the business. Owner-decided flow (2 of 2 proposed options): the shop prints
+  the counter sheet and fills it by hand; the shop owner photographs the filled sheet and sends it to
+  their bot; a vision model reads it into rows; the **owner sees the parsed rows and confirms before
+  anything is written** (man-in-the-middle by design — the AI never writes stock unsupervised).
+  - `llm/llm_client.py` — `LLMMessage.content` widened `str → str | list[dict]` for OpenAI content-parts
+    (vision); `_to_wire` already passed content through untouched, so the wire format needed no change.
+    `chat()` gained a `model` override so only this one flow leaves the configured chat model.
+  - `orders/counter_sales.py` (new) — `EXTRACT_PROMPT` (strict JSON, no invented codes), pure
+    `parse_extraction` (strips markdown fences models add despite being told not to; drops any row
+    without a readable code+qty; never raises on junk, raises a human-actionable message only when the
+    *whole* sheet is unreadable), `extract_rows` (photo bytes → base64 data URL → vision-model call),
+    `record_sales` (per row: resolve by friendly code (tenant-guarded) → atomic stock decrement → if
+    the stock can't cover it, **the row is still inserted, flagged `discrepancy=true`, stock left
+    untouched** — the sheet says sold, the system says impossible, and that contradiction is the single
+    most useful thing the table stores, so it is never dropped, auto-corrected, or counted as revenue).
+  - Shop-owner bot: 🧾 Today sell → shop picker → send a photo → preview with product names resolved →
+    ✅ Save all / ❌ Discard. A typed correction (`PR0001 2 3400`, one line per sale) **replaces** the
+    model's reading wholesale rather than merging with it — the human's word is final. Rows stash in
+    `chat_data`, not callback data (far past the 64-byte cap); `# ponytail:` marker — a process restart
+    loses an in-progress stash, the owner resends the photo (upgrade to Redis if that ever bites). The
+    photo itself is kept in `shop-reports` as the evidence behind every row (`upload_report` gained a
+    `content_type` param, default xlsx).
+  - `orders/models.py` — `ProfitSummary` gained `counter_revenue`/`counter_profit` (trailing defaults,
+    every existing positional constructor stays valid). Pure `merge_counter(summary, counter_rows)`
+    folds counter revenue/cost/profit in and merges top products **across both channels** — the shop
+    owner wants the best seller, not the best seller *online*. `orders.profit_summary` keeps its exact
+    name and signature (bot tests monkeypatch it by name) and now folds counter sales in automatically;
+    `format_profit` shows a counter-sales line only when non-zero, so a shop with no counter sales reads
+    an unchanged report. New 🧾 Counter sales report (date-grouped, discrepancies called out) on the
+    shop-owner analytics menu.
+- **Live-verified end to end, not just unit-tested:** migration applied to the real project (backfill
+  sanity-checked); `PR0001`/`pr1` both resolve on the live DB and a cross-shop `PR0001` correctly
+  returns "not found"; a live `/productstats` total **exactly matched** the live `/profit` total for
+  the same shop/period (the whole point of sharing `profit_summary`'s exclusions); the counter sheet
+  exported 10 real products to Storage with a working signed URL; the vision model id
+  (`moonshot-v1-32k-vision-preview`, previously flagged as an offline guess) was confirmed against the
+  provider's live model list **and** by a real content-parts round trip that the API accepted and
+  `parse_extraction` handled cleanly. All 7 bots restarted onto the new code and stayed error-free.
+- Tests: `tests/utils/test_codes.py` (new), `tests/orders/test_counter_sales.py` (new — extraction
+  parsing hardest of all, since model output is untrusted input; stock-write + discrepancy paths;
+  vision-model-override assertion), `tests/products/test_addproduct_flow.py` (new, 12-step flow +
+  button entry), plus extensions across `orders/reports/telegram_bot/tenants/escalations` test files
+  and `tests/audit_suite/test_shopowner_isolation.py` (every new shop-owner action re-tested for
+  cross-tenant refusal before any data access). **487 total green**, zero warnings, all 9 module
+  self-checks pass (was 306 at Stage 12c close, +181 across migration 010 + all 6 phases).
+
 ## 🔵 In progress
 
-- _(nothing — Stage 12 + audit + delivery/rider/COD complete, awaiting Stage 13)_
+- _(nothing — gap-fix wave complete, awaiting Stage 13)_
 
 ## ⏭️ Next up (Stage 13 — WhatsApp/Twilio cutover, §1; + small tails)
 
 1. **Stage 13:** activate the real Twilio path (was mocked, ADR-002) — **this is where `celery_worker` finally gets a producer**; Twilio **outbound** client (the worker currently discards `result.reply`, `ponytail:` at `tasks.py:42`); wire `self.retry` on the pipeline's `locked` action; run the 300+-concurrent load test; owner cutover checklist.
-2. **Deploy-time (Stage 12 tail):** flip `AI_PROVIDER=openai`; add CI once the repo exists.
-3. **Stage 10 §12 tail (optional):** `/owner usage` (Redis-today + `usage_daily`-past merge), `/owner shop <id>`, shopkeeper `/report daily|inventory_low|top_products`, `/productstats` (Q-014).
+2. **Deploy-time (Stage 12 tail):** flip `AI_PROVIDER=openai`; add CI now that the repo is a real git repo (Stage 12b/c/d note: it wasn't at Stage 12 close — check current state before assuming).
+3. **Stage 10 §12 tail (optional):** `/owner usage` (Redis-today + `usage_daily`-past merge), `/owner shop <id>`, shopkeeper `/report daily|inventory_low|top_products`.
 4. **Reported, not built (low severity — see Stage 12b):** structured `delivery_date` column, customer phone separated from address, attack-forensics snapshot including the triggering message, DB-level `selling_price >= cost_price` guard.
+5. **Two dashboards planned, not built** (2026-07-16): `DASHBOARD_PLAN_SHOP.md` (shop + shop-owner web dashboard) and `DASHBOARD_PLAN_OWNER.md` (platform-owner console) — full IA/architecture plans against verified code, pushed to their own repos (`mobile-shop-and-shop-owner-dashboard`, `owner-dashboard-mobile`). Not started: needs a Cloudflare-Tunnel bridge API on this FastAPI app + ~6 new migrations (020–025) before either dashboard's Phase 0.
+6. **Shop editing for existing products** (min_qty especially) — `/addproduct` sets `min_qty` on new rows; there is no edit path for the ~10 products that predate migration 010 (they default to `0` = alerts off).
 
-> **Q-012 / Q-013 / Q-014 are open** (`12-OPEN-QUESTIONS.md`): SPEC §4's ranking formula contradicts itself (boost as hard sort key vs relevance multiplier); SPEC §4 literally excludes brand/model from search; `/productstats` has no data source. All three implemented/deferred with the sensible reading — **don't silently re-decide them.** **Q-006 (rider model) is now resolved** — see Stage 12b above.
+> **Q-012 / Q-013 are open** (`12-OPEN-QUESTIONS.md`): SPEC §4's ranking formula contradicts itself (boost as hard sort key vs relevance multiplier); SPEC §4 literally excludes brand/model from search. Both implemented with the sensible reading — **don't silently re-decide them.** **Q-006 (rider model) and Q-014 (`/productstats`) are now resolved** — see Stage 12b/12d above.
 
 > **Folder rule:** create whatever folders a capability needs (organized by purpose, no loose root files) and register each in `08-FILE-MAP.md`. See `AGENTS.md` §5.
 > **Pipeline naming:** SPEC §9 enumerates **7 ordered steps**, not 9 — docs historically said "9-step"; treat "SPEC §9 pipeline" as the 7-step list.
@@ -360,3 +536,5 @@ Notes for whoever builds these:
 | 2026-07-11 | audit | **8-goal live QA audit** driven end-to-end against the live bots + live DB (not mocks): customer chat, escalation/security, inventory, order/delivery, owner oversight, concurrency/edge, reports/accuracy, UX/errors. Found + fixed the **over-length false-quarantine bug** (a clean >2000-char message tripped the injection detector's length rule — removed from `detect_attack`, handled instead as a friendly `too_long` pipeline reply). Built **fulfilment status**: `orders.advance_delivery` + keeper `/deliveryupdate <#> packed\|shipped\|delivered` (`_is_next_step` pure rule — no skip/backward/off-flow). All 8 goals live-tested on Telegram; results pushed to the owner's chat | audit |
 | 2026-07-12 | 12b | **Timezone decided + built**: owner confirmed UAE-only → `reports.service` uses one `DUBAI=+4` day boundary (`parse_period`/`_day`), no per-shop column (would be unused configurability for a single-timezone business) | live-fix |
 | 2026-07-12 | 12b | **Rider onboarding + assignment + COD (Q-006 resolved).** New `riders/` module + migrations 007 (`delivery_persons.telegram_id`) and 008 (`orders` COD/custody columns + new `cod_ledger`), both applied live. Owner onboards riders (`/addrider`, `/riders`); rider links Telegram by shared contact (phone-matched); keeper `/assigndelivery` (COD + balance on the card) and `/reconcilecod` (previous+today−handover=remaining, pushed to rider too); global rider bot with `/mydeliveries`, `/accept`\|`/notreceived` (**custody handshake**, write-once — neither side can dispute a handover after), `/deliver` (time→cash→finalize), `/canceldelivery` (remarks mandatory, restocks), `/myreport`. Money is an append-only ledger, balance always re-derived. Live-verified full lifecycle on order #7 (assign→accept→deliver 1500→reconcile 1650→50 AED remaining), every row checked against the formula. 50 new tests (235 total) | Stage 12b |
+| 2026-07-13/14 | 12c | **Inline-button UX on every bot + security audit suite + shop-owner bot (7th bot, ADR-006).** `telegram_bot/keyboards.py`+`format.py` (new) — every menu button calls the same service function its matching slash command calls, never a second implementation. `tests/audit_suite/` (new) — tenant isolation vs prompt injection, webhook dedup under concurrency, atomic-stock-decrement race, WhatsApp sanitization, callback tenant isolation, every registered command on every bot smoke-run. Fixed 2 bugs found building it: `/addproduct` confirmation could 400 on shopkeeper-typed Markdown chars (now Telegram HTML, escaped); rider `/start` crashed (`kb` variable shadowed the module alias). **Shop-owner bot**: migration 009 (`clients.telegram_id` + new `messages` permanent chat archive, dual-written alongside the Redis session) applied live; deliberately no security/escalation views (owner: those would scare a client into abandoning the system); full financial/operational visibility instead — profit/orders/inventory/riders&COD/exports/transcripts per owned shop + cross-shop analytics. `scripts/run_bots_live.sh` (pins the venv python explicitly). 306 total green (52 in the new audit suite alone, zero warnings) | Stage 12c |
+| 2026-07-16 | 12d | **Gap-fix wave: migration 010 (applied live) + 6 phases, from a structured 14-item live-use report.** Real bug fixed: `list_price_requests` selected a nonexistent `identity` column (live column `phone`) — every `/pricerequests` press 500'd as "Internal error." Friendly reference codes (`utils/codes.py`; `PR0001`/`rider001`, migration-010-backfilled, `get_product_by_ref`/`bot._resolve_product`/`_resolve_rider` are now the one choke point every keeper command routes through) replace raw UUIDs everywhere a human types one. Real `/productstats` (folds orders against the catalogue — was Q-014's honest stub, **now resolved**), low-stock alerts (`orders.notify_low_stock`, fires only after a positive decrement), a 12th `/addproduct` step (`min_qty`) reachable from a button too, a printable 🧾 counter sheet. Platform-owner onboarding (`create_client`/`create_shop`/`create_shopkeeper` existed as repo methods with **zero callers** — now a real ➕ Onboarding menu + `/addclient`/`/addshop`/`/setshoptokens`/`/addkeeper`), owner analytics (top products/cancels+discounts/COD across every shop, reusing the shop-owner bot's own formatters), `escalations.resolve_escalation` made public + a ✔️ Resolve button (`/reply` alone never closed a row). Shop-owner 🗓 date-range orders (its first free-text consumer, re-guards the shop id when text lands) + a 📋 activity log (`_audit` now fires from the mutating inline buttons too, not just slash commands — a button-only keeper previously left zero trail). **Counter (walk-in) sales**: shop fills a printed sheet by hand → shop owner photographs it → vision model (`moonshot-v1-32k-vision-preview`) extracts rows → **owner confirms before anything is written** (man-in-the-middle by design); a discrepancy (sheet says sold, stock says impossible) is recorded flagged, never dropped, never counted as revenue; folds into `/profit` via `merge_counter`. Live-verified: identity backfill (10 products→PR0001-10, 1 rider→rider001, zero nulls), cross-shop code resolution correctly refused, `/productstats` total exactly matched `/profit` total, counter sheet exported real Storage objects, vision model round-trip confirmed against the live provider. All 7 bots restarted onto the new code, zero errors. 181 new tests (487 total), zero warnings, 9/9 self-checks pass | Stage 12d |

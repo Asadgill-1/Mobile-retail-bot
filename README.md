@@ -1,10 +1,10 @@
 # Multi-Shop Chatbot
 
-> **Status:** 🟢 Stages 0–12 core complete + full live QA audit + delivery/rider/COD (Stage 12b) · 235 tests passing · next: Stage 13 (WhatsApp/Twilio cutover)
+> **Status:** 🟢 Stages 0–12 core complete + full live QA audit + delivery/rider/COD + shop-owner bot + inline-button UX + gap-fix wave (Stages 12b–12d) · 487 tests passing · 7 bots live · next: Stage 13 (WhatsApp/Twilio cutover)
 > **Spec:** [`docs/SPEC-source.md`](docs/SPEC-source.md) (immutable)
 > **Current state:** [`docs/07-CURRENT-STATE.md`](docs/07-CURRENT-STATE.md)
 
-A production-grade, multi-tenant chatbot **platform** for an automation service company: each **client shop** (mobile/computer store) is an isolated tenant. WhatsApp (customers) + Telegram (owner/shopkeepers), AI anti-hallucination with function calling, intrusion detection + auto-quarantine, suspension/escalation/bypass, profit reporting, and Excel order export — single deployment, complete tenant isolation.
+A production-grade, multi-tenant chatbot **platform** for an automation service company: each **client shop** (mobile/computer store) is an isolated tenant. WhatsApp (customers) + Telegram (owner/shopkeepers/riders/shop-owners), AI anti-hallucination with function calling, intrusion detection + auto-quarantine, suspension/escalation/bypass, profit reporting (incl. counter/walk-in sales via vision extraction), friendly reference codes, and Excel order export — single deployment, complete tenant isolation.
 
 - **Testing phase:** Telegram-first, LLM = **Moonshot (Kimi)**, WhatsApp mocked.
 - **Production:** LLM = **OpenAI GPT-4o**, real Twilio/WhatsApp activated. (ADR-004, ADR-002)

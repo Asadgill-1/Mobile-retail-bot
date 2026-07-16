@@ -107,13 +107,12 @@
 - Verified live on `moonshotai/kimi-k2`: "cheapest phone" → 2,499 AED Galaxy S23; "anything under 2600" → offers the 2,499 and nothing above; "most expensive" → 4,699 AED S23 Ultra 512GB. Regression tests: `tests/products/test_search.py::test_cheapest_ignores_boost_the_q015_regression` and `::test_price_sort_still_respects_what_the_customer_asked_for`.
 - Status: **resolved → ADR-008 rev. 2.** Residual: superlative correctness depends on the model choosing `sort` — re-verify when switching provider (Stage 12 → GPT-4o). `_SYNONYMS` is hand-written and will need extending as real customer language arrives.
 
-### Q-014 — `/productstats`: what are "views" and "suggestions", and where are they stored?
+### Q-014 — `/productstats`: what are "views" and "suggestions", and where are they stored?  ✅ resolved (Stage 12d, 2026-07-16)
 - Context: SPEC §5 defines `/productstats <product_id>` as "Views, suggestions, orders, profit generated". **None of that data exists.** There is no views/suggestions/impressions table in `001_init.sql`; `orders` exists but order + profit logic is Stage 8. In a chat interface there is also no natural "view" event — the closest thing is "the AI returned this product from `search_products`".
-- Options: (a) **defer the whole command to Stage 8**, when orders/profit exist (current: `/productstats` stub now says Stage 8); (b) start metering "suggestions" now with a Redis counter at `ai/orchestrator._run_tool` (same `INCR` pattern as the ADR-006 usage meter) and treat suggestions as views; (c) add a `product_events` table.
-- Recommendation: (a) then (b) — don't build a counter for a report that doesn't exist. If suggestions should be metered from day one (for shopkeeper trust in boost/tags), say so and (b) is ~5 lines in the existing usage-meter pattern.
-- Decision needed from: owner.
-- Status: open. `/productstats` stub retargeted from Stage 5 → Stage 8.
-- Blocking: `/productstats` only. Nothing else in Stage 5.
+- Resolution: **views/suggestions were never built — orders/profit were, and that's what shipped.** `/productstats [period]` (`orders.service.product_stats` + `_fold_product_stats`) folds confirmed/delivered orders in the period (same status exclusions as `profit_summary`, so the two reports can never disagree) against the full catalogue, one row per product: sold qty, revenue, profit, current stock. Unsold products list with zeros at the bottom — dead stock, not view/suggestion counts, is what a shopkeeper actually needs from this report. `reports.service.format_product_stats` renders it; keeper `/productstats` and a new 📊 button (`keeper_stats_menu`, period-scoped) both call it.
+- Live-verified: a live `/productstats` total for a shop/period **exactly matched** the live `/profit` total for the same window — the whole point of sharing `profit_summary`'s exclusions.
+- Views/suggestions metering (original option (b)/(c)) was **not built** — nothing suggested it was needed once orders/profit existed. Revisit only if a shopkeeper explicitly asks for it.
+- Status: **resolved.** See `docs/07-CURRENT-STATE.md` Stage 12d.
 
 ### Q-013 — SPEC §4 search: are brand/model/category searchable, or only `specs` + `tags`?
 - Context: SPEC §4 says the backend "builds PostgreSQL query searching `specs` JSONB with ILIKE, also searches `tags`" — literally excluding `brand`, `model`, `category`, `color`, `condition`. But a customer typing "Samsung phone" is searching brand and category, and would match nothing.
