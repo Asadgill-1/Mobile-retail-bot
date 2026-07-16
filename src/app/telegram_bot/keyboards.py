@@ -79,7 +79,17 @@ def keeper_menu() -> M:
          B("📊 Product stats", callback_data=cb("kstats"))],
         [B("📤 Export orders", callback_data=cb("kexpmenu")),
          B("💬 Negotiation", callback_data=cb("knegmenu"))],
-        [B("🏷 Product tools", callback_data=cb("kprodmenu"))],
+        [B("🏷 Product tools", callback_data=cb("kprodmenu")),
+         B("🆔 ID list", callback_data=cb("kids"))],
+    ])
+
+
+def keeper_ids_menu() -> M:
+    """Nobody memorises which product or rider holds which id — pick what to look up."""
+    return M([
+        [B("📦 Product IDs", callback_data=cb("kidsp")),
+         B("🛵 Rider IDs", callback_data=cb("kidsr"))],
+        [B("⬅️ Menu", callback_data=cb("kmenu"))],
     ])
 
 

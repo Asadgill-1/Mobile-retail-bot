@@ -79,6 +79,7 @@ from app.products.service import (
     ProductNotFound,
     add_tags,
     clear_tags,
+    get_product_by_ref,
     list_inventory,
     parse_boost_level,
     parse_price,
@@ -88,6 +89,7 @@ from app.products.service import (
     toggle_featured,
 )
 from app.tenants.auth import is_owner
+from app.utils.codes import product_code, rider_code
 from app.tenants.models import Client, Shop, ShopStatus
 from app.tenants.service import ClientNotFound, ShopNotFound, TenantService
 
@@ -196,16 +198,22 @@ async def shopstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # --- owner rider onboarding (SPEC §10 delivery) ---
+def _rider_ref(r: dict) -> str:
+    """What a human types back: the friendly code, or the UUID if 010 hasn't numbered the row yet."""
+    n = r.get("rider_number")
+    return rider_code(n) if n else str(r["id"])
+
+
 def _format_riders(shop: Shop, riders: list[dict]) -> str:
     """Shared rider list for owner `/riders <shop>` and keeper `/riders`."""
     if not riders:
         return f"No riders for {shop.name} yet. Owner onboards with /addrider <shop> <phone> <name>."
     lines = [
-        f"• {r['name']} — {r['phone']} {'🟢 linked' if r.get('telegram_id') else '⚪ not linked'}\n"
-        f"  {r['id']}"
+        f"• {_rider_ref(r)} — {r['name']} — {r['phone']} "
+        f"{'🟢 linked' if r.get('telegram_id') else '⚪ not linked'}"
         for r in riders
     ]
-    return f"🛵 Riders — {shop.name}\n" + "\n".join(lines) + "\n\n/assigndelivery <order#> <rider_id>"
+    return f"🛵 Riders — {shop.name}\n" + "\n".join(lines) + "\n\n/assigndelivery <order#> <rider001>"
 
 
 @owner_only
@@ -220,7 +228,7 @@ async def addrider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update, context,
         f"🛵 Rider added to {shop.name}: {rider['name']} ({rider['phone']})\n"
-        f"id: {rider['id']}\n\n"
+        f"id: {_rider_ref(rider)}\n\n"
         "Ask them to open the rider bot and tap “Share my phone” to start receiving deliveries.",
     )
 
@@ -550,11 +558,12 @@ def _shop_of(context: ContextTypes.DEFAULT_TYPE) -> Shop:
     return context.application.bot_data["shop"]
 
 
-def _product_id(raw: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(raw)
-    except ValueError:
-        raise ValueError(f"'{raw}' is not a valid product id")
+async def _resolve_product(shop: Shop, raw: str) -> uuid.UUID:
+    """The single place a keeper-typed product reference becomes a UUID — a full UUID or a
+    friendly code ('PR0001'). Every product command routes through here (SPEC §5). Raises
+    ProductNotFound on miss (mapped to the safe reply; never confirms a foreign product)."""
+    product = await get_product_by_ref(shop.id, raw)
+    return product.id
 
 
 async def _keeper_err(update: Update, context: ContextTypes.DEFAULT_TYPE, exc: Exception) -> None:
@@ -618,9 +627,10 @@ async def _audit(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str
 async def boost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=2)
     if len(parts) < 2:
-        await _reply(update, context, "Usage: /boost <product_id> <1-10>")
+        await _reply(update, context, "Usage: /boost <product> <1-10>")
         return
-    p = await set_boost(_shop_of(context).id, _product_id(parts[0]), parse_boost_level(parts[1]))
+    shop = _shop_of(context)
+    p = await set_boost(shop.id, await _resolve_product(shop, parts[0]), parse_boost_level(parts[1]))
     await _reply(update, context, f"🚀 {p.brand} {p.model} — boost {p.boost_level}/10.")
 
 
@@ -628,9 +638,10 @@ async def boost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def unboost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=1)
     if not parts:
-        await _reply(update, context, "Usage: /unboost <product_id>")
+        await _reply(update, context, "Usage: /unboost <product>")
         return
-    p = await set_boost(_shop_of(context).id, _product_id(parts[0]), 0)  # /unboost = boost 0
+    shop = _shop_of(context)
+    p = await set_boost(shop.id, await _resolve_product(shop, parts[0]), 0)  # /unboost = boost 0
     await _reply(update, context, f"✅ {p.brand} {p.model} — boost cleared.")
 
 
@@ -638,9 +649,10 @@ async def unboost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=2)
     if len(parts) < 2:
-        await _reply(update, context, "Usage: /tag <product_id> <tag1,tag2>")
+        await _reply(update, context, "Usage: /tag <product> <tag1,tag2>")
         return
-    p = await add_tags(_shop_of(context).id, _product_id(parts[0]), parse_tags(parts[1]))
+    shop = _shop_of(context)
+    p = await add_tags(shop.id, await _resolve_product(shop, parts[0]), parse_tags(parts[1]))
     await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
 
 
@@ -648,9 +660,10 @@ async def tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def untag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=2)
     if len(parts) < 2:
-        await _reply(update, context, "Usage: /untag <product_id> <tag>")
+        await _reply(update, context, "Usage: /untag <product> <tag>")
         return
-    p = await remove_tag(_shop_of(context).id, _product_id(parts[0]), parts[1])
+    shop = _shop_of(context)
+    p = await remove_tag(shop.id, await _resolve_product(shop, parts[0]), parts[1])
     await _reply(update, context, f"🏷 {p.brand} {p.model} — tags: {', '.join(p.tags) or '—'}")
 
 
@@ -658,9 +671,10 @@ async def untag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cleartags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=1)
     if not parts:
-        await _reply(update, context, "Usage: /cleartags <product_id>")
+        await _reply(update, context, "Usage: /cleartags <product>")
         return
-    p = await clear_tags(_shop_of(context).id, _product_id(parts[0]))
+    shop = _shop_of(context)
+    p = await clear_tags(shop.id, await _resolve_product(shop, parts[0]))
     await _reply(update, context, f"🏷 {p.brand} {p.model} — all tags removed.")
 
 
@@ -668,9 +682,10 @@ async def cleartags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = _split(update.message.text, maxsplit=1)
     if not parts:
-        await _reply(update, context, "Usage: /feature <product_id>")
+        await _reply(update, context, "Usage: /feature <product>")
         return
-    p = await toggle_featured(_shop_of(context).id, _product_id(parts[0]))
+    shop = _shop_of(context)
+    p = await toggle_featured(shop.id, await _resolve_product(shop, parts[0]))
     await _reply(update, context, f"{'⭐' if p.is_featured else '☆'} {p.brand} {p.model} — featured: {p.is_featured}")
 
 
@@ -755,17 +770,15 @@ async def riders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @keeper_command
 async def assigndelivery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/assigndelivery <order#> <rider_id>` — attach a rider to a confirmed order + notify them."""
+    """`/assigndelivery <order#> <rider>` — attach a rider to a confirmed order + notify them."""
     parts = _split(update.message.text, maxsplit=2)
     if len(parts) < 2:
-        await _reply(update, context, "Usage: /assigndelivery <order_number> <rider_id>")
+        await _reply(update, context, "Usage: /assigndelivery <order_number> <rider|rider001|name>")
         return
     num = _order_number(parts[0])
-    try:
-        rider_id = uuid.UUID(parts[1])
-    except ValueError:
-        raise ValueError(f"'{parts[1]}' is not a valid rider id")
-    res = await assign_delivery(_shop_of(context), num, rider_id)
+    shop = _shop_of(context)
+    rider_id = uuid.UUID(str((await _resolve_rider(shop, parts[1]))["id"]))
+    res = await assign_delivery(shop, num, rider_id)
     tail = ("Rider notified. 📲" if res["notified"]
             else "⚠️ Rider hasn't linked Telegram yet — ask them to /start the rider bot.")
     await _reply(update, context,
@@ -773,13 +786,27 @@ async def assigndelivery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _resolve_rider(shop: Shop, arg: str) -> dict:
-    """Rider by UUID or case-insensitive name within this shop (for /reconcilecod)."""
+    """Rider by UUID, friendly code ('rider001') or case-insensitive name, within this shop.
+
+    The single place a keeper-typed rider reference is resolved (/reconcilecod, /assigndelivery,
+    /exportrider). RiderNotFound on miss — same message for unknown and another shop's rider."""
     from app.riders.service import get_rider, list_riders
 
+    from app.utils.codes import parse_rider_code
+
+    arg = (arg or "").strip()
     try:
         return await get_rider(shop.id, uuid.UUID(arg))
     except ValueError:
-        pass  # not a uuid — try by name
+        pass  # not a uuid — try a friendly code, then a name
+
+    number = parse_rider_code(arg)
+    if number is not None:
+        by_code = [r for r in await list_riders(shop.id) if r.get("rider_number") == number]
+        if by_code:
+            return by_code[0]
+        raise RiderNotFound(arg)
+
     matches = [r for r in await list_riders(shop.id) if (r.get("name") or "").lower() == arg.lower()]
     if not matches:
         raise RiderNotFound(arg)
@@ -889,16 +916,14 @@ async def exportorders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @keeper_command
 async def exportrider_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/exportrider <rider_id> [today|yesterday|YYYY-MM-DD]` — one rider's route, sorted by address."""
+    """`/exportrider <rider> [today|yesterday|YYYY-MM-DD]` — one rider's route, sorted by address."""
     parts = _split(update.message.text, maxsplit=2)
     if not parts:
-        await _reply(update, context, "Usage: /exportrider <rider_id> [today|yesterday|YYYY-MM-DD]")
+        await _reply(update, context, "Usage: /exportrider <rider|rider001|name> [today|yesterday|YYYY-MM-DD]")
         return
-    try:
-        rider = uuid.UUID(parts[0])
-    except ValueError:
-        raise ValueError(f"'{parts[0]}' is not a valid rider id")
-    name, url, n = await export_rider(_shop_of(context), rider, parts[1] if len(parts) > 1 else "today")
+    shop = _shop_of(context)
+    rider = uuid.UUID(str((await _resolve_rider(shop, parts[0]))["id"]))
+    name, url, n = await export_rider(shop, rider, parts[1] if len(parts) > 1 else "today")
     await _reply(update, context, f"🛵 {n} order(s) for rider — {name}\n{url}\n(link valid 24h)")
 
 
@@ -1128,7 +1153,7 @@ async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             shop = await service.get_shop(uuid.UUID(args[0]))
             rider = await add_rider(shop.id, parts[1], parts[0])
             await _reply(update, context, f"🛵 Rider added to {shop.name}: {rider['name']} ({rider['phone']})\n"
-                         f"id: {rider['id']}\nAsk them to open the rider bot and tap “Share my phone”.")
+                         f"id: {_rider_ref(rider)}\nAsk them to open the rider bot and tap “Share my phone”.")
         elif do == "omdel":
             await _owner_delete_messages(update, context, args, text)
         else:
@@ -1309,9 +1334,9 @@ async def keeper_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # Which slash prompt each product button maps to (button → guided '<id> <value>' reply).
 _KPROD_PROMPT = {
-    "kboost": "Reply with:  <product_id> <1-10>", "kunboost": "Reply with:  <product_id>",
-    "ktag": "Reply with:  <product_id> <tag1,tag2>", "kuntag": "Reply with:  <product_id> <tag>",
-    "kcleartags": "Reply with:  <product_id>", "kfeature": "Reply with:  <product_id>",
+    "kboost": "Reply with:  <PR0001> <1-10>", "kunboost": "Reply with:  <PR0001>",
+    "ktag": "Reply with:  <PR0001> <tag1,tag2>", "kuntag": "Reply with:  <PR0001> <tag>",
+    "kcleartags": "Reply with:  <PR0001>", "kfeature": "Reply with:  <PR0001>",
 }
 
 
@@ -1333,6 +1358,17 @@ async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await riders_cmd(update, context)
         elif action == "kstats":
             await productstats_cmd(update, context)
+        elif action == "kids":
+            await q.edit_message_text("🆔 Which IDs?", reply_markup=kb.keeper_ids_menu())
+        elif action == "kidsp":
+            from app.reports.service import format_id_list_products
+
+            rows = await list_inventory(shop.id)
+            await _reply(update, context, format_id_list_products(shop.name, rows))
+        elif action == "kidsr":
+            from app.reports.service import format_id_list_riders
+
+            await _reply(update, context, format_id_list_riders(shop.name, await list_riders(shop.id)))
         elif action == "kprofmenu":
             await q.edit_message_text("📈 Profit for…", reply_markup=kb.keeper_profit_menu())
         elif action == "kexpmenu":
@@ -1439,12 +1475,12 @@ async def _keeper_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _keeper_product_edit(update, context, shop, do: str, text: str) -> None:
-    """Apply a product button's '<id> <value>' reply via the existing product-service calls."""
+    """Apply a product button's '<product> <value>' reply via the existing product-service calls."""
     parts = text.split(maxsplit=1)
     if not parts:
         await _reply(update, context, "Nothing entered.")
         return
-    pid = _product_id(parts[0])
+    pid = await _resolve_product(shop, parts[0])
     rest = parts[1] if len(parts) > 1 else ""
     if do == "kboost":
         p = await set_boost(shop.id, pid, parse_boost_level(rest))

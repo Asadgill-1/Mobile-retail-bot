@@ -58,3 +58,40 @@ def test_format_owner_profit_totals_across_shops():
     out = format_owner_profit([("Shop A", a), ("Shop B", b)], "Today")
     assert "Shop A: 1 orders" in out and "Shop B: 2 orders" in out
     assert "All shops: 3 orders · +1,200 AED" in out
+
+
+# --- 🆔 ID list (migration 010): the codes a human types back ---
+from app.reports.service import format_id_list_products, format_id_list_riders  # noqa: E402
+
+
+def test_format_id_list_products_shows_codes_not_uuids():
+    rows = [
+        {"product_number": 1, "brand": "Samsung", "model": "S23", "color": "black", "quantity": 3},
+        {"product_number": 12, "brand": "Apple", "model": "iPhone 15", "quantity": 0},
+    ]
+    out = format_id_list_products("Shop 01", rows)
+    assert "PR0001 · Samsung S23 (black) — qty 3" in out
+    assert "PR0012 · Apple iPhone 15 — qty 0" in out
+    assert "/boost" in out  # tells the keeper what to do with the code
+
+
+def test_format_id_list_products_unnumbered_row_shows_dash():
+    # Before migration 010 backfills, product_number is null — must not crash or print "None".
+    out = format_id_list_products("Shop 01", [{"brand": "Nokia", "model": "3310", "quantity": 5}])
+    assert "— · Nokia 3310" in out or "—" in out
+    assert "None" not in out
+
+
+def test_format_id_list_riders_shows_codes_and_link_state():
+    rows = [
+        {"rider_number": 1, "name": "Sami", "phone": "0501234567", "telegram_id": 999},
+        {"rider_number": 2, "name": "Ali", "phone": "0507654321", "telegram_id": None},
+    ]
+    out = format_id_list_riders("Shop 01", rows)
+    assert "rider001 · Sami — 0501234567 🟢" in out
+    assert "rider002 · Ali — 0507654321 ⚪" in out
+
+
+def test_format_id_lists_empty_states():
+    assert "no products" in format_id_list_products("Shop 01", [])
+    assert "no riders" in format_id_list_riders("Shop 01", [])

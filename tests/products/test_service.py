@@ -244,3 +244,40 @@ async def test_create_product_forces_shop_id_and_stringifies_money():
     assert row["shop_id"] == str(SHOP_A)          # never taken from user input
     assert row["cost_price"] == "1000.00"          # Decimal → str, never float
     assert isinstance(row["cost_price"], str)
+
+
+# --- friendly codes (migration 010): PR0001 resolves like a UUID, still shop-scoped ---
+from app.products.service import get_product_by_ref  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_get_product_by_ref_accepts_uuid():
+    sb = _FakeSupabase([_row()])
+    p = await get_product_by_ref(SHOP_A, str(PROD), client=sb)
+    assert p.id == PROD
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["PR0007", "pr7", "7"])
+async def test_get_product_by_ref_accepts_friendly_code(ref):
+    sb = _FakeSupabase([_row(product_number=7)])
+    p = await get_product_by_ref(SHOP_A, ref, client=sb)
+    assert p.id == PROD and p.product_number == 7
+    assert sb.filters_seen[-1] == {"product_number": 7, "shop_id": str(SHOP_A)}  # scoped by shop
+
+
+@pytest.mark.asyncio
+async def test_get_product_by_ref_code_is_tenant_scoped():
+    # The row exists, but it belongs to shop A — asking as shop B must not find it.
+    sb = _FakeSupabase([_row(product_number=7)])
+    with pytest.raises(ProductNotFound):
+        await get_product_by_ref(SHOP_B, "PR0007", client=sb)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["", "not-a-code", "PR0", "rider001"])
+async def test_get_product_by_ref_junk_is_product_not_found(ref):
+    # Junk must land on the same error a wrong id gets — never a raw crash for the keeper.
+    sb = _FakeSupabase([_row(product_number=7)])
+    with pytest.raises(ProductNotFound):
+        await get_product_by_ref(SHOP_A, ref, client=sb)

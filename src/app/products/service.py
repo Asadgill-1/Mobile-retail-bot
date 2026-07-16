@@ -210,6 +210,43 @@ async def get_product(shop_id: UUID, product_id: UUID, client: Any | None = None
     return product
 
 
+async def get_product_by_ref(shop_id: UUID, ref: str, client: Any | None = None) -> Product:
+    """Resolve a product the shopkeeper named — either a full UUID or a friendly code ('PR0001').
+
+    UUID → the existing tenant guard. Otherwise parse the code to a product_number and look it up
+    within this shop. Both paths raise ProductNotFound on miss (same message — never confirm a
+    foreign product exists)."""
+    from app.utils.codes import parse_product_code
+
+    ref = (ref or "").strip()
+    try:
+        return await get_product(shop_id, UUID(ref), client)
+    except ValueError:
+        pass  # not a UUID — try a friendly code
+
+    number = parse_product_code(ref)
+    if number is None:
+        raise ProductNotFound(ref)
+
+    sb = _sb(client)
+
+    def _q() -> Product | None:
+        r = (
+            sb.table("products")
+            .select("*")
+            .eq("product_number", number)
+            .eq("shop_id", str(shop_id))  # cross-shop access impossible
+            .execute()
+        )
+        rows = r.data or []
+        return Product(**rows[0]) if rows else None
+
+    product = await asyncio.to_thread(_q)
+    if product is None:
+        raise ProductNotFound(ref)
+    return product
+
+
 async def _update(shop_id: UUID, product_id: UUID, patch: dict[str, Any], client: Any | None) -> Product:
     """Apply a patch to a product already proven to belong to this shop."""
     sb = _sb(client)
@@ -266,7 +303,7 @@ async def list_inventory(shop_id: UUID, client: Any | None = None) -> list[dict]
     def _q() -> list[dict]:
         return (
             sb.table("products")
-            .select("brand,model,color,quantity,selling_price,cost_price")
+            .select("product_number,brand,model,color,quantity,selling_price,cost_price,min_qty")
             .eq("shop_id", str(shop_id))
             .order("quantity")
             .limit(100)

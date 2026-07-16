@@ -176,6 +176,41 @@ def format_inventory(shop_name: str, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_id_list_products(shop_name: str, rows: list[dict]) -> str:
+    """The 🆔 ID list — which product holds which code. Columns a human can scan, not UUIDs."""
+    from app.utils.codes import product_code
+
+    if not rows:
+        return f"🆔 {shop_name}: no products."
+    lines = [f"🆔 Product IDs — {shop_name}", ""]
+    for row in rows:
+        n = row.get("product_number")
+        ref = product_code(n) if n else "—"
+        color = f" ({row['color']})" if row.get("color") else ""
+        lines.append(
+            f"  {ref} · {row.get('brand', '?')} {row.get('model', '')}{color}"
+            f" — qty {int(row.get('quantity') or 0)}"
+        )
+    lines += ["", "Use the code with /boost, /tag, /feature."]
+    return "\n".join(lines)
+
+
+def format_id_list_riders(shop_name: str, rows: list[dict]) -> str:
+    """The 🆔 ID list — which rider holds which code."""
+    from app.utils.codes import rider_code
+
+    if not rows:
+        return f"🆔 {shop_name}: no riders."
+    lines = [f"🆔 Rider IDs — {shop_name}", ""]
+    for row in rows:
+        n = row.get("rider_number")
+        ref = rider_code(n) if n else "—"
+        link = "🟢" if row.get("telegram_id") else "⚪"
+        lines.append(f"  {ref} · {row.get('name', '?')} — {row.get('phone', '')} {link}")
+    lines += ["", "Use the code with /assigndelivery, /reconcilecod, /exportrider."]
+    return "\n".join(lines)
+
+
 def format_cod_outstanding(per_shop: list[tuple[str, list[tuple[str, object]]]]) -> str:
     """Cash riders are still holding, per rider per shop + grand total. 0-balance riders shown
     too — the owner should see the full roster, not only debtors."""

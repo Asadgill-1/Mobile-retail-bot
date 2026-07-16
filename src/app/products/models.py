@@ -30,4 +30,6 @@ class Product(BaseModel):
     boost_level: int = 0  # 0-10, internal only — never exposed to customers (SPEC §5)
     tags: list[str] = Field(default_factory=list)
     is_featured: bool = False
+    product_number: int | None = None  # friendly ref "PR0001" (migration 010); null until backfilled
+    min_qty: int = 0  # low-stock alert threshold; 0 = alerts off (migration 010)
     created_at: datetime | None = None

@@ -302,3 +302,42 @@ def test_format_rider_report_survives_bad_timestamp():
                "products": {}}]
     out = bot._format_rider_report(orders, "Today", Decimal("0"))
     assert "#9 — item ×1" in out and "💵 0 AED" in out          # no crash, sane fallbacks
+
+
+# --- friendly-code resolution (migration 010): the single keeper-facing choke point ---
+@pytest.mark.asyncio
+async def test_resolve_rider_accepts_friendly_code(monkeypatch):
+    from uuid import uuid4
+
+    rid = uuid4()
+    shop = type("S", (), {"id": uuid4(), "name": "Shop 01"})()
+
+    async def _list(shop_id, client=None):
+        return [{"id": str(rid), "rider_number": 7, "name": "Sami", "phone": "0501234567"}]
+
+    monkeypatch.setattr("app.riders.service.list_riders", _list)
+    r = await bot._resolve_rider(shop, "rider007")
+    assert r["name"] == "Sami"
+    r = await bot._resolve_rider(shop, "7")  # plain number works too
+    assert r["name"] == "Sami"
+
+
+@pytest.mark.asyncio
+async def test_resolve_rider_unknown_code_is_rider_not_found(monkeypatch):
+    from uuid import uuid4
+
+    from app.riders.service import RiderNotFound
+
+    shop = type("S", (), {"id": uuid4(), "name": "Shop 01"})()
+
+    async def _list(shop_id, client=None):
+        return [{"id": str(uuid4()), "rider_number": 1, "name": "Sami", "phone": "p"}]
+
+    monkeypatch.setattr("app.riders.service.list_riders", _list)
+    with pytest.raises(RiderNotFound):
+        await bot._resolve_rider(shop, "rider999")
+
+
+def test_rider_ref_falls_back_to_uuid_before_backfill():
+    assert bot._rider_ref({"id": "abc", "rider_number": 3}) == "rider003"
+    assert bot._rider_ref({"id": "abc"}) == "abc"  # 010 hasn't numbered the row yet
