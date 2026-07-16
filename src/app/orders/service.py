@@ -142,6 +142,80 @@ async def profit_summary(
     return _aggregate(await asyncio.to_thread(_q))
 
 
+async def product_stats(
+    shop_id: UUID, start: datetime, end: datetime, client: Any | None = None
+) -> list[dict]:
+    """Per-product sales for `/productstats` (Q-014 — was a stub; nothing was ever tracked).
+
+    Two reads, folded in Python: the orders in [start, end) (same exclusions as profit_summary, so
+    the numbers agree with /profit) and the shop's full catalogue — a product that sold NOTHING is
+    the most interesting row on the report, so it must appear with zeros.
+    """
+    sb = _sb(client)
+
+    def _q() -> tuple[list[dict], list[dict]]:
+        orders = (
+            sb.table("orders")
+            .select("product_id,quantity,selling_price,discount_amount,products(cost_price)")
+            .eq("shop_id", str(shop_id))
+            .gte("created_at", start.isoformat())
+            .lt("created_at", end.isoformat())
+            .neq("status", "cancelled")
+            .neq("status", "draft")
+            .execute()
+            .data
+            or []
+        )
+        products = (
+            sb.table("products")
+            .select("id,product_number,brand,model,quantity")
+            .eq("shop_id", str(shop_id))
+            .execute()
+            .data
+            or []
+        )
+        return orders, products
+
+    orders, products = await asyncio.to_thread(_q)
+    return _fold_product_stats(orders, products)
+
+
+def _fold_product_stats(orders: list[dict], products: list[dict]) -> list[dict]:
+    """Pure: orders + catalogue → one row per product, best seller first. Revenue is gross
+    selling_price (what /profit calls revenue) so the two reports never disagree."""
+    from app.utils.codes import product_code
+
+    sold: dict[str, dict] = {}
+    for o in orders:
+        p = o.get("products") or {}
+        sell = Decimal(str(o["selling_price"]))
+        disc = Decimal(str(o["discount_amount"]))
+        cp = Decimal(str(p.get("cost_price", "0")))
+        qty = int(o["quantity"])
+        e = sold.setdefault(
+            str(o.get("product_id")), {"sold_qty": 0, "revenue": Decimal("0"), "profit": Decimal("0")}
+        )
+        e["sold_qty"] += qty
+        e["revenue"] += sell
+        e["profit"] += line_profit(sell, disc, cp, qty)
+
+    zero = {"sold_qty": 0, "revenue": Decimal("0"), "profit": Decimal("0")}
+    rows = []
+    for pr in products:
+        s = sold.get(str(pr.get("id")), zero)
+        n = pr.get("product_number")
+        rows.append({
+            "code": product_code(n) if n else "—",
+            "label": f"{pr.get('brand', '?')} {pr.get('model', '')}".strip(),
+            "sold_qty": s["sold_qty"],
+            "revenue": s["revenue"],
+            "profit": s["profit"],
+            "stock": int(pr.get("quantity") or 0),
+        })
+    rows.sort(key=lambda r: (r["revenue"], r["sold_qty"]), reverse=True)
+    return rows
+
+
 def _aggregate(rows: list[dict]) -> ProfitSummary:
     revenue = discounts = cost = profit = clearance = Decimal("0")
     by_product: dict[str, ProfitLine] = {}
@@ -458,7 +532,44 @@ async def confirm_order(shop: Shop, order_number: int, client: Any | None = None
     )
     await send_to_customer(shop, draft["phone"], msg)
     await _remember_to_customer(shop, draft["phone"], msg)  # AI knows it's confirmed (not "still waiting")
+    await notify_low_stock(shop, draft["product_id"], client)  # only after a successful decrement
     return draft
+
+
+async def notify_low_stock(shop: Shop, product_id: Any, client: Any | None = None) -> bool:
+    """Ping the shop AND its owner when a product just fell to its min_qty (migration 010).
+
+    Called only after stock actually went DOWN (confirm_order, counter sales) — a restock must
+    never alert. min_qty = 0 means alerts are off, which is every product until someone sets one.
+    Best-effort: an alert that fails can never break the sale that triggered it.
+    """
+    try:
+        from app.products.service import get_product
+
+        product = await get_product(shop.id, product_id, client)  # fresh read: post-decrement qty
+        if product.min_qty <= 0 or product.quantity > product.min_qty:
+            return False
+
+        from app.utils.codes import product_code
+
+        ref = product_code(product.product_number) if product.product_number else str(product.id)
+        text = (
+            f"⚠️ Low stock — {shop.name}\n"
+            f"{ref} · {product.brand} {product.model}\n"
+            f"{product.quantity} left (alert at {product.min_qty}). Time to reorder."
+        )
+        await _notify_shop(shop, text)
+
+        from app.db.factory import get_tenant_repo
+        from app.telegram_bot.notify import send_to_shopowner
+
+        owner = await get_tenant_repo().get_client(shop.client_id)
+        if owner is not None and owner.telegram_id:
+            await send_to_shopowner(owner.telegram_id, text)
+        return True
+    except Exception:
+        logger.exception("low-stock alert failed shop=%s product=%s", shop.id, product_id)
+        return False
 
 
 async def advance_delivery(

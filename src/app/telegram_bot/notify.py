@@ -80,6 +80,19 @@ async def send_to_rider(telegram_id: int, text: str,
     )
 
 
+async def send_to_shopowner(telegram_id: int, text: str,
+                           reply_markup: InlineKeyboardMarkup | None = None) -> bool:
+    """Push a notice to a shop owner (client) on the global shop-owner bot. Best-effort.
+
+    Mirrors send_to_rider: False if the shop-owner bot token is unset or the owner hasn't linked
+    their Telegram — an unreached owner never breaks the action that triggered the notice.
+    """
+    return await _send(
+        settings.telegram_shopowner_bot_token, telegram_id, text, what="shop-owner notice",
+        reply_markup=reply_markup,
+    )
+
+
 async def send_to_customer(shop: Shop, identity: str, text: str) -> bool:
     """Reach the customer on the shop's customer-facing channel.
 

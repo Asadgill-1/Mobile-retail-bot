@@ -264,7 +264,7 @@ def test_keeper_bot_registers_real_product_commands(tenant_service):
     for name, handler in bot.KEEPER_COMMANDS.items():
         assert registered[name] is handler, f"/{name} is stubbed, not wired"
 
-    # /addproduct is the 11-step ConversationHandler, not a plain CommandHandler stub
+    # /addproduct is the 12-step ConversationHandler, not a plain CommandHandler stub
     convs = [h for h in handlers if isinstance(h, ConversationHandler)]
     assert len(convs) == 1 and convs[0].name == "addproduct"
     assert "addproduct" not in registered

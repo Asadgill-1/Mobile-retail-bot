@@ -157,11 +157,12 @@ async def create_product(
     cost_price: Decimal,
     selling_price: Decimal,
     quantity: int,
+    min_qty: int = 0,
     images: list[str] | None = None,
     video_url: str | None = None,
     client: Any | None = None,
 ) -> Product:
-    """Insert a product (SPEC §4 step 11). `shop_id` comes from the bot's shop, never user input."""
+    """Insert a product (SPEC §4 step 12). `shop_id` comes from the bot's shop, never user input."""
     sb = _sb(client)
     row = {
         "id": str(product_id),
@@ -175,6 +176,7 @@ async def create_product(
         "cost_price": str(cost_price),  # Decimal → string; never float across the wire
         "selling_price": str(selling_price),
         "quantity": quantity,
+        "min_qty": min_qty,
         "images": images or [],
         "video_url": video_url,
     }
@@ -294,6 +296,66 @@ async def toggle_featured(shop_id: UUID, product_id: UUID, client: Any | None = 
     """`/feature` — toggle is_featured (SPEC §5)."""
     product = await get_product(shop_id, product_id, client)
     return await _update(shop_id, product_id, {"is_featured": not product.is_featured}, client)
+
+
+_COUNTER_SHEET_HEADERS = [
+    "Product ID", "Product Name", "Specifications", "Qty in hand", "Price sold", "Qty sold",
+]
+
+
+def _specs_text(specs: dict | None) -> str:
+    """'ram: 12GB · storage: 256GB' — one readable cell, not a JSON blob."""
+    return " · ".join(f"{k}: {v}" for k, v in (specs or {}).items())
+
+
+def counter_sheet_rows(products: list[dict]) -> list[list]:
+    """Pure: catalogue → sheet rows. Price sold / Qty sold stay EMPTY — the shop fills them by
+    hand at the counter, and the shop owner photographs the filled sheet (Phase 6 reads it back)."""
+    from app.utils.codes import product_code
+
+    rows = []
+    for p in products:
+        n = p.get("product_number")
+        name = f"{p.get('brand', '?')} {p.get('model', '')}".strip()
+        if p.get("color"):
+            name += f" ({p['color']})"
+        rows.append([
+            product_code(n) if n else "",
+            name,
+            _specs_text(p.get("specs")),
+            int(p.get("quantity") or 0),
+            "",   # Price sold — filled by hand
+            "",   # Qty sold  — filled by hand
+        ])
+    return rows
+
+
+async def export_counter_sheet(shop: Any, client: Any | None = None) -> tuple[str, str, int]:
+    """🧾 Counter sheet: the printable day sheet the shop fills in by hand.
+
+    Returns (filename, 24h signed url, product count). Same upload path as every other report.
+    """
+    from app.utils.excel import sheet_workbook
+    from app.utils.storage import upload_report
+
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("products")
+            .select("product_number,brand,model,color,specs,quantity")
+            .eq("shop_id", str(shop.id))
+            .order("product_number")
+            .execute()
+            .data
+            or []
+        )
+
+    products = await asyncio.to_thread(_q)
+    data = sheet_workbook("Counter sales", _COUNTER_SHEET_HEADERS, counter_sheet_rows(products))
+    filename = f"counter_sheet_{shop.id}.xlsx"
+    url = await upload_report(shop.id, filename, data, client)
+    return filename, url, len(products)
 
 
 async def list_inventory(shop_id: UUID, client: Any | None = None) -> list[dict]:

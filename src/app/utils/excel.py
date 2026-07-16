@@ -56,19 +56,21 @@ def _row(o: dict, detailed: bool) -> list[Any]:
     return row
 
 
-def orders_workbook(rows: list[dict], *, detailed: bool = False) -> bytes:
-    """Build the pick-&-pack sheet. `detailed` adds time/rider/instructions columns (SPEC §10)."""
-    headers = _BASE + (_DETAIL if detailed else [])
+def sheet_workbook(title: str, headers: list[str], rows: list[list[Any]]) -> bytes:
+    """Any styled sheet: SPEC §10 header, borders, auto-width, frozen header → .xlsx bytes.
+
+    The styling lives here once; every export (orders, counter sheet) is just headers + rows.
+    """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Orders"
+    ws.title = title
 
     ws.append(headers)
     for c in ws[1]:
         c.fill, c.font, c.border, c.alignment = _HEADER_FILL, _HEADER_FONT, _BORDER, _CENTER
 
-    for o in rows:
-        ws.append(_row(o, detailed))
+    for r in rows:
+        ws.append(r)
     for line in ws.iter_rows(min_row=2):
         for c in line:
             c.border = _BORDER
@@ -82,6 +84,12 @@ def orders_workbook(rows: list[dict], *, detailed: bool = False) -> bytes:
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def orders_workbook(rows: list[dict], *, detailed: bool = False) -> bytes:
+    """Build the pick-&-pack sheet. `detailed` adds time/rider/instructions columns (SPEC §10)."""
+    headers = _BASE + (_DETAIL if detailed else [])
+    return sheet_workbook("Orders", headers, [_row(o, detailed) for o in rows])
 
 
 if __name__ == "__main__":  # ponytail self-check: builds, reloads, columns + specs extraction hold

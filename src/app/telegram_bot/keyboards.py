@@ -81,6 +81,7 @@ def keeper_menu() -> M:
          B("💬 Negotiation", callback_data=cb("knegmenu"))],
         [B("🏷 Product tools", callback_data=cb("kprodmenu")),
          B("🆔 ID list", callback_data=cb("kids"))],
+        [B("🧾 Counter sheet", callback_data=cb("ksheet"))],
     ])
 
 
@@ -95,6 +96,10 @@ def keeper_ids_menu() -> M:
 
 def keeper_profit_menu() -> M:
     return M(_period_rows("kprof") + [[B("⬅️ Menu", callback_data=cb("kmenu"))]])
+
+
+def keeper_stats_menu() -> M:
+    return M(_period_rows("kstat") + [[B("⬅️ Menu", callback_data=cb("kmenu"))]])
 
 
 def keeper_export_menu() -> M:
@@ -113,6 +118,7 @@ def keeper_negotiation_menu() -> M:
 def keeper_product_menu() -> M:
     """Product edits need an id + value typed, so each button starts a guided prompt."""
     return M([
+        [B("➕ Add product", callback_data=cb("kaddp"))],
         [B("🚀 Boost", callback_data=cb("kboost")), B("↩️ Unboost", callback_data=cb("kunboost"))],
         [B("🏷 Add tags", callback_data=cb("ktag")), B("🏷 Remove tag", callback_data=cb("kuntag"))],
         [B("🧹 Clear tags", callback_data=cb("kcleartags")),

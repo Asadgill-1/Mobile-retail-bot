@@ -50,3 +50,34 @@ def test_detailed_adds_rider_columns():
 def test_base_has_no_detail_columns():
     _, hdr = _sheet([_ROW])
     assert "Rider Name" not in hdr and "Order Time" not in hdr
+
+
+# --- generic sheet builder (the counter sheet reuses the orders styling) ---
+def test_sheet_workbook_styles_header_and_writes_rows():
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    from app.utils.excel import sheet_workbook
+
+    data = sheet_workbook("Counter sales", ["A", "B"], [[1, "x"], [2, "y"]])
+    ws = load_workbook(BytesIO(data)).active
+    assert ws.title == "Counter sales"
+    assert [c.value for c in ws[1]] == ["A", "B"]
+    assert ws["A1"].fill.fgColor.rgb.endswith("2563EB")  # same SPEC §10 header as orders
+    assert ws.freeze_panes == "A2"
+    assert [c.value for c in ws[2]] == [1, "x"]
+
+
+def test_counter_sheet_rows_leave_sale_columns_empty_for_the_pen():
+    from app.products.service import counter_sheet_rows
+
+    rows = counter_sheet_rows([
+        {"product_number": 1, "brand": "Samsung", "model": "S23", "color": "black",
+         "specs": {"ram": "12GB", "storage": "256GB"}, "quantity": 4},
+        {"product_number": 2, "brand": "Apple", "model": "iPhone 15", "quantity": 0},
+    ])
+    assert rows[0][:4] == ["PR0001", "Samsung S23 (black)", "ram: 12GB · storage: 256GB", 4]
+    assert rows[0][4:] == ["", ""]          # Price sold / Qty sold — the shop writes these by hand
+    assert rows[1][:2] == ["PR0002", "Apple iPhone 15"]
+    assert rows[1][2] == ""                 # no specs → empty cell, not "None"

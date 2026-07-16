@@ -927,15 +927,40 @@ async def exportrider_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _reply(update, context, f"🛵 {n} order(s) for rider — {name}\n{url}\n(link valid 24h)")
 
 
+# --- counter sale sheet: the printable day sheet the shop fills by hand ---
+@keeper_command
+async def countersheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/countersheet` — Excel of the catalogue with empty 'Price sold' / 'Qty sold' columns.
+    Print it, fill it at the counter, then the shop owner photographs it into 🧾 Today sell."""
+    from app.products.service import export_counter_sheet
+
+    shop = _shop_of(context)
+    name, url, n = await export_counter_sheet(shop)
+    await _reply(
+        update, context,
+        f"🧾 Counter sheet — {n} product(s)\n{url}\n(link valid 24h)\n\n"
+        "Print it, record each counter sale by hand, then the shop owner uploads a photo "
+        "of the filled sheet from their bot.",
+    )
+
+
 # --- shopkeeper product stats (SPEC §5; Q-014) ---
 @keeper_command
 async def productstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/productstats` — per-product view/suggestion stats (Q-014). No tracking source exists yet."""
-    await _reply(
-        update, context,
-        "📊 Product stats aren't available yet — the shop doesn't track product views or how often "
-        "the assistant suggests each item. This turns on once that tracking is added (Q-014).",
-    )
+    """`/productstats [today|yesterday|weekly|monthly|YYYY-MM-DD]` — what sold, what didn't."""
+    args = _split(update.message.text, maxsplit=1) if update.message else []
+    await _do_product_stats(update, context, args[0] if args else "")
+
+
+async def _do_product_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    """Shared by /productstats and the stats-period buttons."""
+    from app.orders.service import product_stats
+    from app.reports.service import format_product_stats
+
+    shop = _shop_of(context)
+    start, end, label = parse_period(arg)
+    rows = await product_stats(shop.id, start, end)
+    await _reply(update, context, format_product_stats(shop.name, rows, label))
 
 
 # --- shopkeeper escalation commands (SPEC §3) — Stage 6 ---
@@ -1004,7 +1029,8 @@ KEEPER_COMMANDS: dict[str, Callable] = {
     # SPEC §10 Excel export (Stage 9)
     "exportorders": exportorders_cmd,
     "exportrider": exportrider_cmd,
-    # SPEC §5 product stats (Q-014 — honest "not tracked yet")
+    "countersheet": countersheet_cmd,
+    # SPEC §5 product stats (Q-014)
     "productstats": productstats_cmd,
 }
 
@@ -1357,7 +1383,11 @@ async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elif action == "kriders":
             await riders_cmd(update, context)
         elif action == "kstats":
-            await productstats_cmd(update, context)
+            await q.edit_message_text("📊 Product stats for…", reply_markup=kb.keeper_stats_menu())
+        elif action == "kstat":
+            await _do_product_stats(update, context, args[0])
+        elif action == "ksheet":
+            await countersheet_cmd(update, context)
         elif action == "kids":
             await q.edit_message_text("🆔 Which IDs?", reply_markup=kb.keeper_ids_menu())
         elif action == "kidsp":

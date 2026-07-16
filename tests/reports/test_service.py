@@ -95,3 +95,34 @@ def test_format_id_list_riders_shows_codes_and_link_state():
 def test_format_id_lists_empty_states():
     assert "no products" in format_id_list_products("Shop 01", [])
     assert "no riders" in format_id_list_riders("Shop 01", [])
+
+
+# --- product stats (Q-014) ---
+from app.reports.service import format_product_stats  # noqa: E402
+
+
+def _stat(code, label, sold, revenue, profit, stock):
+    from decimal import Decimal
+
+    return {"code": code, "label": label, "sold_qty": sold,
+            "revenue": Decimal(str(revenue)), "profit": Decimal(str(profit)), "stock": stock}
+
+
+def test_format_product_stats_sold_then_dead_stock():
+    rows = [_stat("PR0001", "Samsung S23", 2, 4000, 900, 4),
+            _stat("PR0002", "Nokia 3310", 0, 0, 0, 7)]
+    out = format_product_stats("Shop 01", rows, "This week")
+
+    assert "PR0001 · Samsung S23 — 2 sold" in out
+    assert "profit" in out and "stock 4" in out
+    assert "💤 No sales (1)" in out and "PR0002 · Nokia 3310 — stock 7" in out
+
+
+def test_format_product_stats_nothing_sold_says_so():
+    out = format_product_stats("Shop 01", [_stat("PR0001", "Nokia 3310", 0, 0, 0, 7)], "Today")
+    assert "nothing sold in this period" in out
+    assert "💤 No sales (1)" in out
+
+
+def test_format_product_stats_empty_catalogue():
+    assert "no products" in format_product_stats("Shop 01", [], "Today")

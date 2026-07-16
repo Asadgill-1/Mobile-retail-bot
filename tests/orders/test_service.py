@@ -584,3 +584,134 @@ async def test_list_price_requests_selects_phone_column():
     rows = await svc.list_price_requests(uuid4(), client=_SelSB())
     assert "phone" in captured["cols"] and "identity" not in captured["cols"]
     assert rows[0]["phone"] == "501234567"  # renderer reads r['phone']
+
+
+# --- product stats (Q-014): what sold, what didn't ---
+from app.orders.service import _fold_product_stats, notify_low_stock  # noqa: E402
+
+
+def _pstat_order(pid, sell, disc, cost, qty):
+    return {"product_id": pid, "quantity": qty, "selling_price": str(sell),
+            "discount_amount": str(disc), "products": {"cost_price": str(cost)}}
+
+
+def test_fold_product_stats_sums_per_product_best_seller_first():
+    products = [
+        {"id": "p1", "product_number": 1, "brand": "Samsung", "model": "S23", "quantity": 4},
+        {"id": "p2", "product_number": 2, "brand": "Apple", "model": "iPhone 15", "quantity": 1},
+    ]
+    orders = [
+        _pstat_order("p1", 2000, 0, 1500, 1),
+        _pstat_order("p1", 2000, 100, 1500, 1),   # same product, second sale
+        _pstat_order("p2", 5000, 0, 4000, 1),
+    ]
+    rows = _fold_product_stats(orders, products)
+    assert [r["code"] for r in rows] == ["PR0002", "PR0001"]  # 5000 revenue beats 4000
+    s23 = next(r for r in rows if r["code"] == "PR0001")
+    assert s23["sold_qty"] == 2 and s23["revenue"] == Decimal("4000")
+    assert s23["profit"] == Decimal("900")  # (2000-1500) + (2000-100-1500)
+    assert s23["stock"] == 4
+
+
+def test_fold_product_stats_lists_unsold_products_with_zeros():
+    # Dead stock is the whole point of the report — it must not vanish just because it never sold.
+    products = [{"id": "p9", "product_number": 9, "brand": "Nokia", "model": "3310", "quantity": 7}]
+    rows = _fold_product_stats([], products)
+    assert len(rows) == 1
+    assert rows[0] == {"code": "PR0009", "label": "Nokia 3310", "sold_qty": 0,
+                       "revenue": Decimal("0"), "profit": Decimal("0"), "stock": 7}
+
+
+def test_fold_product_stats_revenue_matches_profit_summary_definition():
+    # /profit counts revenue as gross selling_price; product stats must agree or the keeper
+    # sees two reports that contradict each other.
+    products = [{"id": "p1", "product_number": 1, "brand": "B", "model": "M", "quantity": 0}]
+    orders = [_pstat_order("p1", 1000, 250, 600, 1)]
+    rows = _fold_product_stats(orders, products)
+    assert rows[0]["revenue"] == Decimal("1000")           # gross, like _aggregate
+    assert rows[0]["profit"] == Decimal("150")             # (1000-250) - 600
+
+
+# --- low-stock alerts (migration 010) ---
+class _LowStockShop:
+    def __init__(self):
+        self.id = uuid4()
+        self.client_id = uuid4()
+        self.name = "Shop 01"
+
+
+def _lowstock_product(quantity, min_qty, number=1):
+    from app.products.models import Product
+
+    return Product(id=uuid4(), shop_id=uuid4(), category="Mobile", brand="Samsung", model="S23",
+                   condition="New", cost_price=Decimal("1000"), selling_price=Decimal("1500"),
+                   quantity=quantity, min_qty=min_qty, product_number=number)
+
+
+@pytest.fixture
+def low_stock_wire(monkeypatch):
+    cap = {"shop_msg": None, "owner_msg": None, "product": None, "client": None}
+
+    async def _get_product(shop_id, product_id, client=None):
+        return cap["product"]
+
+    async def _notify_shop(shop, text, reply_markup=None):
+        cap["shop_msg"] = text
+
+    async def _send_owner(tid, text, reply_markup=None):
+        cap["owner_msg"] = (tid, text)
+        return True
+
+    class _Repo:
+        async def get_client(self, cid):
+            return cap["client"]
+
+    monkeypatch.setattr("app.products.service.get_product", _get_product)
+    monkeypatch.setattr(svc, "_notify_shop", _notify_shop)
+    monkeypatch.setattr("app.telegram_bot.notify.send_to_shopowner", _send_owner)
+    monkeypatch.setattr("app.db.factory.get_tenant_repo", lambda: _Repo())
+    return cap
+
+
+@pytest.mark.asyncio
+async def test_notify_low_stock_alerts_shop_and_owner_at_threshold(low_stock_wire):
+    low_stock_wire["product"] = _lowstock_product(quantity=2, min_qty=2)  # just hit the threshold
+    low_stock_wire["client"] = type("C", (), {"telegram_id": 555})()
+
+    assert await notify_low_stock(_LowStockShop(), uuid4()) is True
+    assert "Low stock" in low_stock_wire["shop_msg"] and "PR0001" in low_stock_wire["shop_msg"]
+    assert "2 left (alert at 2)" in low_stock_wire["shop_msg"]
+    assert low_stock_wire["owner_msg"][0] == 555  # owner sees it too — that's the anti-blindness bit
+
+
+@pytest.mark.asyncio
+async def test_notify_low_stock_silent_when_threshold_is_off(low_stock_wire):
+    low_stock_wire["product"] = _lowstock_product(quantity=0, min_qty=0)  # 0 = alerts off (the default)
+    assert await notify_low_stock(_LowStockShop(), uuid4()) is False
+    assert low_stock_wire["shop_msg"] is None
+
+
+@pytest.mark.asyncio
+async def test_notify_low_stock_silent_above_threshold(low_stock_wire):
+    low_stock_wire["product"] = _lowstock_product(quantity=5, min_qty=2)
+    assert await notify_low_stock(_LowStockShop(), uuid4()) is False
+    assert low_stock_wire["shop_msg"] is None
+
+
+@pytest.mark.asyncio
+async def test_notify_low_stock_never_raises(monkeypatch):
+    # An alert that blows up must not take the sale down with it.
+    async def _boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.products.service.get_product", _boom)
+    assert await notify_low_stock(_LowStockShop(), uuid4()) is False
+
+
+@pytest.mark.asyncio
+async def test_notify_low_stock_skips_owner_without_telegram(low_stock_wire):
+    low_stock_wire["product"] = _lowstock_product(quantity=1, min_qty=3)
+    low_stock_wire["client"] = type("C", (), {"telegram_id": None})()  # owner never linked
+    assert await notify_low_stock(_LowStockShop(), uuid4()) is True
+    assert low_stock_wire["shop_msg"] is not None  # shop still told
+    assert low_stock_wire["owner_msg"] is None

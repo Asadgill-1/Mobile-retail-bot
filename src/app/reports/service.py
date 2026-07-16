@@ -176,6 +176,36 @@ def format_inventory(shop_name: str, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_product_stats(shop_name: str, rows: list[dict], label: str) -> str:
+    """Per-product sales (Q-014). Best sellers first; everything that sold nothing is listed at the
+    end — dead stock is what the keeper actually needs to see."""
+    if not rows:
+        return f"📊 {shop_name}: no products."
+    sold = [r for r in rows if r["sold_qty"] > 0]
+    unsold = [r for r in rows if r["sold_qty"] == 0]
+
+    lines = [f"📊 Product stats — {shop_name} · {label}", ""]
+    if sold:
+        for r in sold:
+            lines.append(
+                f"  {r['code']} · {r['label']} — {r['sold_qty']} sold · "
+                f"{_aed(float(r['revenue']))} · profit {_aed(float(r['profit']))} · stock {r['stock']}"
+            )
+        lines += [
+            "",
+            f"Σ {sum(r['sold_qty'] for r in sold)} unit(s) · "
+            f"{_aed(float(sum(r['revenue'] for r in sold)))} · "
+            f"profit {_aed(float(sum(r['profit'] for r in sold)))}",
+        ]
+    else:
+        lines.append("  nothing sold in this period.")
+
+    if unsold:
+        lines += ["", f"💤 No sales ({len(unsold)}):"]
+        lines += [f"  {r['code']} · {r['label']} — stock {r['stock']}" for r in unsold]
+    return "\n".join(lines)
+
+
 def format_id_list_products(shop_name: str, rows: list[dict]) -> str:
     """The 🆔 ID list — which product holds which code. Columns a human can scan, not UUIDs."""
     from app.utils.codes import product_code
