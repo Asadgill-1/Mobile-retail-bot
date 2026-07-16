@@ -9,6 +9,7 @@ exception. A crash here is a bug; the auth wrappers are supposed to catch and re
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -60,6 +61,17 @@ def _update(text: str, user_id: int) -> Update:
 @pytest.fixture
 def offline(monkeypatch):
     """Stub every external edge so command bodies run without network/DB."""
+    # Bot tokens are settings-driven, and seed_default() reads them to attach per-shop bots. A dev
+    # machine has them in .env; CI does not — so provision fakes here, before seeding, or the bot
+    # factories raise and these tests only ever pass locally.
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", json.dumps(
+        [{"keeper_token": f"{n}:keeperfake", "customer_token": f"{n}:customerfake",
+          "customer_chat_id": str(n)} for n in (1, 2)]))
+    monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "9:riderfake")
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "7:ownerfake")
+
     repo = InMemoryTenantRepo(); repo.seed_default()
     monkeypatch.setattr(factory, "get_tenant_repo", lambda: repo)
     monkeypatch.setattr("app.db.supabase_client.get_supabase", lambda: _FakeSupabase())
