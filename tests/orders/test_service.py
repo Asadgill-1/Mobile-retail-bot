@@ -117,15 +117,21 @@ async def test_create_order_checks_tenant_and_writes_status_history(monkeypatch)
 @pytest.mark.asyncio
 async def test_profit_summary_reads_range_and_aggregates(monkeypatch):
     class _QSB:
-        def table(self, n): return self
+        """Table-aware: profit_summary now also reads counter_sales (walk-in takings)."""
+        def table(self, n):
+            self._t = n
+            return self
         def select(self, *a): return self
         def eq(self, *a): return self
         def gte(self, *a): return self
         def lt(self, *a): return self
         def neq(self, *a): return self
+        def order(self, *a): return self
         def execute(self):
+            rows = [] if self._t == "counter_sales" else [_row(2499, 0, 2000, 1)]
+
             class _R:
-                data = [_row(2499, 0, 2000, 1)]
+                data = rows
             return _R()
 
     start = datetime(2026, 7, 9, tzinfo=timezone.utc)

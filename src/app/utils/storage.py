@@ -23,14 +23,18 @@ def _sb(client: Any | None) -> Any:
     return client if client is not None else get_supabase()
 
 
-async def upload_report(shop_id: UUID, filename: str, data: bytes, client: Any | None = None) -> str:
-    """Upload one report under the shop's prefix, return a 24h signed download URL."""
+async def upload_report(shop_id: UUID, filename: str, data: bytes, client: Any | None = None,
+                        content_type: str = _XLSX) -> str:
+    """Upload one report under the shop's prefix, return a 24h signed download URL.
+
+    `content_type` defaults to xlsx (every existing caller); counter-sale sheet photos pass jpeg.
+    """
     sb = _sb(client)
     path = f"{shop_id}/{filename}"  # tenant-prefixed, like media paths
 
     def _q() -> str:
         bucket = sb.storage.from_(settings.supabase_reports_bucket)
-        bucket.upload(path, data, {"content-type": _XLSX, "upsert": "true"})
+        bucket.upload(path, data, {"content-type": content_type, "upsert": "true"})
         res = bucket.create_signed_url(path, _TTL)
         url = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
         if url and url.startswith("/"):  # some client versions return a path, not an absolute URL

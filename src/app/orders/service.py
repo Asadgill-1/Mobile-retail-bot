@@ -123,7 +123,11 @@ async def create_order(
 async def profit_summary(
     shop_id: UUID, start: datetime, end: datetime, client: Any | None = None
 ) -> ProfitSummary:
-    """Aggregate profit for a shop over [start, end). Cancelled orders excluded (SPEC §6)."""
+    """Aggregate profit for a shop over [start, end). Cancelled orders excluded (SPEC §6).
+
+    Includes counter (walk-in) sales — profit that ignored half the shop's takings would be a
+    lie. Name and signature are unchanged: every caller keeps working.
+    """
     sb = _sb(client)
 
     def _q() -> list[dict]:
@@ -139,7 +143,55 @@ async def profit_summary(
         )
         return r.data or []
 
-    return _aggregate(await asyncio.to_thread(_q))
+    summary = _aggregate(await asyncio.to_thread(_q))
+
+    from app.orders.counter_sales import counter_totals
+
+    return merge_counter(summary, await counter_totals(shop_id, start, end, client))
+
+
+def merge_counter(summary: ProfitSummary, counter_rows: list[dict]) -> ProfitSummary:
+    """Pure: fold counter sales into an online-orders summary.
+
+    A counter row has no discount column — the price written on the sheet IS the price paid, so
+    it lands in revenue whole. Top products merge across both channels: the shop owner wants the
+    best seller, not the best seller *online*.
+    """
+    if not counter_rows:
+        return summary
+
+    revenue = cost = profit = Decimal("0")
+    by_product: dict[str, ProfitLine] = {line.label: line for line in summary.top}
+
+    for row in counter_rows:
+        p = row.get("products") or {}
+        qty = int(row.get("quantity") or 0)
+        sell = Decimal(str(row.get("sold_price") or 0)) * qty  # sold_price is PER UNIT
+        cp = Decimal(str(p.get("cost_price") or 0))
+        pr = line_profit(sell, Decimal("0"), cp, qty)
+
+        revenue += sell
+        cost += cp * qty
+        profit += pr
+
+        label = f"{p.get('brand', '?')} {p.get('model', '?')}".strip()
+        prev = by_product.get(label)
+        by_product[label] = ProfitLine(
+            label, (prev.qty if prev else 0) + qty, (prev.profit if prev else Decimal("0")) + pr
+        )
+
+    top = sorted(by_product.values(), key=lambda line: line.profit, reverse=True)[:5]
+    return ProfitSummary(
+        orders=summary.orders + len(counter_rows),
+        revenue=summary.revenue + revenue,
+        discounts=summary.discounts,
+        cost=summary.cost + cost,
+        profit=summary.profit + profit,
+        clearance_profit=summary.clearance_profit,
+        top=top,
+        counter_revenue=revenue,
+        counter_profit=profit,
+    )
 
 
 async def product_stats(

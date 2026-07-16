@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     ai_temperature: float = 1.0
     ai_max_tokens: int = 1024
     ai_request_timeout: float = 30.0
+    # Reads hand-filled counter-sale sheets from a photo (shop-owner bot 🧾 Today sell). Chat
+    # stays on ai_model — only that one flow overrides it. FLAGGED: the exact id could not be
+    # verified offline; override with AI_VISION_MODEL and confirm with a real photo first.
+    ai_vision_model: str = "moonshot-v1-32k-vision-preview"
     # Per-customer daily cap on AI-answered messages (cost/abuse ceiling; 0 disables). Far above any
     # real customer — rapid-fire (20/60s) catches bursts, this catches a sustained flood under it.
     ai_daily_msg_cap: int = 1000

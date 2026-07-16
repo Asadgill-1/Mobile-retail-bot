@@ -7,6 +7,7 @@ the only thing here; the numbers come from `orders.profit_summary`.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 
 from app.orders.models import ProfitSummary
 
@@ -66,6 +67,11 @@ def format_profit(s: ProfitSummary, label: str) -> str:
     if s.top:
         lines += ["", "Top products:"]
         lines += [f"  {i}. {l.label} — {l.qty} sold, +{_aed(l.profit)}" for i, l in enumerate(s.top, 1)]
+    if s.counter_revenue or s.counter_profit:
+        # Only when there ARE counter sales: a shop that sells online only shouldn't read a
+        # line of zeros about a channel it doesn't use.
+        lines += ["", f"🧾 Counter sales:  {_aed(s.counter_revenue)} "
+                      f"(profit +{_aed(s.counter_profit)}) — included above"]
     if s.clearance_profit:
         lines += ["", f"🧹 Clearance profit: +{_aed(s.clearance_profit)}"]
     return "\n".join(lines)
@@ -296,6 +302,41 @@ def format_id_list_riders(shop_name: str, rows: list[dict]) -> str:
         link = "🟢" if row.get("telegram_id") else "⚪"
         lines.append(f"  {ref} · {row.get('name', '?')} — {row.get('phone', '')} {link}")
     lines += ["", "Use the code with /assigndelivery, /reconcilecod, /exportrider."]
+    return "\n".join(lines)
+
+
+def format_counter_sales(per_shop: list[tuple[str, list[dict]]], label: str) -> str:
+    """🧾 Counter sales — walk-in takings per shop, grouped by day, discrepancies called out."""
+    lines = [f"🧾 Counter sales — {label}"]
+    grand = Decimal("0")
+    flagged = 0
+    for shop_name, rows in per_shop:
+        lines += ["", f"🏪 {shop_name}"]
+        if not rows:
+            lines.append("  no counter sales")
+            continue
+        day = None
+        for r in rows:
+            d = str(r.get("sold_on") or "—")
+            if d != day:
+                day = d
+                lines.append(f"  🗓 {d}")
+            p = r.get("products") or {}
+            item = f"{p.get('brand', '?')} {p.get('model', '')}".strip()
+            qty = int(r.get("quantity") or 0)
+            unit = Decimal(str(r.get("sold_price") or 0))
+            line_total = unit * qty
+            mark = ""
+            if r.get("discrepancy"):
+                flagged += 1
+                mark = "  ⚠️ stock didn't cover this — not counted"
+            else:
+                grand += line_total
+            lines.append(f"    {item} ×{qty} — {_aed(line_total)}{mark}")
+    lines += ["", f"Σ {_aed(grand)} counter revenue"]
+    if flagged:
+        lines.append(f"⚠️ {flagged} row(s) flagged: the sheet recorded a sale "
+                     "the stock couldn't cover.")
     return "\n".join(lines)
 
 

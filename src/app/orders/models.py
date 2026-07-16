@@ -28,6 +28,11 @@ class ProfitSummary:
     profit: Decimal = Decimal("0")
     clearance_profit: Decimal = Decimal("0")
     top: list[ProfitLine] = field(default_factory=list)
+    # Walk-in sales folded in from `counter_sales`. Trailing defaults keep every existing
+    # positional constructor valid. revenue/cost/profit above INCLUDE these; these two fields
+    # only say how much of the total came from the counter.
+    counter_revenue: Decimal = Decimal("0")
+    counter_profit: Decimal = Decimal("0")
 
     @property
     def margin(self) -> float:

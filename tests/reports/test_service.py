@@ -176,3 +176,50 @@ def test_format_activity_bad_timestamp_and_empty():
     assert "no activity" in format_activity("S", [], {})
     out = format_activity("S", [_log("kconf", detail={"args": ["1"]}, at="junk")], {})
     assert "confirmed order #1" in out  # no crash
+
+
+# --- counter sales report (🧾) ---
+from app.reports.service import format_counter_sales  # noqa: E402
+
+
+def _csale(qty, unit, sold_on="2026-07-12", brand="Samsung", model="S23", flagged=False):
+    return {"quantity": qty, "sold_price": str(unit), "sold_on": sold_on,
+            "discrepancy": flagged, "products": {"brand": brand, "model": model}}
+
+
+def test_format_counter_sales_groups_by_day_and_totals():
+    per_shop = [("Shop 01", [_csale(2, 3400), _csale(1, 5000, sold_on="2026-07-13")])]
+    out = format_counter_sales(per_shop, "This week")
+    assert "🗓 2026-07-12" in out and "🗓 2026-07-13" in out
+    assert "Samsung S23 ×2" in out
+    assert "11,800 AED counter revenue" in out  # 6800 + 5000
+
+
+def test_format_counter_sales_flags_discrepancies_and_excludes_them_from_the_total():
+    per_shop = [("Shop 01", [_csale(1, 100), _csale(9, 100, flagged=True)])]
+    out = format_counter_sales(per_shop, "Today")
+    assert "stock didn't cover this — not counted" in out
+    assert "100 AED counter revenue" in out       # the flagged 900 is NOT in the money
+    assert "1 row(s) flagged" in out
+
+
+def test_format_counter_sales_empty_shop():
+    out = format_counter_sales([("Shop 01", [])], "Today")
+    assert "no counter sales" in out and "0 AED counter revenue" in out
+
+
+def test_format_profit_shows_counter_line_only_when_there_are_counter_sales():
+    from decimal import Decimal
+
+    from app.orders.models import ProfitSummary
+    from app.reports.service import format_profit
+
+    online_only = ProfitSummary(orders=1, revenue=Decimal("100"), cost=Decimal("60"),
+                                profit=Decimal("40"))
+    assert "Counter sales" not in format_profit(online_only, "Today")
+
+    both = ProfitSummary(orders=2, revenue=Decimal("200"), cost=Decimal("120"),
+                         profit=Decimal("80"), counter_revenue=Decimal("100"),
+                         counter_profit=Decimal("40"))
+    out = format_profit(both, "Today")
+    assert "Counter sales" in out and "included above" in out

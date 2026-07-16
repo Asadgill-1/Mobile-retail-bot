@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LLMMessage:
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: str
+    # str for ordinary chat; a list of OpenAI content-parts for vision
+    # ([{"type": "text", ...}, {"type": "image_url", ...}]). `_to_wire` passes either through
+    # untouched, so the wire format is already correct for both.
+    content: str | list[dict[str, Any]]
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -108,10 +111,15 @@ class LLMClient:
         messages: list[LLMMessage],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> LLMResponse:
-        """Chat completion with optional tool-calling. Retries once on error (SPEC §11)."""
+        """Chat completion with optional tool-calling. Retries once on error (SPEC §11).
+
+        `model` overrides the configured chat model for this call — the vision model reads
+        counter-sale sheets; everything else stays on the chat model.
+        """
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": [_to_wire(m) for m in messages],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,

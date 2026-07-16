@@ -248,7 +248,16 @@ def shopowner_menu() -> M:
     return M([
         [B("🏪 My shops", callback_data=cb("sshops")),
          B("📊 Analytics", callback_data=cb("sanmenu"))],
-        [B("💬 Messages", callback_data=cb("smsgs"))],
+        [B("💬 Messages", callback_data=cb("smsgs")),
+         B("🧾 Today sell", callback_data=cb("ssellmenu"))],
+    ])
+
+
+def shopowner_confirm_sales() -> M:
+    """The man-in-the-middle gate: nothing is written until the owner taps Save."""
+    return M([
+        [B("✅ Save all", callback_data=cb("ssave")),
+         B("❌ Discard", callback_data=cb("sdisc"))],
     ])
 
 
@@ -303,6 +312,7 @@ def shopowner_analytics_menu() -> M:
          B("🏆 Top products", callback_data=cb("stopmenu"))],
         [B("🕵️ Cancels & discounts", callback_data=cb("scanmenu")),
          B("💵 COD outstanding", callback_data=cb("scodall"))],
+        [B("🧾 Counter sales", callback_data=cb("scntmenu"))],
         [B("⬅️ Menu", callback_data=cb("smenu"))],
     ])
 

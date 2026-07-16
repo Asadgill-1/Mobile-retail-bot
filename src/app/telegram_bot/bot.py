@@ -15,7 +15,8 @@ import functools
 import logging
 import signal
 import uuid
-from decimal import Decimal
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
@@ -2127,8 +2128,6 @@ async def rider_myreport(update: Update, context: ContextTypes.DEFAULT_TYPE, row
 def _format_rider_report(orders: list[dict], label: str, cash: Decimal) -> str:
     """Deliveries grouped by Dubai date, each with the detail a rider needs to recall the drop:
     order number, item, qty, ADDRESS, cash, time. Pure — the report's whole layout, testable."""
-    from datetime import datetime
-
     from app.reports.service import DUBAI
 
     lines = [f"📊 Delivery report — {label}", "",
@@ -2386,8 +2385,6 @@ def _format_owner_orders(shop: Shop, rows: list[dict], filt: str) -> str:
 
 def _format_orders_by_date(shop: Shop, rows: list[dict], label: str) -> str:
     """Date-range orders grouped under a header per Dubai day."""
-    from datetime import datetime
-
     from app.reports.service import DUBAI
 
     if not rows:
@@ -2427,6 +2424,18 @@ async def _shopowner_orders_range(update: Update, context: ContextTypes.DEFAULT_
     await _reply(update, context, _format_orders_by_date(shop, rows, label))
 
 
+async def _shopowner_counter_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    service, client, period: str) -> None:
+    """🧾 Counter sales across every owned shop for a period."""
+    from app.orders.counter_sales import sales_report
+    from app.reports.service import format_counter_sales
+
+    start, end, label = parse_period(period)
+    shops = await service.list_shops_by_client(client.id)
+    per_shop = [(s.name, await sales_report(s.id, start, end)) for s in shops]
+    await _reply(update, context, format_counter_sales(per_shop, label))
+
+
 async def _shopowner_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, shop: Shop) -> None:
     """📋 Logs — every action taken in this shop, so nothing happens unseen."""
     from app.audit.service import recent
@@ -2437,6 +2446,141 @@ async def _shopowner_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, sh
     keepers = await get_tenant_repo().list_shopkeepers(shop.id)
     actors = {str(sk.telegram_id): (sk.name or str(sk.telegram_id)) for sk in keepers}
     await _reply(update, context, format_activity(shop.name, rows, actors))
+
+
+def _format_sale_preview(shop: Shop, rows: list[dict]) -> str:
+    """What the owner checks before anything is written — the man-in-the-middle moment."""
+    lines = [f"🧾 {shop.name} — read from the sheet:", ""]
+    total = Decimal("0")
+    for r in rows:
+        price = r.get("price")
+        shown = f"{price} AED" if price is not None else "list price"
+        if price is not None:
+            total += Decimal(str(price)) * int(r["qty"])
+        label = r.get("label") or r["code"]
+        lines.append(f"  {r['code']} · {label} ×{r['qty']} — {shown}")
+    lines += ["", f"Σ {total} AED (rows priced on the sheet)", ""]
+    lines.append("Wrong? Reply with corrected lines, one per line:  PR0001 2 3400")
+    return "\n".join(lines)
+
+
+async def _label_rows(shop: Shop, rows: list[dict]) -> list[dict]:
+    """Attach product names so the owner checks against names, not bare codes."""
+    for r in rows:
+        try:
+            product = await get_product_by_ref(shop.id, r["code"])
+            r["label"] = f"{product.brand} {product.model}".strip()
+        except ProductNotFound:
+            r["label"] = "❓ unknown code"
+    return rows
+
+
+async def _shopowner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🧾 Today sell — the owner sends a photo of the hand-filled counter sheet."""
+    from app.orders.counter_sales import extract_rows
+    from app.utils.storage import upload_report
+
+    pending = context.chat_data.get("pending")
+    if not pending or pending.get("do") != "ssell":
+        return  # a stray photo isn't a sheet
+    user = update.effective_user
+    service = _service(context)
+    client = await service.client_by_telegram(user.id) if user else None
+    if client is None:
+        return
+    try:
+        shop = await _own_shop(service, client, pending["args"][0])  # re-guard before any read
+        await _reply(update, context, "🔍 Reading the sheet…")
+
+        f = await update.message.photo[-1].get_file()  # largest rendition
+        data = bytes(await f.download_as_bytearray())
+        # Keep the photo: it's the evidence behind every row written below.
+        path = f"counter_{shop.id}_{datetime.now(tz=None):%Y%m%d_%H%M%S}.jpg"
+        try:
+            await upload_report(shop.id, path, data, content_type="image/jpeg")
+        except Exception:
+            logger.exception("counter sheet photo upload failed shop=%s", shop.id)
+            path = None  # proof lost, but the sale still gets recorded
+
+        rows = await extract_rows(data)
+        if not rows:
+            await _reply(update, context, "Nothing readable on that sheet. Try a clearer photo.")
+            return
+        rows = await _label_rows(shop, rows)
+        # Stash in memory, not callback data: the rows are far past 64 bytes.
+        # ponytail: a restart loses the stash — the owner resends the photo. Redis if that bites.
+        context.chat_data["sale_draft"] = {"shop": pending["args"][0], "rows": rows, "photo": path}
+        context.chat_data["pending"] = {"do": "ssellfix", "args": pending["args"]}
+        await context.bot.send_message(update.effective_chat.id, _format_sale_preview(shop, rows),
+                                       reply_markup=kb.shopowner_confirm_sales())
+    except ShopNotFound:
+        await _reply(update, context, "❌ Not found.")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+    except Exception:
+        logger.exception("counter sheet read failed")
+        await _reply(update, context, "❌ Could not read the sheet. Nothing was recorded.")
+
+
+def parse_correction(text: str) -> list[dict]:
+    """'PR0001 2 3400' per line → rows. The human's final word over the model's reading.
+
+    Pure. Raises ValueError naming the bad line — the owner must know which one to retype.
+    """
+    rows: list[dict] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            raise ValueError(f"'{line}' — need at least:  <code> <qty>  (e.g. PR0001 2 3400)")
+        code, qty_raw = parts[0], parts[1]
+        if not qty_raw.isdigit() or int(qty_raw) <= 0:
+            raise ValueError(f"'{line}' — quantity must be a positive whole number.")
+        price = None
+        if len(parts) > 2:
+            try:
+                price = Decimal(parts[2].replace(",", ""))
+            except InvalidOperation:
+                raise ValueError(f"'{line}' — '{parts[2]}' is not a price.") from None
+            if price < 0:
+                raise ValueError(f"'{line}' — price can't be negative.")
+        rows.append({"code": code, "qty": int(qty_raw), "price": price})
+    if not rows:
+        raise ValueError("Nothing to correct — send one line per sale:  PR0001 2 3400")
+    return rows
+
+
+async def _shopowner_save_sales(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                service, client) -> None:
+    """✅ Save all — the only place counter sales are written."""
+    from app.orders.counter_sales import record_sales
+
+    draft = context.chat_data.get("sale_draft")
+    if not draft:
+        await _reply(update, context, "Nothing to save — send the sheet photo again.")
+        return
+    shop = await _own_shop(service, client, draft["shop"])  # re-guard at the write
+    user = update.effective_user
+    res = await record_sales(shop, draft["rows"], photo_path=draft.get("photo"),
+                             recorded_by=user.id if user else 0)
+    context.chat_data.pop("sale_draft", None)
+    context.chat_data.pop("pending", None)
+
+    lines = [f"✅ {shop.name} — recorded {len(res['saved'])} sale(s), {res['total']} AED"]
+    for r in res["saved"]:
+        lines.append(f"  {r['code']} · {r['label']} ×{r['qty']} — {r['price']} AED")
+    if res["discrepancies"]:
+        lines += ["", "⚠️ Recorded but stock didn't cover them (kept for you to investigate):"]
+        lines += [f"  {r['code']} · {r['label']} ×{r['qty']} — only {r['stock']} in stock"
+                  for r in res["discrepancies"]]
+    if res["unknown"]:
+        lines += ["", f"❓ Unknown codes, skipped: {', '.join(res['unknown'])}"]
+    await _reply(update, context, "\n".join(lines))
+    await _audit(update, context, "counter_sale", shop_id=shop.id,
+                 detail={"saved": len(res["saved"]), "flagged": len(res["discrepancies"]),
+                         "total": str(res["total"])})
 
 
 async def _shopowner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2460,6 +2604,17 @@ async def _shopowner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             shop = await _own_shop(service, client, pending["args"][0])
             text = (update.message.text or "").strip()
             await _shopowner_orders_range(update, context, shop, text)
+        elif pending["do"] == "ssellfix":
+            # The owner is overruling the model's reading — their lines replace it wholesale.
+            shop = await _own_shop(service, client, pending["args"][0])
+            rows = await _label_rows(shop, parse_correction(update.message.text or ""))
+            draft = context.chat_data.get("sale_draft") or {}
+            draft.update({"shop": pending["args"][0], "rows": rows})
+            context.chat_data["sale_draft"] = draft
+            context.chat_data["pending"] = pending  # stay armed for another correction
+            await context.bot.send_message(update.effective_chat.id,
+                                           _format_sale_preview(shop, rows),
+                                           reply_markup=kb.shopowner_confirm_sales())
     except ShopNotFound:
         await _reply(update, context, "❌ Not found.")
     except ValueError as e:
@@ -2523,6 +2678,33 @@ async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         elif action == "slog":
             shop = await _own_shop(service, client, args[0])
             await _shopowner_logs(update, context, shop)
+        elif action == "ssellmenu":
+            shops = await service.list_shops_by_client(client.id)
+            if not shops:
+                await _reply(update, context, "No shops yet.")
+            else:
+                picker = [{"id": str(s.id), "name": s.name} for s in shops]
+                await q.edit_message_text("🧾 Counter sales for which shop?",
+                                          reply_markup=kb.shopowner_shop_picker(picker, "ssell"))
+        elif action == "ssell":
+            shop = await _own_shop(service, client, args[0])
+            context.chat_data["pending"] = {"do": "ssell", "args": args}
+            await _reply(update, context,
+                         f"🧾 {shop.name} — send a photo of today's filled counter sheet.\n"
+                         "You'll see what I read and confirm before anything is recorded.")
+        elif action == "ssave":
+            await _shopowner_save_sales(update, context, service, client)
+        elif action == "sdisc":
+            context.chat_data.pop("sale_draft", None)
+            context.chat_data.pop("pending", None)
+            await _reply(update, context, "❌ Discarded. Nothing was recorded.")
+        elif action == "scntmenu":
+            await q.edit_message_text(
+                "🧾 Counter sales for…",
+                reply_markup=kb.shopowner_period_menu("scnt", kb.cb("sanmenu")),
+            )
+        elif action == "scnt":
+            await _shopowner_counter_report(update, context, service, client, args[0])
         elif action == "sinv":
             shop = await _own_shop(service, client, args[0])
             await _reply(update, context, format_inventory(shop.name, await list_inventory(shop.id)))
@@ -2606,6 +2788,7 @@ def build_shopowner_application(service: TenantService) -> Application:
     app.add_handler(CommandHandler("menu", shopowner_menu_cmd))
     app.add_handler(CallbackQueryHandler(_shopowner_cb))
     app.add_handler(MessageHandler(filters.CONTACT, _shopowner_contact))
+    app.add_handler(MessageHandler(filters.PHOTO, _shopowner_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _shopowner_text))
     return app
 

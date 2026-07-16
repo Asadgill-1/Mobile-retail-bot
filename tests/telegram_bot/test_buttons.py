@@ -564,3 +564,38 @@ def test_fields_splits_on_semicolons_and_pads():
     assert bot._fields("a; b; c", 4) == ["a", "b", "c", ""]
     assert bot._fields("Gulf Mobiles", 2) == ["Gulf Mobiles", ""]  # names may contain spaces
     assert bot._fields("a;b;c;d;e", 3) == ["a", "b", "c"]
+
+
+# --- counter-sale correction parsing (the human's final word over the model) ---
+def test_parse_correction_reads_code_qty_price_lines():
+    from decimal import Decimal
+
+    rows = bot.parse_correction("PR0001 2 3400\nPR0002 1 5,000")
+    assert rows == [
+        {"code": "PR0001", "qty": 2, "price": Decimal("3400")},
+        {"code": "PR0002", "qty": 1, "price": Decimal("5000")},
+    ]
+
+
+def test_parse_correction_price_is_optional():
+    rows = bot.parse_correction("PR0001 2")
+    assert rows == [{"code": "PR0001", "qty": 2, "price": None}]
+
+
+def test_parse_correction_skips_blank_lines():
+    assert len(bot.parse_correction("PR0001 1\n\n  \nPR0002 2")) == 2
+
+
+@pytest.mark.parametrize("bad,why", [
+    ("PR0001", "need at least"),
+    ("PR0001 x", "positive whole number"),
+    ("PR0001 0", "positive whole number"),
+    ("PR0001 -2", "positive whole number"),
+    ("PR0001 1 abc", "is not a price"),
+    ("PR0001 1 -5", "can't be negative"),
+    ("", "one line per sale"),
+])
+def test_parse_correction_names_the_bad_line(bad, why):
+    with pytest.raises(ValueError) as e:
+        bot.parse_correction(bad)
+    assert why in str(e.value)  # the owner must know WHICH line to retype

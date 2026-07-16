@@ -8,6 +8,7 @@ prove refusal happens BEFORE any data access, not after.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -227,3 +228,113 @@ async def test_shopowner_text_without_pending_is_silent(world):
     )
     await bot._shopowner_text(upd, ctx)
     assert ctx.bot.sent == []  # all-button bot stays quiet on stray text
+
+
+# --- Phase 6: counter sales. The photo flow writes stock, so isolation matters most here. ---
+def _photo_update(user_id):
+    class _F:
+        async def download_as_bytearray(self):
+            return bytearray(b"jpegbytes")
+
+    class _P:
+        async def get_file(self):
+            return _F()
+
+    return SimpleNamespace(
+        callback_query=None, effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=1),
+        message=SimpleNamespace(text=None, photo=[_P()]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_foreign_counter_sale_photo_refused_before_reading(world, monkeypatch):
+    async def _extract(*a, **k):
+        raise AssertionError("a foreign shop's sheet must never reach the vision model")
+
+    monkeypatch.setattr("app.orders.counter_sales.extract_rows", _extract)
+    ctx = _ctx(world.svc)
+    ctx.chat_data["pending"] = {"do": "ssell", "args": [str(world.shop_a.id)]}  # forged
+    await bot._shopowner_photo(_photo_update(OWNER_B), ctx)
+    assert "not found" in ctx.bot.sent[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_foreign_save_refused_before_writing_stock(world, monkeypatch):
+    async def _record(*a, **k):
+        raise AssertionError("cross-tenant stock write must never run")
+
+    monkeypatch.setattr("app.orders.counter_sales.record_sales", _record)
+    ctx = _ctx(world.svc)
+    ctx.chat_data["sale_draft"] = {"shop": str(world.shop_a.id), "rows": [], "photo": None}
+    await bot._shopowner_cb(_cb("ssave", OWNER_B), ctx)
+    assert "not found" in ctx.bot.sent[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_photo_never_writes_without_confirmation(world, monkeypatch):
+    """The man-in-the-middle rule: reading a sheet must not record anything by itself."""
+    async def _extract(data):
+        return [{"code": "PR0001", "qty": 2, "price": None}]
+
+    async def _record(*a, **k):
+        raise AssertionError("record_sales must only run after the owner taps Save")
+
+    async def _label(shop, rows):
+        for r in rows:
+            r["label"] = "Samsung S23"
+        return rows
+
+    async def _upload(*a, **k):
+        return "proof.jpg"
+
+    monkeypatch.setattr("app.orders.counter_sales.extract_rows", _extract)
+    monkeypatch.setattr("app.orders.counter_sales.record_sales", _record)
+    monkeypatch.setattr(bot, "_label_rows", _label)
+    monkeypatch.setattr("app.utils.storage.upload_report", _upload)
+
+    ctx = _ctx(world.svc)
+    ctx.chat_data["pending"] = {"do": "ssell", "args": [str(world.shop_a.id)]}
+    await bot._shopowner_photo(_photo_update(OWNER_A), ctx)
+
+    assert "PR0001" in ctx.bot.sent[-1] and "Samsung S23" in ctx.bot.sent[-1]
+    assert ctx.chat_data["sale_draft"]["rows"][0]["qty"] == 2  # staged, not written
+    assert ctx.chat_data["pending"]["do"] == "ssellfix"        # armed for corrections
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_the_draft(world):
+    ctx = _ctx(world.svc)
+    ctx.chat_data["sale_draft"] = {"shop": str(world.shop_a.id), "rows": [{"code": "PR1"}]}
+    ctx.chat_data["pending"] = {"do": "ssellfix", "args": [str(world.shop_a.id)]}
+    await bot._shopowner_cb(_cb("sdisc", OWNER_A), ctx)
+    assert "sale_draft" not in ctx.chat_data and "pending" not in ctx.chat_data
+    assert "Discarded" in ctx.bot.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_owner_correction_replaces_the_models_reading(world, monkeypatch):
+    async def _label(shop, rows):
+        for r in rows:
+            r["label"] = "Samsung S23"
+        return rows
+
+    monkeypatch.setattr(bot, "_label_rows", _label)
+    ctx = _ctx(world.svc)
+    ctx.chat_data["sale_draft"] = {
+        "shop": str(world.shop_a.id),
+        "rows": [{"code": "PR0009", "qty": 99, "price": None}],
+        "photo": None,
+    }
+    ctx.chat_data["pending"] = {"do": "ssellfix", "args": [str(world.shop_a.id)]}
+    upd = SimpleNamespace(
+        callback_query=None, effective_user=SimpleNamespace(id=OWNER_A),
+        effective_chat=SimpleNamespace(id=1),
+        message=SimpleNamespace(text="PR0001 2 3400"),
+    )
+    await bot._shopowner_text(upd, ctx)
+
+    rows = ctx.chat_data["sale_draft"]["rows"]
+    assert len(rows) == 1  # the human's lines REPLACE the model's, they don't merge
+    assert rows[0] == {"code": "PR0001", "qty": 2, "price": Decimal("3400"), "label": "Samsung S23"}
+    assert ctx.chat_data["pending"]["do"] == "ssellfix"  # still correctable
