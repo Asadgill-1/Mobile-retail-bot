@@ -118,6 +118,7 @@ async def test_rider_accept_button_calls_set_custody(monkeypatch):
 
     async def _set_custody(ids, name, num, accept):
         calls["set"] = (ids, name, num, accept)
+        return {"id": "o1", "shop_id": "s1", "order_number": num}  # real one returns the order
 
     monkeypatch.setattr("app.riders.service.riders_by_telegram", _by_tg)
     monkeypatch.setattr("app.riders.service.set_custody", _set_custody)
@@ -146,6 +147,7 @@ async def test_rider_cancel_remarks_reply_calls_cancel(monkeypatch):
 
     async def _cancel(ids, name, num, remarks):
         calls["cancel"] = (ids, name, num, remarks)
+        return {"id": "o1", "shop_id": "s1", "order_number": num}  # real one returns the order
 
     monkeypatch.setattr("app.riders.service.riders_by_telegram", _by_tg)
     monkeypatch.setattr("app.riders.service.cancel_delivery", _cancel)

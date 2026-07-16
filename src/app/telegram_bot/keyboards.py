@@ -266,6 +266,7 @@ def shopowner_shop_actions(shop_id: str) -> M:
          B("🛵 Riders & COD", callback_data=cb("scod", shop_id))],
         [B("📤 Export Excel", callback_data=cb("sexpmenu", shop_id)),
          B("💬 Messages", callback_data=cb("smsg", shop_id))],
+        [B("📋 Logs", callback_data=cb("slog", shop_id))],
         [B("⬅️ Shops", callback_data=cb("sshops"))],
     ])
 
@@ -284,6 +285,7 @@ def shopowner_period_menu(action: str, back: str) -> M:
 def shopowner_orders_menu(shop_id: str) -> M:
     filts = [("Today", "today"), ("Yesterday", "yesterday"), ("Pending", "pending"), ("All", "all")]
     rows = [[B(label, callback_data=cb("sord", shop_id, val))] for label, val in filts]
+    rows.append([B("🗓 Date range", callback_data=cb("sordr", shop_id))])
     return M(rows + [[B("⬅️ Back", callback_data=cb("sshop", shop_id))]])
 
 

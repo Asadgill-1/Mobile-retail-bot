@@ -126,3 +126,53 @@ def test_format_product_stats_nothing_sold_says_so():
 
 def test_format_product_stats_empty_catalogue():
     assert "no products" in format_product_stats("Shop 01", [], "Today")
+
+
+# --- activity logs (📋): the shop owner must be able to read what staff did ---
+from app.reports.service import format_activity  # noqa: E402
+
+
+def _log(action, actor="555", detail=None, at="2026-07-12T10:22:00+00:00"):
+    return {"action": action, "actor": actor, "detail": detail or {}, "created_at": at}
+
+
+def test_format_activity_humanizes_actions_and_names_actors():
+    rows = [
+        _log("kconf", detail={"args": ["7"]}),
+        _log("kneg", detail={"args": ["off"]}),
+        _log("racc", actor="999", detail={"args": ["7"]}),
+    ]
+    out = format_activity("Shop 01", rows, {"555": "Ali", "999": "Sami"})
+
+    assert "Ali — confirmed order #7" in out
+    assert "Ali — turned negotiation off" in out
+    assert "Sami — confirmed pickup of order #7" in out
+    assert "14:22" in out  # Dubai time (UTC+4), not raw UTC
+
+
+def test_format_activity_slash_and_button_read_the_same():
+    button = format_activity("S", [_log("kconf", detail={"args": ["7"]})], {})
+    command = format_activity("S", [_log("confirmorder_cmd", detail={"args": ["7"]})], {})
+    assert "confirmed order #7" in button and "confirmed order #7" in command
+
+
+def test_format_activity_unknown_action_still_shows():
+    # An unmapped action must never vanish from the log — that's the one worth seeing.
+    out = format_activity("S", [_log("mystery_cmd", detail={"text": "/mystery 1"})], {})
+    assert "mystery_cmd" in out and "/mystery 1" in out
+
+
+def test_format_activity_mapped_action_missing_args_does_not_crash():
+    out = format_activity("S", [_log("kconf", detail={})], {})
+    assert "confirmed order" in out
+
+
+def test_format_activity_unknown_actor_shows_raw_id():
+    out = format_activity("S", [_log("kconf", actor="777", detail={"args": ["1"]})], {})
+    assert "777 — confirmed order #1" in out
+
+
+def test_format_activity_bad_timestamp_and_empty():
+    assert "no activity" in format_activity("S", [], {})
+    out = format_activity("S", [_log("kconf", detail={"args": ["1"]}, at="junk")], {})
+    assert "confirmed order #1" in out  # no crash

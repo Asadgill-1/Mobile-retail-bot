@@ -16,7 +16,7 @@ import logging
 import signal
 import uuid
 from decimal import Decimal
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from telegram import Update
 from telegram.ext import (
@@ -89,7 +89,7 @@ from app.products.service import (
     toggle_featured,
 )
 from app.tenants.auth import is_owner
-from app.utils.codes import product_code, rider_code
+from app.utils.codes import rider_code
 from app.tenants.models import Client, Shop, ShopStatus
 from app.tenants.service import ClientNotFound, ShopNotFound, TenantService
 
@@ -734,16 +734,24 @@ def keeper_command(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaita
     return wrapper
 
 
-async def _audit(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
-    """Append an audit row for a completed privileged command (§16). Best-effort — never raises."""
+async def _audit(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str,
+                 detail: dict | None = None, shop_id: Any | None = None) -> None:
+    """Append an audit row for a completed privileged action (§16). Best-effort — never raises.
+
+    `detail` overrides the default message-text capture (button presses carry no text, so they
+    pass their callback args instead). `shop_id` is for bots with no shop in bot_data — the rider
+    bot is global, so its actions carry the shop of the order they touched.
+    """
     from app.audit.service import record
 
     user = update.effective_user
     shop = context.application.bot_data.get("shop")  # present on keeper bots, absent on owner control bot
-    text = (update.message.text or "")[:300] if update.message else ""
+    if detail is None:
+        text = (update.message.text or "")[:300] if update.message else ""
+        detail = {"text": text}
     await record(
         str(user.id) if user else "unknown", action,
-        shop_id=shop.id if shop else None, detail={"text": text},
+        shop_id=shop_id or (shop.id if shop else None), detail=detail,
     )
 
 
@@ -1578,6 +1586,13 @@ _KPROD_PROMPT = {
     "kcleartags": "Reply with:  <PR0001>", "kfeature": "Reply with:  <PR0001>",
 }
 
+# Button actions that CHANGE something. Only the slash commands were audited, so a keeper who
+# used buttons left no trail at all — which is exactly what the shop owner's 📋 Logs must show.
+# Read-only presses (menus, lists, reports) stay out: they'd bury the real actions in noise.
+_AUDITED_CB = frozenset({
+    "kconf", "krej", "kdup", "kappr", "kcust", "kdeny", "kasgr", "krec", "kneg", "ksheet",
+})
+
 
 async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline-button dispatcher for the keeper bot. Auth already enforced by the group -10 gate.
@@ -1681,6 +1696,8 @@ async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await _reply(update, context, _KPROD_PROMPT[action])
         else:
             await _reply(update, context, "Unknown action. /menu")
+        if action in _AUDITED_CB:  # only after it actually worked (same rule as keeper_command)
+            await _audit(update, context, action, detail={"args": args})
     except Exception as e:
         await _keeper_err(update, context, e)
 
@@ -1713,6 +1730,7 @@ async def _keeper_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _reply(update, context, trail["text"] + tail)
         elif do in _KPROD_PROMPT:
             await _keeper_product_edit(update, context, shop, do, text)
+        await _audit(update, context, do, detail={"args": args, "text": text[:300]})
     except Exception as e:
         await _keeper_err(update, context, e)
 
@@ -1905,7 +1923,11 @@ def rider_command(handler: Callable) -> Callable:
             logger.exception("rider command failed")
             await _reply(update, context, "❌ Internal error.")
         else:
-            await _audit(update, context, handler.__name__)  # §16: rider actions are logged too
+            # §16: rider actions are logged too. The rider bot is global (no shop in bot_data), so
+            # a handler that touched an order leaves its shop here — otherwise the row lands with
+            # shop_id=NULL and never shows in that shop owner's 📋 Logs.
+            await _audit(update, context, handler.__name__,
+                         shop_id=context.chat_data.pop("audit_shop", None))
 
     return wrapper
 
@@ -1957,7 +1979,8 @@ async def rider_accept(update: Update, context: ContextTypes.DEFAULT_TYPE, rows:
         await _reply(update, context, "Usage: /accept <order_number>")
         return
     num = _order_number(parts[0])
-    await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=True)
+    order = await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=True)
+    context.chat_data["audit_shop"] = order.get("shop_id")
     await _reply(update, context,
                  f"✅ Pickup confirmed for order #{num}. Shop notified.\nWhen done: /deliver {num}")
 
@@ -1972,7 +1995,8 @@ async def rider_notreceived(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await _reply(update, context, "Usage: /notreceived <order_number>")
         return
     num = _order_number(parts[0])
-    await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=False)
+    order = await set_custody([r["id"] for r in rows], rows[0]["name"], num, accept=False)
+    context.chat_data["audit_shop"] = order.get("shop_id")
     await _reply(update, context, f"🚨 Recorded: order #{num} not received. The shop has been alerted.")
 
 
@@ -2032,10 +2056,15 @@ async def _rider_cash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         from app.riders.service import cancel_delivery
         try:
-            await cancel_delivery([r["id"] for r in rows], rows[0]["name"], remarks_for, text)
+            order = await cancel_delivery(
+                [r["id"] for r in rows], rows[0]["name"], remarks_for, text
+            )
         except Exception as e:
             await _reply(update, context, f"⚠️ {e}")
             return
+        # This handler isn't wrapped by rider_command, so it audits itself (§16).
+        await _audit(update, context, "rider_cancel", shop_id=order.get("shop_id"),
+                     detail={"order": remarks_for, "remarks": text[:300]})
         await _reply(update, context,
                      f"❌ Delivery #{remarks_for} cancelled. Shop and customer notified; stock restored.")
         return
@@ -2062,6 +2091,8 @@ async def _rider_cash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, context, "❌ That delivery is no longer yours.")
         return
     context.chat_data.pop("await_cash", None)
+    await _audit(update, context, "rider_deliver", shop_id=order.get("shop_id"),
+                 detail={"order": pending["order"], "cash": str(cash)})
     cod = order.get("cod_amount")
     diff = ""
     if cod is not None and Decimal(str(cod)) != cash:
@@ -2183,12 +2214,16 @@ async def _rider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _do_rider_report(update, context, rows, args)
         elif action == "racc":
             num = int(args[0])
-            await set_custody(rider_ids, rows[0]["name"], num, accept=True)
+            order = await set_custody(rider_ids, rows[0]["name"], num, accept=True)
+            await _audit(update, context, "racc", shop_id=order.get("shop_id"),
+                         detail={"args": args})
             await _reply(update, context,
                          f"✅ Pickup confirmed for #{num}. Shop notified. When done, tap 🚚 Deliver.")
         elif action == "rnrx":
             num = int(args[0])
-            await set_custody(rider_ids, rows[0]["name"], num, accept=False)
+            order = await set_custody(rider_ids, rows[0]["name"], num, accept=False)
+            await _audit(update, context, "rnrx", shop_id=order.get("shop_id"),
+                         detail={"args": args})
             await _reply(update, context, f"🚨 Recorded: #{num} not received. The shop has been alerted.")
         elif action == "rdel":
             await _do_rider_deliver(update, context, rows, int(args[0]))
@@ -2349,6 +2384,91 @@ def _format_owner_orders(shop: Shop, rows: list[dict], filt: str) -> str:
     return "\n".join(lines)
 
 
+def _format_orders_by_date(shop: Shop, rows: list[dict], label: str) -> str:
+    """Date-range orders grouped under a header per Dubai day."""
+    from datetime import datetime
+
+    from app.reports.service import DUBAI
+
+    if not rows:
+        return f"📦 {shop.name} — {label}: no orders."
+    lines = [f"📦 Orders — {shop.name} · {label}", ""]
+    day = None
+    for o in rows:
+        stamp = o.get("created_at") or ""
+        try:
+            local = datetime.fromisoformat(stamp).astimezone(DUBAI)
+        except ValueError:
+            local = None
+        d = f"{local:%b %d}" if local else "—"
+        if d != day:
+            day = d
+            lines += ["", f"🗓 {d}"]
+        p = o.get("products") or {}
+        item = f"{p.get('brand', '')} {p.get('model', '')}".strip() or "item"
+        net = float(o.get("selling_price") or 0) - float(o.get("discount_amount") or 0)
+        line = (f"  #{o.get('order_number')} · {item} ×{o.get('quantity', 1)}"
+                f" · {net:,.0f} AED · {o.get('status', '?')}")
+        if o.get("status") == "cancelled" and o.get("cancel_remarks"):
+            line += f"\n     ❌ {o['cancel_remarks']}"
+        lines.append(line)
+    lines += ["", f"Σ {len(rows)} order(s)"]
+    return "\n".join(lines)
+
+
+async def _shopowner_orders_range(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  shop: Shop, text: str) -> None:
+    """🗓 Date range — reuses the rider report's 2-date parser."""
+    from app.orders.service import orders_in_range
+    from app.riders.service import report_window
+
+    start, end, label = report_window(text.split())
+    rows = await orders_in_range(shop.id, start, end)
+    await _reply(update, context, _format_orders_by_date(shop, rows, label))
+
+
+async def _shopowner_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, shop: Shop) -> None:
+    """📋 Logs — every action taken in this shop, so nothing happens unseen."""
+    from app.audit.service import recent
+    from app.db.factory import get_tenant_repo
+    from app.reports.service import format_activity
+
+    rows = await recent(limit=20, shop_id=shop.id)
+    keepers = await get_tenant_repo().list_shopkeepers(shop.id)
+    actors = {str(sk.telegram_id): (sk.name or str(sk.telegram_id)) for sk in keepers}
+    await _reply(update, context, format_activity(shop.name, rows, actors))
+
+
+async def _shopowner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The shop-owner bot's only free-text consumer: the 🗓 date-range reply.
+
+    Fails silent without a pending prompt (same rule as _keeper_text) — this bot is otherwise
+    all-button, and stray text shouldn't get an answer.
+    """
+    pending = context.chat_data.get("pending")
+    if not pending:
+        return
+    context.chat_data.pop("pending", None)
+    user = update.effective_user
+    service = _service(context)
+    client = await service.client_by_telegram(user.id) if user else None
+    if client is None:
+        return  # not linked → silence, never a hint about what this bot does
+    try:
+        if pending["do"] == "sordr":
+            # Re-guard: a pending prompt is not a capability — the id is re-checked here.
+            shop = await _own_shop(service, client, pending["args"][0])
+            text = (update.message.text or "").strip()
+            await _shopowner_orders_range(update, context, shop, text)
+    except ShopNotFound:
+        await _reply(update, context, "❌ Not found.")
+    except ValueError as e:
+        await _reply(update, context, f"⚠️ {e}")
+    except Exception:
+        logger.exception("shop-owner text action failed")
+        await _reply(update, context, "❌ Internal error.")
+
+
 async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline-button dispatcher for the shop-owner bot. Every shop-id-carrying action resolves
     the shop through `_own_shop` first — a crafted foreign shop_id gets '❌ Not found'."""
@@ -2395,6 +2515,14 @@ async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             shop = await _own_shop(service, client, args[0])
             rows = await orders_for_export(shop.id, args[1])
             await _reply(update, context, _format_owner_orders(shop, rows, args[1]))
+        elif action == "sordr":
+            shop = await _own_shop(service, client, args[0])  # guard before we accept any text
+            context.chat_data["pending"] = {"do": "sordr", "args": args}
+            await _reply(update, context,
+                         f"🗓 {shop.name} — reply with:  YYYY-MM-DD YYYY-MM-DD  (inclusive)")
+        elif action == "slog":
+            shop = await _own_shop(service, client, args[0])
+            await _shopowner_logs(update, context, shop)
         elif action == "sinv":
             shop = await _own_shop(service, client, args[0])
             await _reply(update, context, format_inventory(shop.name, await list_inventory(shop.id)))
@@ -2463,7 +2591,9 @@ async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_shopowner_application(service: TenantService) -> Application:
     """Global shop-owner bot: client owners watch their shops remotely (ADR-006).
-    All-button UX — no free-text handler; every input is a tap."""
+
+    Button-first UX: every action is a tap. The one exception is the 🗓 date range, which needs
+    two dates typed — that reply is consumed by `_shopowner_text` and nothing else."""
     from app.core.config import settings
 
     if not settings.telegram_shopowner_bot_token:
@@ -2476,6 +2606,7 @@ def build_shopowner_application(service: TenantService) -> Application:
     app.add_handler(CommandHandler("menu", shopowner_menu_cmd))
     app.add_handler(CallbackQueryHandler(_shopowner_cb))
     app.add_handler(MessageHandler(filters.CONTACT, _shopowner_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _shopowner_text))
     return app
 
 

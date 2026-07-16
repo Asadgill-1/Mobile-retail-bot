@@ -756,6 +756,32 @@ async def orders_for_export(shop_id: UUID, filter_arg: str, client: Any | None =
     return await asyncio.to_thread(_q)
 
 
+async def orders_in_range(
+    shop_id: UUID, start: datetime, end: datetime, client: Any | None = None
+) -> list[dict]:
+    """Range twin of orders_for_export: every non-draft order in [start, end), oldest first.
+
+    The shop owner's 🗓 Date range view groups these by day, so order by created_at, not number.
+    """
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("orders")
+            .select(_EXPORT_SELECT)
+            .eq("shop_id", str(shop_id))
+            .neq("status", "draft")
+            .gte("created_at", start.isoformat())
+            .lt("created_at", end.isoformat())
+            .order("created_at")
+            .execute()
+            .data
+            or []
+        )
+
+    return await asyncio.to_thread(_q)
+
+
 async def rider_orders_for_export(
     shop_id: UUID, rider_id: UUID, filter_arg: str, client: Any | None = None
 ) -> list[dict]:

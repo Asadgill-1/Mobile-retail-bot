@@ -176,6 +176,64 @@ def format_inventory(shop_name: str, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# audit_logs.action → a sentence a shop owner can read. {0} = the first detail arg.
+# Slash command and button land on the same phrasing: the owner shouldn't care which was used.
+_HUMAN_ACTIONS: dict[str, str] = {
+    "kconf": "confirmed order #{0}", "confirmorder_cmd": "confirmed order #{0}",
+    "krej": "rejected order #{0}", "rejectorder_cmd": "rejected order #{0}",
+    "kdup": "moved order #{0} to {1}", "deliveryupdate_cmd": "updated a delivery",
+    "kappr": "approved price request #{0}", "approveprice_cmd": "approved a price request",
+    "kcust": "countered price request #{0}", "custom_cmd": "countered a price request",
+    "kdeny": "denied price request #{0}", "denyprice_cmd": "denied a price request",
+    "kasgr": "assigned order #{0} to a rider", "assigndelivery_cmd": "assigned a delivery",
+    "krec": "reconciled COD with a rider", "reconcilecod_cmd": "reconciled COD with a rider",
+    "kneg": "turned negotiation {0}", "negotiation_cmd": "changed negotiation",
+    "ksheet": "downloaded the counter sheet", "countersheet_cmd": "downloaded the counter sheet",
+    "kboost": "boosted a product", "kunboost": "cleared a product's boost",
+    "ktag": "tagged a product", "kuntag": "removed a product tag",
+    "kcleartags": "cleared a product's tags", "kfeature": "toggled a product's featured flag",
+    "racc": "confirmed pickup of order #{0}", "rnrx": "reported order #{0} NOT received",
+    "rider_deliver": "delivered an order", "rider_cancel": "cancelled a delivery",
+    "rider_accept": "confirmed a pickup", "rider_notreceived": "reported an order not received",
+    "exportorders_cmd": "exported orders", "exportrider_cmd": "exported a rider route",
+}
+
+
+def _humanize(row: dict) -> str:
+    """Never crash on an unknown action — an unmapped one still has to appear in the log."""
+    action = row.get("action") or "?"
+    detail = row.get("detail") or {}
+    args = detail.get("args") or []
+    template = _HUMAN_ACTIONS.get(action)
+    if template is None:
+        snippet = (detail.get("text") or "")[:40]
+        return f"{action}{f' — {snippet}' if snippet else ''}"
+    try:
+        return template.format(*args)
+    except (IndexError, KeyError):  # mapped action, missing args — show it anyway
+        return template.split(" #")[0].split(" {")[0]
+
+
+def format_activity(shop_name: str, rows: list[dict], actors: dict[str, str]) -> str:
+    """📋 Logs — what every person did in this shop, newest first.
+
+    `actors` maps telegram_id → name; an unknown actor shows as their raw id rather than
+    disappearing (an unnamed actor is exactly the one worth seeing).
+    """
+    if not rows:
+        return f"📋 {shop_name}: no activity recorded yet."
+    lines = [f"📋 Activity — {shop_name}", ""]
+    for row in rows:
+        stamp = row.get("created_at") or ""
+        try:
+            when = f"{datetime.fromisoformat(stamp).astimezone(DUBAI):%b %d %H:%M}"
+        except ValueError:
+            when = stamp[:16] or "—"
+        actor = row.get("actor") or "?"
+        lines.append(f"  {when} · {actors.get(actor, actor)} — {_humanize(row)}")
+    return "\n".join(lines)
+
+
 def format_product_stats(shop_name: str, rows: list[dict], label: str) -> str:
     """Per-product sales (Q-014). Best sellers first; everything that sold nothing is listed at the
     end — dead stock is what the keeper actually needs to see."""
