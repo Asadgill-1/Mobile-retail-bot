@@ -69,6 +69,12 @@ class TenantRepo(ABC):
     async def create_shop(self, client_id: UUID, name: str, whatsapp_number: str | None = None) -> Shop:
         """Dev/test helper — create a shop under a client (ADR-006)."""
 
+    @abstractmethod
+    async def update_shop_tokens(
+        self, shop_id: UUID, keeper_token: str | None = None, customer_token: str | None = None
+    ) -> Shop:
+        """Set a shop's bot tokens during onboarding. None = leave that token untouched."""
+
     # --- shopkeepers ---
     @abstractmethod
     async def get_shopkeeper_by_telegram_id(self, telegram_id: int) -> Shopkeeper | None:

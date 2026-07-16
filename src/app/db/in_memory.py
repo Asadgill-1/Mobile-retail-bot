@@ -159,6 +159,21 @@ class InMemoryTenantRepo(TenantRepo):
     async def create_shop(self, client_id: UUID, name: str, whatsapp_number: str | None = None) -> Shop:
         return self.create_shop_sync(client_id, name, whatsapp_number)
 
+    async def update_shop_tokens(
+        self, shop_id: UUID, keeper_token: str | None = None, customer_token: str | None = None
+    ) -> Shop:
+        shop = self._shops.get(shop_id)
+        if shop is None:
+            raise KeyError(f"shop {shop_id} not found")
+        patch: dict = {}
+        if keeper_token is not None:
+            patch["telegram_keeper_bot_token"] = keeper_token
+        if customer_token is not None:
+            patch["telegram_customer_bot_token"] = customer_token
+        updated = shop.model_copy(update=patch)
+        self._shops[shop_id] = updated
+        return updated
+
     # --- shopkeepers ---
     async def get_shopkeeper_by_telegram_id(self, telegram_id: int) -> Shopkeeper | None:
         return self._shopkeepers.get(telegram_id)

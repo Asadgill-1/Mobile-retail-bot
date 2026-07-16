@@ -233,6 +233,66 @@ async def addrider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# --- owner onboarding (ADR-006): repos always had these; nothing could reach them until now ---
+@owner_only
+async def addclient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/addclient <name; contact; phone; email>` — onboard the person who owns shops."""
+    parts = _split(update.message.text, maxsplit=1)
+    if not parts:
+        await _reply(update, context, "Usage: /addclient <name; contact name; phone; email>")
+        return
+    name, contact, phone, email = _fields(parts[0], 4)
+    c = await _service(context).create_client(name, contact or None, phone or None, email or None)
+    await _reply(update, context, f"👤 Client added: {c.name}\nid: {c.id}")
+
+
+@owner_only
+async def addshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/addshop <client_id> <name; whatsapp>` — onboard a shop under a client."""
+    parts = _split(update.message.text, maxsplit=1)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /addshop <client_id> <shop name; whatsapp number>")
+        return
+    name, number = _fields(parts[1], 2)
+    s = await _service(context).create_shop(uuid.UUID(parts[0]), name, number or None)
+    await _reply(update, context, f"🏪 Shop added: {s.name}\nid: {s.id}")
+
+
+@owner_only
+async def setshoptokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/setshoptokens <shop> <keeper; customer>` — attach the shop's bot tokens (`-` = keep)."""
+    parts = _split(update.message.text, maxsplit=1)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /setshoptokens <shop_id|number> <keeper token; customer token>")
+        return
+    shop = await _resolve_shop(_service(context), parts[0])
+    keeper, customer = _fields(parts[1], 2)
+    s = await _service(context).set_shop_tokens(
+        shop.id,
+        None if keeper in ("", "-") else keeper,
+        None if customer in ("", "-") else customer,
+    )
+    await _reply(update, context, f"🔑 Tokens saved for {s.name}. Bots start polling on next restart.")
+
+
+@owner_only
+async def addkeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/addkeeper <shop> <telegram_id; name; owner>` — give a person keeper-bot access."""
+    parts = _split(update.message.text, maxsplit=1)
+    if len(parts) < 2:
+        await _reply(update, context, "Usage: /addkeeper <shop_id|number> <telegram_id; name; yes|no>")
+        return
+    shop = await _resolve_shop(_service(context), parts[0])
+    raw_id, name, owner = _fields(parts[1], 3)
+    if not raw_id.isdigit():
+        raise ValueError("telegram id must be a number")
+    sk = await _service(context).create_shopkeeper(
+        shop.id, int(raw_id), name or None, owner.lower() in ("yes", "y", "true")
+    )
+    await _reply(update, context, f"🧑‍💼 Shopkeeper added to {shop.name}: {sk.name or '—'} "
+                 f"[{sk.telegram_id}]{' (owner)' if sk.is_owner else ''}")
+
+
 @owner_only
 async def owner_riders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/riders <shop_id|number>` — list a shop's riders (owner view)."""
@@ -454,9 +514,73 @@ async def _owner_escalations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not rows:
         await _reply(update, context, "No open escalations. 🎉")
         return
-    lines = [f"• {r['phone']} — {(r.get('message') or '')[:50]} ({(r.get('created_at') or '')[:16]})"
-             for r in rows]
-    await _reply(update, context, "Open escalations:\n" + "\n".join(lines))
+    await _reply(update, context, "🚦 Open escalations:")
+    # One message per escalation so each carries its own ✔️ Resolve button — /reply answers a
+    # customer but never closes the row, so without this they pile up forever.
+    for r in rows:
+        text = (f"• {r['phone']} — {(r.get('message') or '')[:50]}\n"
+                f"  ({(r.get('created_at') or '')[:16]})")
+        await context.bot.send_message(
+            update.effective_chat.id, text,
+            reply_markup=kb.owner_escalation_actions(str(r["shop_id"]), str(r["phone"])),
+        )
+
+
+async def _owner_resolve_escalation(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    args: list[str]) -> None:
+    """✔️ Resolve — close the escalation and hand the customer back to the AI."""
+    from app.db.redis_client import get_redis
+    from app.escalations.service import resolve_escalation
+
+    shop_id, identity = uuid.UUID(args[0]), ":".join(args[1:])  # identity may itself contain ':'
+    closed = await resolve_escalation(get_redis(), shop_id, identity)
+    await _reply(update, context,
+                 f"✔️ Resolved {identity} — the assistant is answering them again."
+                 if closed else f"Nothing open for {identity} (already resolved).")
+
+
+async def _owner_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           action: str, period: str) -> None:
+    """🏆 Top products / 🕵️ Cancels+discounts across every shop — the same formatters the
+    shop-owner bot uses, over service.list_shops() instead of one client's shops."""
+    from app.orders.service import cancelled_orders, discounted_orders
+    from app.reports.service import format_audit_report, format_top_products
+
+    shops = await _service(context).list_shops()
+    start, end, label = parse_period(period)
+    if action == "otop":
+        items = [(s.name, await profit_summary(s.id, start, end)) for s in shops]
+        await _reply(update, context, format_top_products(items, label))
+    else:
+        per_shop = [
+            (s.name, await cancelled_orders(s.id, start, end), await discounted_orders(s.id, start, end))
+            for s in shops
+        ]
+        await _reply(update, context, format_audit_report(per_shop, label))
+
+
+async def _owner_cod_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """💵 COD outstanding — cash every rider is still holding, across every shop."""
+    from app.reports.service import format_cod_outstanding
+
+    per_shop = []
+    for s in await _service(context).list_shops():
+        riders = await list_riders(s.id)
+        per_shop.append((s.name, [(r["name"], await cod_balance(s.id, r["id"])) for r in riders]))
+    await _reply(update, context, format_cod_outstanding(per_shop))
+
+
+async def _owner_shop_pick(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           action: str, prompt: str) -> None:
+    """Shared shop picker for the onboarding sub-flows."""
+    shops = await _service(context).list_shops()
+    if not shops:
+        await _reply(update, context, "No shops yet — add a shop first.")
+        return
+    picker = [{"id": str(s.id), "name": s.name} for s in shops]
+    await update.callback_query.edit_message_text(
+        prompt, reply_markup=kb.owner_onboard_shop_picker(picker, action)
+    )
 
 
 async def _owner_security(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1068,6 +1192,14 @@ _OSEC_PROMPT = {
     "obypr": "↩️ Reply with the phone to un-bypass.",
 }
 
+# Onboarding button → prompt. Fields are `;`-separated: a shop name may contain spaces.
+_OONB_PROMPT = {
+    "oaddc": "👤 Reply with:  name; contact name; phone; email\n(only the name is required)",
+    "oaddsc": "🏪 Reply with:  shop name; whatsapp number\n(number optional)",
+    "oaddt": "🔑 Reply with:  keeper token; customer token\n(use `-` to leave one unchanged)",
+    "oaddk": "🧑‍💼 Reply with:  telegram id; name; owner\n(owner = yes/no, default no)",
+}
+
 
 async def _owner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline-button dispatcher for the owner bot."""
@@ -1105,6 +1237,35 @@ async def _owner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_text("💰 Profit for…", reply_markup=kb.owner_profit_menu())
         elif action == "oprof":
             await _owner_profit(update, context, args)  # ['today'|…|'compare']
+        elif action in ("otopmenu", "ocanmenu"):
+            # Same period menu, different report — the builder is prefix-agnostic.
+            await q.edit_message_text(
+                "🏆 Top products for…" if action == "otopmenu" else "🕵️ Cancels + discounts for…",
+                reply_markup=kb.shopowner_period_menu(action[:-4], kb.cb("omenu")),
+            )
+        elif action in ("otop", "ocan"):
+            await _owner_analytics(update, context, action, args[0])
+        elif action == "ocodall":
+            await _owner_cod_all(update, context)
+        elif action == "oonb":
+            await q.edit_message_text("➕ Onboarding:", reply_markup=kb.owner_onboarding_menu())
+        elif action in _OONB_PROMPT:
+            context.chat_data["pending"] = {"do": action, "args": args}
+            await _reply(update, context, _OONB_PROMPT[action])
+        elif action == "oaddtmenu":
+            await _owner_shop_pick(update, context, "oaddt", "🔑 Tokens for which shop?")
+        elif action == "oaddkmenu":
+            await _owner_shop_pick(update, context, "oaddk", "🧑‍💼 Shopkeeper for which shop?")
+        elif action == "oadds":
+            clients = await service.list_clients()
+            if not clients:
+                await _reply(update, context, "No clients yet — add a client first.")
+            else:
+                picker = [{"id": str(c.id), "name": c.name} for c in clients]
+                await q.edit_message_text("🏪 Shop for which client?",
+                                          reply_markup=kb.owner_client_picker(picker, "oaddsc"))
+        elif action == "oesr":
+            await _owner_resolve_escalation(update, context, args)
         elif action == "oresume":
             resumed = await service.resume_shop(uuid.UUID(args[0]))
             await _reply(update, context, f"✅ Resumed: {resumed.name} ({resumed.status.value})")
@@ -1182,6 +1343,8 @@ async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                          f"id: {_rider_ref(rider)}\nAsk them to open the rider bot and tap “Share my phone”.")
         elif do == "omdel":
             await _owner_delete_messages(update, context, args, text)
+        elif do in _OONB_PROMPT:
+            await _owner_onboard_text(update, context, do, args, text)
         else:
             await _owner_security_text(update, context, do, text)
     except (ShopNotFound, ClientNotFound) as e:
@@ -1191,6 +1354,51 @@ async def _owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         logger.exception("owner text action failed")
         await _reply(update, context, "❌ Internal error.")
+
+
+def _fields(text: str, n: int) -> list[str]:
+    """'a; b; c' → ['a','b','c', ...] padded to n. Semicolons, not spaces — names have spaces."""
+    parts = [p.strip() for p in text.split(";")]
+    return (parts + [""] * n)[:n]
+
+
+async def _owner_onboard_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              do: str, args: list[str], text: str) -> None:
+    """Consume an onboarding prompt reply. These were repo-only calls with no way to reach them."""
+    service = _service(context)
+
+    if do == "oaddc":
+        name, contact, phone, email = _fields(text, 4)
+        c = await service.create_client(name, contact or None, phone or None, email or None)
+        await _reply(update, context,
+                     f"👤 Client added: {c.name}\nid: {c.id}\n\nNow add a shop under them.")
+    elif do == "oaddsc":
+        name, number = _fields(text, 2)
+        s = await service.create_shop(uuid.UUID(args[0]), name, number or None)
+        await _reply(update, context,
+                     f"🏪 Shop added: {s.name}\nid: {s.id}\n\nSet its bot tokens next.")
+    elif do == "oaddt":
+        keeper, customer = _fields(text, 2)
+        s = await service.set_shop_tokens(
+            uuid.UUID(args[0]),
+            None if keeper in ("", "-") else keeper,      # `-` = leave this one alone
+            None if customer in ("", "-") else customer,
+        )
+        await _reply(update, context,
+                     f"🔑 Tokens saved for {s.name}.\n"
+                     "Its bots start polling the next time the bot process restarts "
+                     "(applications are built at boot).")
+    elif do == "oaddk":
+        raw_id, name, owner = _fields(text, 3)
+        if not raw_id.isdigit():
+            await _reply(update, context, "Telegram id must be a number. Tap 🧑‍💼 Add shopkeeper again.")
+            return
+        sk = await service.create_shopkeeper(
+            uuid.UUID(args[0]), int(raw_id), name or None, owner.lower() in ("yes", "y", "true")
+        )
+        await _reply(update, context,
+                     f"🧑‍💼 Shopkeeper added: {sk.name or '—'} [{sk.telegram_id}]"
+                     f"{' (owner)' if sk.is_owner else ''}\nThey can now /start the shop's keeper bot.")
 
 
 async def _owner_delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1272,6 +1480,11 @@ def build_application(service: TenantService) -> Application:
     # owner rider onboarding (§10)
     app.add_handler(CommandHandler("addrider", addrider))
     app.add_handler(CommandHandler("riders", owner_riders))
+    # owner tenant onboarding (ADR-006)
+    app.add_handler(CommandHandler("addclient", addclient))
+    app.add_handler(CommandHandler("addshop", addshop))
+    app.add_handler(CommandHandler("setshoptokens", setshoptokens))
+    app.add_handler(CommandHandler("addkeeper", addkeeper))
     # owner profit (§6)
     app.add_handler(CommandHandler("owner", owner_cmd))
     # owner security (§7, §8)

@@ -425,3 +425,140 @@ async def test_owner_delete_by_shop(monkeypatch):
     await bot._owner_cb(_cb_update(f"omdel:shop:{sid}"), ctx)
     await bot._owner_text(_text_update("YES"), ctx)
     assert str(calls["del"]) == sid
+
+
+# --- owner: analytics, onboarding, escalation resolve (Phase 4) ---
+def test_owner_menu_has_analytics_and_onboarding():
+    actions = {kb.parse_cb(b.callback_data)[0]
+               for row in kb.owner_menu().inline_keyboard for b in row}
+    assert {"otopmenu", "ocanmenu", "ocodall", "oonb"} <= actions
+
+
+def test_owner_onboarding_menu_actions():
+    actions = {kb.parse_cb(b.callback_data)[0]
+               for row in kb.owner_onboarding_menu().inline_keyboard for b in row}
+    assert {"oaddc", "oadds", "oaddtmenu", "oaddkmenu"} <= actions
+
+
+def test_owner_escalation_actions_carries_shop_and_identity():
+    m = kb.owner_escalation_actions("s-uuid", "971501234567")
+    assert kb.parse_cb(m.inline_keyboard[0][0].callback_data) == ("oesr", ["s-uuid", "971501234567"])
+
+
+def test_owner_escalation_actions_none_when_payload_too_long():
+    # A pathological identity must not crash the whole escalation list.
+    assert kb.owner_escalation_actions("s" * 36, "i" * 40) is None
+
+
+@pytest.mark.asyncio
+async def test_owner_resolve_button_calls_resolve_escalation(monkeypatch):
+    from uuid import uuid4
+
+    calls = {}
+    sid = uuid4()
+
+    async def _resolve(redis, shop_id, identity, client=None):
+        calls["args"] = (shop_id, identity)
+        return 1
+
+    monkeypatch.setattr("app.escalations.service.resolve_escalation", _resolve)
+    monkeypatch.setattr("app.db.redis_client.get_redis", lambda: object())
+
+    ctx = _Ctx(service=None)
+    await bot._owner_cb(_cb_update(kb.cb("oesr", str(sid), "971501234567")), ctx)
+
+    assert calls["args"] == (sid, "971501234567")
+    assert any("Resolved" in s for s in ctx.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_owner_resolve_button_reports_already_resolved(monkeypatch):
+    from uuid import uuid4
+
+    async def _resolve(redis, shop_id, identity, client=None):
+        return 0  # nothing was open
+
+    monkeypatch.setattr("app.escalations.service.resolve_escalation", _resolve)
+    monkeypatch.setattr("app.db.redis_client.get_redis", lambda: object())
+
+    ctx = _Ctx(service=None)
+    await bot._owner_cb(_cb_update(kb.cb("oesr", str(uuid4()), "p1")), ctx)
+    assert any("already resolved" in s for s in ctx.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_owner_top_products_button_uses_all_shops(monkeypatch):
+    from uuid import uuid4
+
+    from app.orders.models import ProfitSummary
+
+    seen = {}
+    shops = [SimpleNamespace(id=uuid4(), name="Shop 01"), SimpleNamespace(id=uuid4(), name="Shop 02")]
+
+    class _Svc:
+        async def list_shops(self):
+            return shops
+
+    async def _profit(shop_id, start, end):
+        seen.setdefault("shops", []).append(shop_id)
+        return ProfitSummary()
+
+    def _fmt(items, label):
+        seen["items"] = items
+        seen["label"] = label
+        return "🏆 top"
+
+    monkeypatch.setattr(bot, "profit_summary", _profit)
+    monkeypatch.setattr("app.reports.service.format_top_products", _fmt)
+
+    ctx = _Ctx(service=_Svc())
+    await bot._owner_cb(_cb_update(kb.cb("otop", "weekly")), ctx)
+
+    assert seen["shops"] == [s.id for s in shops]          # every shop, not one client's
+    assert [n for n, _ in seen["items"]] == ["Shop 01", "Shop 02"]
+    assert "🏆 top" in ctx.bot.sent
+
+
+@pytest.mark.asyncio
+async def test_owner_add_client_button_prompts_then_text_creates(monkeypatch):
+    from uuid import uuid4
+
+    created = {}
+
+    class _Svc:
+        async def create_client(self, name, contact=None, phone=None, email=None):
+            created["args"] = (name, contact, phone, email)
+            return SimpleNamespace(id=uuid4(), name=name)
+
+    ctx = _Ctx(service=_Svc())
+    await bot._owner_cb(_cb_update(kb.cb("oaddc")), ctx)
+    assert ctx.chat_data["pending"] == {"do": "oaddc", "args": []}
+
+    await bot._owner_text(_text_update("Gulf Traders; Asad; 0501234567; a@b.ae"), ctx)
+    assert created["args"] == ("Gulf Traders", "Asad", "0501234567", "a@b.ae")
+    assert any("Client added" in s for s in ctx.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_owner_set_tokens_dash_keeps_existing(monkeypatch):
+    from uuid import uuid4
+
+    seen = {}
+    sid = uuid4()
+
+    class _Svc:
+        async def set_shop_tokens(self, shop_id, keeper, customer):
+            seen["args"] = (shop_id, keeper, customer)
+            return SimpleNamespace(name="Shop 01")
+
+    ctx = _Ctx(service=_Svc())
+    ctx.chat_data["pending"] = {"do": "oaddt", "args": [str(sid)]}
+    await bot._owner_text(_text_update("new-keeper; -"), ctx)
+
+    assert seen["args"] == (sid, "new-keeper", None)  # `-` → None → untouched
+
+
+def test_fields_splits_on_semicolons_and_pads():
+    assert bot._fields("a; b; c", 4) == ["a", "b", "c", ""]
+    assert bot._fields("Gulf Mobiles", 2) == ["Gulf Mobiles", ""]  # names may contain spaces
+    assert bot._fields("a;b;c;d;e", 3) == ["a", "b", "c"]

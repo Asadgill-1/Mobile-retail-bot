@@ -229,6 +229,25 @@ class SupabaseTenantRepo(TenantRepo):
 
         return await asyncio.to_thread(_q)
 
+    async def update_shop_tokens(
+        self, shop_id: UUID, keeper_token: str | None = None, customer_token: str | None = None
+    ) -> Shop:
+        def _q() -> Shop:
+            patch: dict[str, Any] = {}
+            if keeper_token is not None:
+                patch["telegram_keeper_bot_token"] = keeper_token
+            if customer_token is not None:
+                patch["telegram_customer_bot_token"] = customer_token
+            if not patch:  # nothing to change — read the row back rather than issue a bare update
+                r = self.sb.table("shops").select("*").eq("id", str(shop_id)).execute()
+            else:
+                r = self.sb.table("shops").update(patch).eq("id", str(shop_id)).execute()
+            if not r.data:
+                raise KeyError(f"shop {shop_id} not found")
+            return _row_to_shop(r.data[0])
+
+        return await asyncio.to_thread(_q)
+
     # --- shopkeepers ---
     async def get_shopkeeper_by_telegram_id(self, telegram_id: int) -> Shopkeeper | None:
         def _q() -> Shopkeeper | None:

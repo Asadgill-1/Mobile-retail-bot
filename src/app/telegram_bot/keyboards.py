@@ -170,7 +170,41 @@ def owner_menu() -> M:
          B("🛡 Security", callback_data=cb("osecmenu"))],
         [B("📋 Audit", callback_data=cb("oaudit")),
          B("🧹 Messages", callback_data=cb("omsgmenu"))],
+        [B("🏆 Top products", callback_data=cb("otopmenu")),
+         B("🕵️ Cancels+discounts", callback_data=cb("ocanmenu"))],
+        [B("💵 COD outstanding", callback_data=cb("ocodall")),
+         B("➕ Onboarding", callback_data=cb("oonb"))],
     ])
+
+
+def owner_onboarding_menu() -> M:
+    """Onboarding was scripts-only until now — every step is a guided prompt."""
+    return M([
+        [B("👤 Add client", callback_data=cb("oaddc")),
+         B("🏪 Add shop", callback_data=cb("oadds"))],
+        [B("🔑 Set shop tokens", callback_data=cb("oaddtmenu")),
+         B("🧑‍💼 Add shopkeeper", callback_data=cb("oaddkmenu"))],
+        [B("⬅️ Menu", callback_data=cb("omenu"))],
+    ])
+
+
+def owner_client_picker(clients: list[dict], action: str) -> M:
+    rows = [[B(f"👤 {c['name']}", callback_data=cb(action, c["id"]))] for c in clients]
+    return M(rows + [[B("⬅️ Back", callback_data=cb("oonb"))]])
+
+
+def owner_onboard_shop_picker(shops: list[dict], action: str) -> M:
+    rows = [[B(f"🏪 {s['name']}", callback_data=cb(action, s["id"]))] for s in shops]
+    return M(rows + [[B("⬅️ Back", callback_data=cb("oonb"))]])
+
+
+def owner_escalation_actions(shop_id: str, identity: str) -> M | None:
+    """✔️ Resolve on one escalation. None when the payload would blow the 64-byte cap
+    (a long identity) — the owner still has /handover on the shop bot."""
+    try:
+        return M([[B("✔️ Resolve", callback_data=cb("oesr", shop_id, identity))]])
+    except AssertionError:
+        return None
 
 
 def owner_profit_menu() -> M:

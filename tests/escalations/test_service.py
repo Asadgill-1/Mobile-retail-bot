@@ -197,3 +197,40 @@ async def test_shop_b_cannot_hand_over_shop_a_escalation(redis, wire):
     with pytest.raises(NoPendingEscalation):
         await handover(redis, shop_b, "p1")
     assert await is_frozen(redis, shop_a.id, "p1")  # untouched
+
+
+# --- resolve_escalation: /reply answers a customer but never closed the row (owner ✔️ Resolve) ---
+from app.escalations.service import resolve_escalation  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_resolve_escalation_closes_row_and_unfreezes(redis, wire):
+    shop = _shop()
+    await escalate(redis, shop, "p1", "help", "reason")
+    assert await is_frozen(redis, shop.id, "p1")
+
+    closed = await resolve_escalation(redis, shop.id, "p1")
+
+    assert closed == 1
+    assert wire["resolved"] == [(shop.id, "p1")]
+    assert await is_frozen(redis, shop.id, "p1") is False  # AI answers them again
+
+
+@pytest.mark.asyncio
+async def test_resolve_escalation_is_idempotent_when_nothing_open(redis, wire, monkeypatch):
+    async def _none(shop_id, identity, client):
+        return 0
+
+    monkeypatch.setattr(svc, "_resolve_escalation", _none)
+    shop = _shop()
+    assert await resolve_escalation(redis, shop.id, "p1") == 0  # no crash, owner told "already resolved"
+
+
+@pytest.mark.asyncio
+async def test_handover_still_resolves_through_the_shared_path(redis, wire):
+    # handover now routes through resolve_escalation — same close + unfreeze, one implementation.
+    shop = _shop()
+    await escalate(redis, shop, "p1", "help", "reason")
+    await handover(redis, shop, "p1")
+    assert wire["resolved"] == [(shop.id, "p1")]
+    assert await is_frozen(redis, shop.id, "p1") is False

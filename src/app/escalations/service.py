@@ -183,5 +183,17 @@ async def handover(
     """
     if not await is_frozen(redis, shop.id, identity):
         raise NoPendingEscalation(identity)
-    await _resolve_escalation(shop.id, identity, client)
-    await unfreeze(redis, shop.id, identity)
+    await resolve_escalation(redis, shop.id, identity, client)
+
+
+async def resolve_escalation(
+    redis: Any, shop_id: UUID, identity: str, client: Any | None = None
+) -> int:
+    """Close the open escalation(s) for a customer and let the AI answer them again.
+
+    `/reply` alone leaves the row open forever — the owner's ✔️ Resolve button and `/handover`
+    both land here. Returns how many rows were closed (0 = nothing was open).
+    """
+    closed = await _resolve_escalation(shop_id, identity, client)
+    await unfreeze(redis, shop_id, identity)
+    return closed
