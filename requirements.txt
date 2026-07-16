@@ -6,7 +6,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
 # Settings / validation
-pydantic==2.10.4
+pydantic==2.13.4
 pydantic-settings==2.7.0
 
 # Supabase (Postgres + Storage) — ADR-001, ADR-003
