@@ -90,7 +90,12 @@ class Settings(BaseSettings):
     # kimi-k2.* rejects any temperature except 1 (HTTP 400). Defaults must match the default
     # model, or every message 400s, retries once, and degrades to FALLBACK_REPLY. GPT-4o: ~0.2.
     ai_temperature: float = 1.0
-    ai_max_tokens: int = 1024
+    # kimi-k2.6 is a reasoning model: it emits reasoning_content that counts against max_tokens
+    # BEFORE any customer-facing content. At 1024 a reasoning-heavy turn exhausts the budget on
+    # thinking alone → finish_reason='length' with empty content → the customer is needlessly
+    # handed to a human. Headroom for reasoning + the reply; it's a cap, so normal turns still stop
+    # early and cost is unchanged. GPT-4o (no separate reasoning stream) would be fine far lower.
+    ai_max_tokens: int = 4096
     ai_request_timeout: float = 30.0
     # Reads hand-filled counter-sale sheets from a photo (shop-owner bot 🧾 Today sell). Chat
     # stays on ai_model — only that one flow overrides it. Verified live against the provider's
