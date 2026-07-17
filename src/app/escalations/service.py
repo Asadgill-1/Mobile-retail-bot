@@ -19,7 +19,12 @@ from typing import Any
 from uuid import UUID
 
 from app.escalations.context import remember
-from app.telegram_bot.notify import send_to_customer, send_to_owner, send_to_shopkeepers
+from app.telegram_bot.notify import (
+    send_photo_to_customer,
+    send_to_customer,
+    send_to_owner,
+    send_to_shopkeepers,
+)
 from app.tenants.models import Shop
 
 logger = logging.getLogger(__name__)
@@ -136,6 +141,7 @@ async def escalate(
         f"⚠️ Escalation from {identity}: {message}\n"
         f"Reason: {reason}\n\n"
         f"Reply to the customer:  /reply {identity} <your message>\n"
+        f"Send a photo:  attach it with {identity} as the caption\n"
         f"Give it back to the assistant:  /handover {identity}"
     )
     reached = await send_to_shopkeepers(shop, await _shopkeepers(shop.id), text)
@@ -171,6 +177,19 @@ async def reply(redis: Any, shop: Shop, identity: str, text: str) -> None:
         raise DeliveryFailed(identity)
     # Recorded as a real turn: after /handover the AI must know what the human already said.
     await remember(redis, shop.id, identity, "shopkeeper", text)
+
+
+async def reply_photo(
+    redis: Any, shop: Shop, identity: str, photo: bytes, caption: str | None = None
+) -> None:
+    """Shopkeeper sends a photo to an escalated customer (e.g. a request_shop_media follow-up).
+    Same guard and turn-recording as reply(); the caller supplies bytes (cross-bot file_ids don't
+    transfer — see notify.send_photo_to_customer)."""
+    if not await is_frozen(redis, shop.id, identity):
+        raise NoPendingEscalation(identity)
+    if not await send_photo_to_customer(shop, identity, photo, caption):
+        raise DeliveryFailed(identity)
+    await remember(redis, shop.id, identity, "shopkeeper", f"[photo] {caption or ''}".strip())
 
 
 async def handover(

@@ -100,3 +100,28 @@ async def send_to_customer(shop: Shop, identity: str, text: str) -> bool:
     Stage 13: this becomes the Twilio WhatsApp send and `identity` is a phone number.
     """
     return await _send(shop.telegram_customer_bot_token, identity, text, what="customer message")
+
+
+async def send_photo_to_customer(
+    shop: Shop, identity: str, photo: bytes, caption: str | None = None
+) -> bool:
+    """Send a photo to the customer on the shop's customer bot. Best-effort; never raises.
+
+    Takes raw bytes, not a Telegram file_id: file_ids are bound to the bot that received them, so a
+    photo the keeper bot got cannot be re-sent by the customer bot by id — the caller downloads the
+    bytes off the keeper bot and hands them here (ADR-005).
+    """
+    token = shop.telegram_customer_bot_token
+    if not token:
+        logger.error("cannot send customer photo: no customer bot token for shop=%s", shop.id)
+        return False
+    try:
+        async with Bot(token) as bot:
+            await bot.send_photo(chat_id=identity, photo=photo, caption=caption)
+        return True
+    except TelegramError as e:
+        logger.error("failed to send customer photo to chat=%s: %s", identity, e)
+        return False
+    except Exception:
+        logger.exception("unexpected error sending customer photo to chat=%s", identity)
+        return False

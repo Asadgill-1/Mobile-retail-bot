@@ -82,8 +82,10 @@ help them decide on one you're recommending, call `show_product_media` with that
 media is sent to the customer for you — just introduce it in one line ("Here's the iPhone 16 in green:"). \
 NEVER tell the customer you can't share photos or that they must visit the store to see the product.
 - If `show_product_media` reports nothing was sent (no photo/video is on file for that product), say so \
-plainly — we don't have one saved to show right now — and offer to pass their request to the shop. Still \
-never tell them to visit the store.
+plainly — we don't have one saved to show right now — and offer to have the shop send some. Never tell \
+them to visit the store. If they say yes, call `request_shop_media` for that product; the shop sends the \
+photos to the customer directly, so just say you've asked and they'll arrive shortly — never say you're \
+connecting them to a person.
 """
 
 # SPEC §3 step 3: what the customer sees when the AI hands over to a person.

@@ -170,10 +170,7 @@ def owner_menu() -> M:
          B("🛡 Security", callback_data=cb("osecmenu"))],
         [B("📋 Audit", callback_data=cb("oaudit")),
          B("🧹 Messages", callback_data=cb("omsgmenu"))],
-        [B("🏆 Top products", callback_data=cb("otopmenu")),
-         B("🕵️ Cancels+discounts", callback_data=cb("ocanmenu"))],
-        [B("💵 COD outstanding", callback_data=cb("ocodall")),
-         B("➕ Onboarding", callback_data=cb("oonb"))],
+        [B("➕ Onboarding", callback_data=cb("oonb"))],
     ])
 
 

@@ -555,37 +555,6 @@ async def _owner_resolve_escalation(update: Update, context: ContextTypes.DEFAUL
                  if closed else f"Nothing open for {identity} (already resolved).")
 
 
-async def _owner_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                           action: str, period: str) -> None:
-    """🏆 Top products / 🕵️ Cancels+discounts across every shop — the same formatters the
-    shop-owner bot uses, over service.list_shops() instead of one client's shops."""
-    from app.orders.service import cancelled_orders, discounted_orders
-    from app.reports.service import format_audit_report, format_top_products
-
-    shops = await _service(context).list_shops()
-    start, end, label = parse_period(period)
-    if action == "otop":
-        items = [(s.name, await profit_summary(s.id, start, end)) for s in shops]
-        await _reply(update, context, format_top_products(items, label))
-    else:
-        per_shop = [
-            (s.name, await cancelled_orders(s.id, start, end), await discounted_orders(s.id, start, end))
-            for s in shops
-        ]
-        await _reply(update, context, format_audit_report(per_shop, label))
-
-
-async def _owner_cod_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """💵 COD outstanding — cash every rider is still holding, across every shop."""
-    from app.reports.service import format_cod_outstanding
-
-    per_shop = []
-    for s in await _service(context).list_shops():
-        riders = await list_riders(s.id)
-        per_shop.append((s.name, [(r["name"], await cod_balance(s.id, r["id"])) for r in riders]))
-    await _reply(update, context, format_cod_outstanding(per_shop))
-
-
 async def _owner_shop_pick(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            action: str, prompt: str) -> None:
     """Shared shop picker for the onboarding sub-flows."""
@@ -1261,16 +1230,6 @@ async def _owner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_text("💰 Profit for…", reply_markup=kb.owner_profit_menu())
         elif action == "oprof":
             await _owner_profit(update, context, args)  # ['today'|…|'compare']
-        elif action in ("otopmenu", "ocanmenu"):
-            # Same period menu, different report — the builder is prefix-agnostic.
-            await q.edit_message_text(
-                "🏆 Top products for…" if action == "otopmenu" else "🕵️ Cancels + discounts for…",
-                reply_markup=kb.shopowner_period_menu(action[:-4], kb.cb("omenu")),
-            )
-        elif action in ("otop", "ocan"):
-            await _owner_analytics(update, context, action, args[0])
-        elif action == "ocodall":
-            await _owner_cod_all(update, context)
         elif action == "oonb":
             await q.edit_message_text("➕ Onboarding:", reply_markup=kb.owner_onboarding_menu())
         elif action in _OONB_PROMPT:
@@ -1791,6 +1750,37 @@ async def _keeper_product_edit(update, context, shop, do: str, text: str) -> Non
         await _reply(update, context, f"{'⭐' if p.is_featured else '☆'} {p.brand} {p.model} — featured: {p.is_featured}")
 
 
+async def _keeper_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A shopkeeper sends a photo to an escalated customer — the reply to a request_shop_media
+    handover. The customer id goes in the caption (mirrors /reply <customer>); any text after it
+    rides along as the photo caption. Only fires outside the /addproduct flow, which claims its own
+    photos (handler order in build_shopkeeper_application)."""
+    caption = (update.message.caption or "").strip()
+    parts = caption.split(maxsplit=1)
+    if not parts:
+        await _reply(update, context,
+                     "📷 To send this to a customer, add their id as the caption "
+                     "(e.g. 5215780245), optionally followed by a message.")
+        return
+    identity, note = parts[0], (parts[1] if len(parts) > 1 else None)
+    from app.db.redis_client import get_redis
+    from app.escalations.service import DeliveryFailed, NoPendingEscalation, reply_photo
+
+    shop = _shop_of(context)
+    try:
+        # file_ids are per-bot: download bytes off THIS (keeper) bot so the customer bot can send.
+        tg_file = await context.bot.get_file(update.message.photo[-1].file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        await reply_photo(get_redis(), shop, identity, data, note)
+        await _reply(update, context, f"✅ Photo sent to {identity}.")
+    except NoPendingEscalation:
+        await _reply(update, context, f"❌ {identity} isn't an escalated customer. Nothing sent.")
+    except DeliveryFailed:
+        await _reply(update, context, f"❌ Couldn't deliver the photo to {identity}.")
+    except Exception as e:
+        await _keeper_err(update, context, e)
+
+
 def build_shopkeeper_application(service: TenantService, shop: Shop) -> Application:
     """Per-shop shopkeeper bot: staff-side commands scoped to one shop."""
     if not shop.telegram_keeper_bot_token:
@@ -1814,6 +1804,9 @@ def build_shopkeeper_application(service: TenantService, shop: Shop) -> Applicat
     # Runs AFTER the /addproduct conversation, so an active add-flow keeps its text; otherwise a
     # pending button-prompt (reject reason, counter price, COD amount) claims the reply.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _keeper_text))
+    # Also after /addproduct: a standalone photo means "send this to an escalated customer" (the
+    # add-flow's ConversationHandler claims photos only while its media step is active).
+    app.add_handler(MessageHandler(filters.PHOTO, _keeper_photo))
     return app
 
 

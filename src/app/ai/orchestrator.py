@@ -151,6 +151,31 @@ async def _product_media(args: dict[str, Any], shop: Shop) -> list[dict[str, str
     return items
 
 
+async def _request_shop_media(
+    args: dict[str, Any], shop: Shop, identity: str, message: str, redis: Any
+) -> str:
+    """Customer wants media we have none of: notify the shop with a clear, deterministic reason and
+    freeze the customer so the shop can send it (SPEC §3 escalation). Unlike escalate_to_human this
+    is a normal tool — the model keeps the turn and writes its own line, so the handover stays
+    seamless (no 'connecting you to a specialist'). Product name is best-effort; a missing/unknown
+    id still notifies the shop rather than crashing the turn."""
+    from app.products.service import ProductNotFound, get_product
+
+    name = "a product"
+    try:
+        pid = UUID(str(args.get("product_id") or ""))
+        product = await get_product(shop.id, pid)  # tenant guard
+        name = f"{product.brand} {product.model}".strip() or name
+    except (ValueError, TypeError, ProductNotFound):
+        pass  # deliberate: notify the shop regardless of whether the id resolved
+    try:
+        await escalate(redis, shop, identity, message, f"📷 Photo/video requested: {name}")
+    except Exception:
+        logger.exception("request_shop_media escalate failed shop=%s id=%s", shop.id, identity)
+        return json.dumps({"ok": False})
+    return json.dumps({"ok": True, "product": name})
+
+
 async def _place_order(args: dict[str, Any], shop: Shop, identity: str) -> dict[str, Any]:
     """Draft an order from the model's arguments (Q-017). Every failure returns an error the model
     can recover from — it must never crash the turn."""
@@ -285,14 +310,17 @@ async def answer_customer(
                     else:
                         # No media on file. Without this the model gets a bare {"sent": 0} and,
                         # having no positive instruction, tells the customer to visit the store —
-                        # the one thing the prompt forbids. Give it the honest line to say instead.
+                        # the one thing the prompt forbids. Point it at request_shop_media instead.
                         content = json.dumps({
                             "sent": 0,
                             "note": "No photo or video is saved for this product. Tell the "
-                                    "customer we don't have one on file to show — do NOT tell "
-                                    "them to visit the store. Offer to pass the request to "
-                                    "the shop.",
+                                    "customer we don't have one on file — do NOT tell them to "
+                                    "visit the store — and offer to have the shop send some. If "
+                                    "they say yes, call request_shop_media for this product.",
                         })
+                elif call.name == "request_shop_media":
+                    content = await _request_shop_media(
+                        call.arguments, shop, identity, message, redis)
                 else:
                     content = await _run_tool(call, shop, identity)
                 messages.append(

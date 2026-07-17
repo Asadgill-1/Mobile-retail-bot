@@ -181,6 +181,52 @@ async def test_keeper_confirm_button_calls_confirm_order(monkeypatch):
     assert upd.callback_query.cleared  # Confirm/Reject buttons stripped after success
 
 
+# --- keeper photo reply to an escalated customer ---------------------------
+def _photo_update(caption, user_id: int = OWNER, chat_id: int = 7):
+    photo = [SimpleNamespace(file_id="F1")]
+    msg = SimpleNamespace(caption=caption, photo=photo)
+    return SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=user_id),
+                           effective_chat=SimpleNamespace(id=chat_id))
+
+
+class _PhotoBot(_Bot):
+    async def get_file(self, file_id):
+        async def _dl():
+            return bytearray(b"IMG")
+        return SimpleNamespace(download_as_bytearray=_dl)
+
+
+@pytest.mark.asyncio
+async def test_keeper_photo_forwards_to_escalated_customer(monkeypatch):
+    calls = {}
+
+    async def _reply_photo(redis, shop, identity, data, note):
+        calls["photo"] = (identity, bytes(data), note)
+
+    monkeypatch.setattr("app.escalations.service.reply_photo", _reply_photo)
+    monkeypatch.setattr("app.db.redis_client.get_redis", lambda: object())
+    ctx = _Ctx(shop=SimpleNamespace(id="s1", name="TechWorld"))
+    ctx.bot = _PhotoBot()
+    await bot._keeper_photo(_photo_update("5215780245 here you go"), ctx)
+    assert calls["photo"] == ("5215780245", b"IMG", "here you go")
+    assert "sent to 5215780245" in ctx.bot.sent[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_keeper_photo_without_caption_shows_usage(monkeypatch):
+    called = {"photo": False}
+
+    async def _reply_photo(*a, **k):
+        called["photo"] = True
+
+    monkeypatch.setattr("app.escalations.service.reply_photo", _reply_photo)
+    ctx = _Ctx(shop=SimpleNamespace(id="s1", name="TechWorld"))
+    ctx.bot = _PhotoBot()
+    await bot._keeper_photo(_photo_update(""), ctx)
+    assert called["photo"] is False  # no customer id → nothing sent
+    assert "caption" in ctx.bot.sent[-1].lower()
+
+
 @pytest.mark.asyncio
 async def test_keeper_deliveryupdate_button_calls_advance(monkeypatch):
     calls = {}
@@ -437,11 +483,13 @@ async def test_owner_delete_by_shop(monkeypatch):
     assert str(calls["del"]) == sid
 
 
-# --- owner: analytics, onboarding, escalation resolve (Phase 4) ---
-def test_owner_menu_has_analytics_and_onboarding():
+# --- owner: onboarding, escalation resolve (Phase 4) ---
+def test_owner_menu_has_platform_controls_and_onboarding():
     actions = {kb.parse_cb(b.callback_data)[0]
                for row in kb.owner_menu().inline_keyboard for b in row}
-    assert {"otopmenu", "ocanmenu", "ocodall", "oonb"} <= actions
+    assert {"oshops", "odash", "ohealth", "oesc", "oaudit", "oonb"} <= actions
+    # Business analytics (top products, cancels+discounts, COD) live on the shop-owner bot, not here.
+    assert not ({"otopmenu", "ocanmenu", "ocodall"} & actions)
 
 
 def test_owner_onboarding_menu_actions():
@@ -494,39 +542,6 @@ async def test_owner_resolve_button_reports_already_resolved(monkeypatch):
     ctx = _Ctx(service=None)
     await bot._owner_cb(_cb_update(kb.cb("oesr", str(uuid4()), "p1")), ctx)
     assert any("already resolved" in s for s in ctx.bot.sent)
-
-
-@pytest.mark.asyncio
-async def test_owner_top_products_button_uses_all_shops(monkeypatch):
-    from uuid import uuid4
-
-    from app.orders.models import ProfitSummary
-
-    seen = {}
-    shops = [SimpleNamespace(id=uuid4(), name="Shop 01"), SimpleNamespace(id=uuid4(), name="Shop 02")]
-
-    class _Svc:
-        async def list_shops(self):
-            return shops
-
-    async def _profit(shop_id, start, end):
-        seen.setdefault("shops", []).append(shop_id)
-        return ProfitSummary()
-
-    def _fmt(items, label):
-        seen["items"] = items
-        seen["label"] = label
-        return "🏆 top"
-
-    monkeypatch.setattr(bot, "profit_summary", _profit)
-    monkeypatch.setattr("app.reports.service.format_top_products", _fmt)
-
-    ctx = _Ctx(service=_Svc())
-    await bot._owner_cb(_cb_update(kb.cb("otop", "weekly")), ctx)
-
-    assert seen["shops"] == [s.id for s in shops]          # every shop, not one client's
-    assert [n for n, _ in seen["items"]] == ["Shop 01", "Shop 02"]
-    assert "🏆 top" in ctx.bot.sent
 
 
 @pytest.mark.asyncio

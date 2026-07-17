@@ -189,6 +189,43 @@ async def test_escalation_short_circuits_without_answering(monkeypatch, redis, s
 
 
 @pytest.mark.asyncio
+async def test_request_shop_media_notifies_and_stays_seamless(monkeypatch, redis, side_effects):
+    """Customer wants photos we don't have and agrees: the shop is notified with a deterministic
+    reason, and the customer gets the model's OWN line — not the 'specialist' escalation reply."""
+    prod = _product()
+    line = "I've asked the shop — they'll send photos shortly!"
+    fake = _FakeLLM(
+        _tool_call("request_shop_media", product_id=str(prod.id)),
+        LLMResponse(content=line),
+    )
+    monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
+
+    async def _get_product(shop_id, product_id, client=None):
+        return prod
+
+    monkeypatch.setattr("app.products.service.get_product", _get_product)
+
+    reply = await orch.answer_customer(_shop(), "p1", "yes please", redis)
+    assert reply == line  # seamless: the model's own line, not ESCALATION_REPLY
+    assert reply != ESCALATION_REPLY
+    assert side_effects["escalate"][0]["reason"] == "📷 Photo/video requested: Samsung Galaxy S24"
+
+
+@pytest.mark.asyncio
+async def test_request_shop_media_notifies_even_on_junk_id(monkeypatch, redis, side_effects):
+    """A stale/garbled id must still reach the shop — never crash the turn — with a generic reason."""
+    fake = _FakeLLM(
+        _tool_call("request_shop_media", product_id="not-a-uuid"),
+        LLMResponse(content="Asked the shop for you!"),
+    )
+    monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
+
+    reply = await orch.answer_customer(_shop(), "p1", "yes", redis)
+    assert reply == "Asked the shop for you!"
+    assert side_effects["escalate"][0]["reason"] == "📷 Photo/video requested: a product"
+
+
+@pytest.mark.asyncio
 async def test_plain_answer_needs_no_tools(monkeypatch, redis):
     fake = _FakeLLM(LLMResponse(content="Hello! How can I help?"))
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)

@@ -17,6 +17,7 @@ from app.escalations.service import (
     handover,
     is_frozen,
     reply,
+    reply_photo,
 )
 from app.tenants.models import Shop, Shopkeeper
 
@@ -63,15 +64,21 @@ def wire(monkeypatch) -> dict:
         sent["customer"].append((identity, text))
         return True
 
+    async def _photo_to_customer(shop, identity, photo, caption=None):
+        sent["photos"].append((identity, photo, caption))
+        return True
+
     async def _to_owner(text):
         sent["owner"].append(text)
         return True
 
+    sent["photos"] = []
     monkeypatch.setattr(svc, "_open_escalation", _open)
     monkeypatch.setattr(svc, "_resolve_escalation", _resolve)
     monkeypatch.setattr(svc, "_shopkeepers", _shopkeepers)
     monkeypatch.setattr(svc, "send_to_shopkeepers", _to_keepers)
     monkeypatch.setattr(svc, "send_to_customer", _to_customer)
+    monkeypatch.setattr(svc, "send_photo_to_customer", _photo_to_customer)
     monkeypatch.setattr(svc, "send_to_owner", _to_owner)
     return sent
 
@@ -140,6 +147,24 @@ async def test_reply_to_a_customer_who_was_never_escalated_is_refused(redis, wir
     with pytest.raises(NoPendingEscalation):
         await reply(redis, _shop(), "stranger", "hello")
     assert wire["customer"] == []
+
+
+@pytest.mark.asyncio
+async def test_reply_photo_reaches_the_customer_and_is_remembered(redis, wire):
+    shop = _shop()
+    await freeze(redis, shop.id, "p1")
+    await reply_photo(redis, shop, "p1", b"\x89PNG-bytes", "here it is")
+
+    assert wire["photos"] == [("p1", b"\x89PNG-bytes", "here it is")]
+    turns = await history(redis, shop.id, "p1")
+    assert turns == [{"role": "shopkeeper", "content": "[photo] here it is"}]
+
+
+@pytest.mark.asyncio
+async def test_reply_photo_to_a_customer_who_was_never_escalated_is_refused(redis, wire):
+    with pytest.raises(NoPendingEscalation):
+        await reply_photo(redis, _shop(), "stranger", b"bytes")
+    assert wire["photos"] == []
 
 
 @pytest.mark.asyncio

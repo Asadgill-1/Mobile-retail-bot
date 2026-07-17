@@ -148,6 +148,29 @@ SHOW_PRODUCT_MEDIA: dict[str, Any] = {
     },
 }
 
+REQUEST_SHOP_MEDIA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "request_shop_media",
+        "description": (
+            "Ask the shop's staff to send the customer photos or a video of a product we have "
+            "none saved for. Call this ONLY after show_product_media reported nothing was sent "
+            "AND the customer has said they want you to get some. The shop is notified and will "
+            "send the media to the customer directly; after calling, reply in one short, natural "
+            "line that you've asked the shop and they'll send it shortly. Never say you're "
+            "connecting them to a person or a specialist."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "string", "description": "The product id from a search_products result."},
+            },
+            "required": ["product_id"],
+        },
+    },
+}
+
 TOOLS: list[dict[str, Any]] = [
-    SEARCH_PRODUCTS, ESCALATE_TO_HUMAN, PLACE_ORDER, REQUEST_PRICE, SHOW_PRODUCT_MEDIA
+    SEARCH_PRODUCTS, ESCALATE_TO_HUMAN, PLACE_ORDER, REQUEST_PRICE, SHOW_PRODUCT_MEDIA,
+    REQUEST_SHOP_MEDIA,
 ]
