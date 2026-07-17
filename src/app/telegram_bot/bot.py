@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -104,6 +105,20 @@ def _service(context: ContextTypes.DEFAULT_TYPE) -> TenantService:
 
 async def _reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+
+async def _clear_buttons(update: Update) -> None:
+    """Strip the inline keyboard off the message a callback button was tapped on, so a one-shot
+    action (confirm/reject/accept/save…) can't be tapped again after it's done. No-op off a
+    callback; swallows the BadRequest Telegram raises when the keyboard is already gone or the
+    message is too old to edit."""
+    q = update.callback_query
+    if q is None:
+        return
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
 
 
 def _split(text: str, *, maxsplit: int = 2) -> list[str]:
@@ -1594,6 +1609,16 @@ _AUDITED_CB = frozenset({
     "kconf", "krej", "kdup", "kappr", "kcust", "kdeny", "kasgr", "krec", "kneg", "ksheet",
 })
 
+# Callback actions that are a one-shot decision on a notification message (order draft
+# Confirm/Reject, price Approve/Counter/Deny, rider Accept/Deliver, sale Save/Discard). After
+# the action succeeds the tapped message's buttons are stripped so a stale button can't be
+# tapped twice. Menu/navigation actions are absent on purpose — they replace their own keyboard.
+_CLEAR_ON_ACTION = frozenset({
+    "kconf", "krej", "kappr", "kcust", "kdeny", "kdup", "kasgr", "krec",  # keeper
+    "racc", "rnrx", "rdel", "rcan",                                       # rider
+    "ssave", "sdisc",                                                     # shop-owner sale
+})
+
 
 async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline-button dispatcher for the keeper bot. Auth already enforced by the group -10 gate.
@@ -1697,6 +1722,8 @@ async def _keeper_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await _reply(update, context, _KPROD_PROMPT[action])
         else:
             await _reply(update, context, "Unknown action. /menu")
+        if action in _CLEAR_ON_ACTION:  # one-shot done: strip its buttons
+            await _clear_buttons(update)
         if action in _AUDITED_CB:  # only after it actually worked (same rule as keeper_command)
             await _audit(update, context, action, detail={"args": args})
     except Exception as e:
@@ -2232,6 +2259,8 @@ async def _rider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                          f"🚫 Cancelling #{args[0]}. Reply with the reason (remarks are required).")
         else:
             await _reply(update, context, "Unknown action. /menu")
+        if action in _CLEAR_ON_ACTION:  # one-shot done: strip its buttons
+            await _clear_buttons(update)
     except NotYourDelivery as e:
         await _reply(update, context, f"❌ No delivery #{e} assigned to you.")
     except ValueError as e:
@@ -2762,6 +2791,8 @@ async def _shopowner_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _reply(update, context, format_cod_outstanding(per_shop))
         else:
             await _reply(update, context, "Unknown action. /menu")
+        if action in _CLEAR_ON_ACTION:  # one-shot done: strip its buttons
+            await _clear_buttons(update)
     except (ShopNotFound, ClientNotFound):
         await _reply(update, context, "❌ Not found.")
     except ValueError as e:

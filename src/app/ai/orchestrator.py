@@ -280,7 +280,19 @@ async def answer_customer(
                 if call.name == "show_product_media":
                     items = await _product_media(call.arguments, shop)
                     media.extend(items)
-                    content = json.dumps({"sent": len(items)})  # tell the model it went through
+                    if items:
+                        content = json.dumps({"sent": len(items)})  # tell the model it went through
+                    else:
+                        # No media on file. Without this the model gets a bare {"sent": 0} and,
+                        # having no positive instruction, tells the customer to visit the store —
+                        # the one thing the prompt forbids. Give it the honest line to say instead.
+                        content = json.dumps({
+                            "sent": 0,
+                            "note": "No photo or video is saved for this product. Tell the "
+                                    "customer we don't have one on file to show — do NOT tell "
+                                    "them to visit the store. Offer to pass the request to "
+                                    "the shop.",
+                        })
                 else:
                     content = await _run_tool(call, shop, identity)
                 messages.append(

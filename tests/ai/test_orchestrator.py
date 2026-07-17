@@ -142,6 +142,37 @@ async def test_show_product_media_fills_the_media_sink(monkeypatch, redis):
 
 
 @pytest.mark.asyncio
+async def test_show_product_media_no_media_tells_model_not_to_send_to_store(monkeypatch, redis):
+    """Product with no photo/video on file: the tool result must carry guidance so the model
+    says we don't have one — not 'visit the store' (bug: it defaulted to the latter on sent:0)."""
+    prod = _product()
+    prod.images = []  # nothing on file
+    prod.video_url = None
+    fake = _FakeLLM(
+        _tool_call("show_product_media", product_id=str(prod.id)),
+        LLMResponse(content="We don't have a photo of that on file, sorry."),
+    )
+    monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
+
+    async def _get_product(shop_id, product_id, client=None):
+        return prod
+
+    async def _signed(paths, ttl=3600, client=None):
+        return []
+
+    monkeypatch.setattr("app.products.service.get_product", _get_product)
+    monkeypatch.setattr("app.products.media.signed_urls", _signed)
+
+    sink: list = []
+    await orch.answer_customer(_shop(), "p1", "show me the iphone", redis, media_sink=sink)
+    assert sink == []  # nothing sent
+    tool_msg = next(m for m in fake.requests[-1] if getattr(m, "name", None) == "show_product_media")
+    payload = json.loads(tool_msg.content)
+    assert payload["sent"] == 0
+    assert "note" in payload and "store" in payload["note"].lower()  # steers model off "visit store"
+
+
+@pytest.mark.asyncio
 async def test_escalation_short_circuits_without_answering(monkeypatch, redis, side_effects):
     fake = _FakeLLM(_tool_call("escalate_to_human", reason="refund request"))
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)

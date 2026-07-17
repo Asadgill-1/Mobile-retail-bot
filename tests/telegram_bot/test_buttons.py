@@ -64,6 +64,7 @@ class _Query:
         self.answered = False
         self.edits: list[str] = []
         self.markups: list = []
+        self.cleared = False  # set when the inline keyboard is stripped (_clear_buttons)
 
     async def answer(self) -> None:
         self.answered = True
@@ -71,6 +72,9 @@ class _Query:
     async def edit_message_text(self, text, reply_markup=None) -> None:
         self.edits.append(text)
         self.markups.append(reply_markup)
+
+    async def edit_message_reply_markup(self, reply_markup=None) -> None:
+        self.cleared = reply_markup is None
 
 
 class _Bot:
@@ -123,8 +127,10 @@ async def test_rider_accept_button_calls_set_custody(monkeypatch):
     monkeypatch.setattr("app.riders.service.riders_by_telegram", _by_tg)
     monkeypatch.setattr("app.riders.service.set_custody", _set_custody)
     ctx = _Ctx()
-    await bot._rider_cb(_cb_update("racc:7", user_id=555), ctx)
+    upd = _cb_update("racc:7", user_id=555)
+    await bot._rider_cb(upd, ctx)
     assert calls["set"] == (["r1"], "Ali", 7, True)
+    assert upd.callback_query.cleared  # Accept/Not-received buttons stripped after success
 
 
 @pytest.mark.asyncio
@@ -169,8 +175,10 @@ async def test_keeper_confirm_button_calls_confirm_order(monkeypatch):
     monkeypatch.setattr(bot, "confirm_order", _confirm)
     shop = SimpleNamespace(id="s1", name="TechWorld")
     ctx = _Ctx(shop=shop)
-    await bot._keeper_cb(_cb_update("kconf:12"), ctx)
+    upd = _cb_update("kconf:12")
+    await bot._keeper_cb(upd, ctx)
     assert calls["confirm"] == (shop, 12)
+    assert upd.callback_query.cleared  # Confirm/Reject buttons stripped after success
 
 
 @pytest.mark.asyncio

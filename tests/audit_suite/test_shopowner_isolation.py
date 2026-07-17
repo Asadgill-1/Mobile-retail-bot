@@ -33,6 +33,9 @@ class _Query:
         self.edits.append(text)
         self.markups.append(reply_markup)
 
+    async def edit_message_reply_markup(self, reply_markup=None):
+        self.cleared = reply_markup is None
+
 
 class _Bot:
     def __init__(self):
