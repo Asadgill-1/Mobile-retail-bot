@@ -220,6 +220,14 @@ def test_merge_counter_adds_revenue_cost_and_profit():
     assert out.counter_revenue == Decimal("6800") and out.counter_profit == Decimal("1200")
 
 
+def test_merge_counter_void_reversal_nets_out():
+    # Dashboard POS voids by inserting a negative row (migration 022) — the fold must cancel.
+    base = ProfitSummary(orders=0, revenue=Decimal("0"), cost=Decimal("0"), profit=Decimal("0"))
+    out = merge_counter(base, [_crow(2, 3400, 2800), _crow(-2, 3400, 2800)])
+    assert out.revenue == Decimal("0") and out.cost == Decimal("0")
+    assert out.profit == Decimal("0") and out.counter_revenue == Decimal("0")
+
+
 def test_merge_counter_no_rows_returns_the_summary_untouched():
     base = ProfitSummary(orders=1, revenue=Decimal("100"))
     assert merge_counter(base, []) is base

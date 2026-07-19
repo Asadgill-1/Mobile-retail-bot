@@ -150,6 +150,18 @@ def test_format_activity_humanizes_actions_and_names_actors():
     assert "14:22" in out  # Dubai time (UTC+4), not raw UTC
 
 
+def test_format_activity_humanizes_dashboard_pos_actions():
+    rows = [
+        _log("dcsale", actor="dashboard:k@shop.local", detail={"args": ["3"]}),
+        _log("dvoid", actor="dashboard:k@shop.local", detail={"args": ["ab12"]}),
+        _log("dinv", actor="dashboard:k@shop.local", detail={"args": ["000042"]}),
+    ]
+    out = format_activity("Shop 01", rows, {})
+    assert "recorded a counter sale of 3 item(s)" in out
+    assert "voided counter sale ab12" in out
+    assert "issued invoice INV-000042" in out
+
+
 def test_format_activity_slash_and_button_read_the_same():
     button = format_activity("S", [_log("kconf", detail={"args": ["7"]})], {})
     command = format_activity("S", [_log("confirmorder_cmd", detail={"args": ["7"]})], {})

@@ -202,6 +202,9 @@ _HUMAN_ACTIONS: dict[str, str] = {
     "rider_deliver": "delivered an order", "rider_cancel": "cancelled a delivery",
     "rider_accept": "confirmed a pickup", "rider_notreceived": "reported an order not received",
     "exportorders_cmd": "exported orders", "exportrider_cmd": "exported a rider route",
+    # dashboard POS (separate repo) reuses this map so web actions read the same in the owner log
+    "dcsale": "recorded a counter sale of {0} item(s)", "dvoid": "voided counter sale {0}",
+    "dinv": "issued invoice INV-{0}",
 }
 
 
