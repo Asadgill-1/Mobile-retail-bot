@@ -55,5 +55,29 @@ async def history(redis: Any, shop_id: UUID, identity: str, limit: int = SESSION
     return out
 
 
+async def sync_relay(redis: Any, shop_id: UUID, identity: str) -> None:
+    """Pull dashboard-sent turns into the session (messages.relay_pending, migration 021).
+
+    The web dashboard cannot reach this Redis, so its customer sends land in the archive
+    flagged relay_pending; the next AI turn drains them here so the model knows what the
+    shop already told the customer. Raw rpush, NOT remember() — these rows are already
+    archived, remember() would duplicate them. Best-effort: never costs an answer.
+    """
+    try:
+        from app.messaging.store import mark_relayed, pending_relay
+
+        rows = await pending_relay(shop_id, identity)
+        if not rows:
+            return
+        key = session_key(shop_id, identity)
+        for row in rows:
+            await redis.rpush(key, json.dumps({"role": row["role"], "content": row["content"]}))
+        await redis.ltrim(key, -SESSION_MAX, -1)
+        await redis.expire(key, SESSION_TTL_SECONDS)
+        await mark_relayed([r["id"] for r in rows])
+    except Exception:
+        logger.exception("relay sync failed shop=%s identity=%s", shop_id, identity)
+
+
 async def forget(redis: Any, shop_id: UUID, identity: str) -> None:
     await redis.delete(session_key(shop_id, identity))

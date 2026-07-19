@@ -7,7 +7,14 @@ from uuid import uuid4
 import fakeredis.aioredis
 import pytest
 
-from app.escalations.context import SESSION_MAX, forget, history, remember, session_key
+from app.escalations.context import (
+    SESSION_MAX,
+    forget,
+    history,
+    remember,
+    session_key,
+    sync_relay,
+)
 
 SHOP_A, SHOP_B = uuid4(), uuid4()
 
@@ -66,3 +73,49 @@ async def test_forget_clears_the_conversation(redis):
     await remember(redis, SHOP_A, "p1", "customer", "hello")
     await forget(redis, SHOP_A, "p1")
     assert await history(redis, SHOP_A, "p1") == []
+
+
+# --- dashboard relay (migration 021): web sends drain into the session before the AI answers ---
+
+
+@pytest.mark.asyncio
+async def test_relay_drains_dashboard_turns_into_the_session(monkeypatch, redis):
+    rows = [
+        {"id": "m1", "role": "assistant", "content": "Your order is confirmed."},
+        {"id": "m2", "role": "assistant", "content": "Delivery tomorrow."},
+    ]
+    marked: list[list[str]] = []
+
+    async def _pending(shop_id, identity, client=None):
+        return rows
+
+    async def _mark(ids, client=None):
+        marked.append(ids)
+        rows.clear()  # marked rows stop being pending
+
+    monkeypatch.setattr("app.messaging.store.pending_relay", _pending)
+    monkeypatch.setattr("app.messaging.store.mark_relayed", _mark)
+
+    await remember(redis, SHOP_A, "p1", "customer", "did my order go through?")
+    await sync_relay(redis, SHOP_A, "p1")
+    assert await history(redis, SHOP_A, "p1") == [
+        {"role": "customer", "content": "did my order go through?"},
+        {"role": "assistant", "content": "Your order is confirmed."},
+        {"role": "assistant", "content": "Delivery tomorrow."},
+    ]
+    assert marked == [["m1", "m2"]]
+
+    # second drain: nothing pending, session unchanged — no duplicates
+    await sync_relay(redis, SHOP_A, "p1")
+    assert len(await history(redis, SHOP_A, "p1")) == 3
+
+
+@pytest.mark.asyncio
+async def test_relay_failure_never_breaks_the_conversation(monkeypatch, redis):
+    async def _boom(shop_id, identity, client=None):
+        raise ConnectionError("db gone")
+
+    monkeypatch.setattr("app.messaging.store.pending_relay", _boom)
+    await remember(redis, SHOP_A, "p1", "customer", "hello")
+    await sync_relay(redis, SHOP_A, "p1")  # must swallow, not raise
+    assert await history(redis, SHOP_A, "p1") == [{"role": "customer", "content": "hello"}]

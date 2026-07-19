@@ -42,6 +42,39 @@ async def save_message(
         logger.exception("message persist failed shop=%s identity=%s", shop_id, identity)
 
 
+async def pending_relay(shop_id: UUID, identity: str, client: Any | None = None) -> list[dict]:
+    """Dashboard-sent turns not yet in the AI's Redis session (migration 021), oldest first."""
+    sb = _sb(client)
+
+    def _q() -> list[dict]:
+        return (
+            sb.table("messages")
+            .select("id,role,content")
+            .eq("shop_id", str(shop_id))
+            .eq("identity", identity)
+            .eq("relay_pending", True)
+            .order("created_at")
+            .limit(25)
+            .execute()
+            .data
+            or []
+        )
+
+    return await asyncio.to_thread(_q)
+
+
+async def mark_relayed(ids: list[str], client: Any | None = None) -> None:
+    """Clear relay_pending after the rows made it into Redis."""
+    if not ids:
+        return
+    sb = _sb(client)
+
+    def _q() -> None:
+        sb.table("messages").update({"relay_pending": False}).in_("id", ids).execute()
+
+    await asyncio.to_thread(_q)
+
+
 async def conversations(shop_id: UUID, limit: int = 10, client: Any | None = None) -> list[dict]:
     """Most recently active customer identities for one shop, newest first.
 

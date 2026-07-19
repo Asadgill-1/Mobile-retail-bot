@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
-from app.escalations.context import history, remember
+from app.escalations.context import history, remember, sync_relay
 from app.escalations.service import alert_owner, escalate
 from app.llm.functions import TOOLS
 from app.llm.llm_client import LLMMessage, LLMResponse, LLMToolCall, get_llm_client
@@ -246,6 +246,7 @@ async def _id_reference(shop: Shop) -> str:
 async def _replay(redis: Any, shop: Shop, identity: str) -> list[LLMMessage]:
     """Prior turns, oldest first. A broken session must not cost the customer an answer."""
     try:
+        await sync_relay(redis, shop.id, identity)  # dashboard-sent turns first (migration 021)
         past = await history(redis, shop.id, identity)
     except Exception:
         logger.exception("session history unreadable shop=%s identity=%s", shop.id, identity)
