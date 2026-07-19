@@ -123,6 +123,16 @@
 - [ ] Twilio **outbound** client — the worker computes `result.reply` and currently throws it away (`ponytail:` marker, `tasks/tasks.py:42`)
 - [ ] Owner live cutover checklist
 
+### Stage 14 — Shop & Shop-Owner web dashboard (separate repo: `mobile-shop-and-shop-owner-dashboard`)
+> Runs in parallel with this backend, not blocked on Stage 13. Full plan + phase list in that repo's `PLAN.md`.
+- [x] **P0** — migration 020 (`dashboard_users`) applied live; `scripts/seed_dashboard_users.py` provisions the first keeper + owner logins.
+- [x] **P1** — Next.js scaffold, Supabase Auth, tenant scope (`lib/scope.ts`, mirrors `_own_shop`), read-only Home/Orders/Inventory/Chats/Riders/Reports, dark mode, mobile bottom nav.
+- [x] **P2** — all mutations as server actions, each porting its Python service twin exactly (same guards, same atomic `decrement_stock` RPC, same audit action codes so the owner bot's activity log humanizes dashboard actions for free): order confirm/reject/advance/assign/cancel, price approve/counter/deny, product CRUD + media upload (signed URL → Storage direct), rider add + COD reconcile, negotiation toggle.
+- [ ] **P3** — POS (counter sales) + UAE tax invoices (new migrations `021_invoices.sql`/`022_counter_sales.sql` in the dashboard repo — no-op if this backend's own counter-sales table ever needs the same shape).
+- [ ] **P4** — owner-only Oversight (cancellations/discounts/activity/cross-shop transcripts) + a bridge API on **this** FastAPI app (`/internal/escalations/reply|handover`, `/internal/export/orders|rider`) exposed via Cloudflare Tunnel — needed because escalation reply/handover and Excel export touch Redis/openpyxl, which only run on this backend's process.
+- [ ] **P5** — polish: empty/error/loading states everywhere, AED + Dubai-TZ sweep, dark-mode contrast audit.
+- **Known gap until P4:** a dashboard-sent customer message is archived to `messages` but does not enter the AI's Redis session (`escalations/context.py::remember`) — that write only happens on this backend's process. The AI may not "know" a dashboard confirm/reply happened until the bridge lands.
+
 ## Definition of "done" per stage
 
 A stage is done when:

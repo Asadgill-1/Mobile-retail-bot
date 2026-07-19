@@ -63,6 +63,12 @@
 - **Purpose:** permanent chat archive, dual-written alongside the Redis session (`escalations.context.remember()` best-effort writes here too via `messaging.store.save_message`) at the same choke point that feeds the AI's working memory. Redis stays the AI's 25-message/24h window; this table is the durable, shop-owner-facing record.
 - **Invariant:** deletion is **platform-owner-only** (`messaging.store.delete_messages(shop_id=None, start=None, end=None)` — always has a WHERE clause, never a bare `DELETE`), driven from the owner bot's 🧹 Messages menu (all / one shop / a date range, typed-`YES` confirmed).
 
+### dashboard_users  (migration 020, Stage 12e)
+- **Key fields:** `user_id` UUID PK → `auth.users(id)` (Supabase Auth), `role` (`keeper|owner`), `shop_id` FK? (set when `role='keeper'`), `client_id` FK? (set when `role='owner'`), `created_at`.
+- **Purpose:** maps a Supabase Auth login (email/password) to its dashboard tenant scope for the separate Next.js web dashboard (`mobile-shop-and-shop-owner-dashboard` repo). No self-signup — rows are provisioned only by `scripts/seed_dashboard_users.py` (platform owner) until an Owner Console onboarding flow exists.
+- **Invariant:** a `keeper` sees exactly one shop; an `owner` sees every shop of their `client_id`. The dashboard's `lib/scope.ts::getScope()` resolves this row on every request and mirrors the bots' `_own_shop` tenant guard — an unknown or foreign shop/product/order id returns the identical 404.
+- **Relations:** one → one `auth.users`; one → one `shops` (keeper) or `clients` (owner).
+
 ### pending_escalations
 - **Key fields:** `id`, `shop_id` FK, `phone`, `message`, `created_at`, `resolved_at`.
 - **Purpose:** Out-of-domain messages awaiting shopkeeper; freezes AI for that customer.
@@ -103,12 +109,13 @@ clients 1───* shops 1───* shopkeepers
   │           shops 1───* messages
   └── clients.telegram_id (shop-owner bot link, migration 009)
 blacklisted_phones *──?1 shops
+dashboard_users *──1 auth.users, *──?1 shops (keeper), *──?1 clients (owner)
 ```
 
 ## Storage notes
 
 - DB: **Supabase Postgres** (ADR-001).
-- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010 (see `migrations/` for the full list); all applied live.
+- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010, then **020** (see `migrations/` for the full list); all applied live. Numbering gap 011–019 is deliberate — the dashboard's plan (`PLAN.md` in the dashboard repo) reserved 020+ for its own share so the two repos' migrations never collide if both are worked in parallel.
 - Naming: tables `snake_case`, columns `snake_case`.
 - **RLS**: migration 006 (Stage-audit) locked the data API to service-role only across every table that existed at the time — RLS on, no policies, anon revoked. **Migrations 008/009/010 (added after 006) still ship a permissive `using(true)` scaffold on their new tables** (`cod_ledger`, `messages`, `counter_sales`) — a documented ponytail gap, not an oversight; the backend only ever talks with the service-role key, so app-layer `shop_id` scoping is what actually enforces isolation on those three tables today. Tighten alongside the rest if the anon key is ever exposed. `clients` is owner-level (no RLS).
 
