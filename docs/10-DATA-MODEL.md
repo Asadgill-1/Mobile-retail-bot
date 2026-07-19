@@ -69,6 +69,33 @@
 - **Invariant:** a `keeper` sees exactly one shop; an `owner` sees every shop of their `client_id`. The dashboard's `lib/scope.ts::getScope()` resolves this row on every request and mirrors the bots' `_own_shop` tenant guard — an unknown or foreign shop/product/order id returns the identical 404.
 - **Relations:** one → one `auth.users`; one → one `shops` (keeper) or `clients` (owner).
 
+### messages.relay_pending  (migration 021, Stage 12f)
+- **Key field:** `relay_pending` boolean, default `false`, added to the existing `messages` table (migration 009).
+- **Purpose:** the web dashboard runs on a separate process from this backend and cannot reach its local Redis, so a dashboard-sent customer message can't call `escalations.context.remember()` directly. It instead archives to `messages` with `relay_pending=true`; the next AI turn drains it into the Redis session (`escalations.context.sync_relay`, called from `orchestrator._replay` before loading history) and clears the flag. Bot-written rows never set it (default `false`).
+- **Invariant:** drained rows are `rpush`'d raw (not re-passed through `remember()`, which would duplicate the archive write). Best-effort — a drain failure never costs the customer their answer.
+- **Index:** partial `(shop_id, identity, created_at) where relay_pending` — the drain query runs on every customer turn; pending rows are near-zero at any moment.
+
+### counter_sales  (extended migration 022, Stage 12f — table itself is migration 010)
+- **Changed:** `quantity` check loosened from `> 0` to `!= 0` — a **negative** row is a void reversal (dashboard POS), inserted rather than deleting or editing the original sale. `recorded_by` (telegram id, bot-only) now defaults `0` so a dashboard-authored row doesn't need one.
+- **New fields:** `sold_by` (text, `dashboard:{email}` on dashboard rows, null on bot rows), `payment_method` (`cash|card`, null on bot rows — the paper sheet never recorded one).
+- **Invariant:** `orders.service.merge_counter`/`counter_totals` are plain sums over `quantity`/`sold_price`, so a void row nets its original out automatically — **no Python code changed** to support voids.
+
+### product_units  (migration 022, Stage 12f)
+- **Key fields:** `id`, `shop_id`, `product_id`, `imei` (unique per shop), `status` (`in_stock|sold`), `counter_sale_id`/`order_id` FK? (which sale consumed it), `added_at`, `sold_at`.
+- **Purpose:** light IMEI/serial ledger for phones sold through the dashboard POS. **`products.quantity` remains the sole stock source of truth** — the bots know nothing about this table. It exists for warranty lookup and anti-theft (an IMEI can't be sold from two different shops, or sold twice) and the printed invoice line.
+- **Invariant:** a unit is compulsory per unit sold when `products.category` is `Mobile`/`Tablet` (dashboard-side rule, `actions/pos.ts`) — not enforced at the DB layer. A product's in-stock unit count and its `quantity` can drift (the ledger is opt-in per product); the dashboard shows this as a display-only mismatch badge, never auto-corrects either side.
+
+### invoices + invoice_counters  (migration 022, Stage 12f)
+- **Key fields (`invoices`):** `id`, `shop_id`, `invoice_number` (per-shop sequential, unique on `(shop_id, invoice_number)`), `source` (`order|counter`), `order_id`/`counter_sale_ids[]`, customer name/phone/address/TRN, `items` jsonb (line snapshot incl. IMEIs), `subtotal`/`vat_rate`/`vat_amount`/`total`, `issued_at`, `created_by`.
+- **Numbering:** `invoice_counters(shop_id pk, last_no)` + `next_invoice_number(p_shop)` RPC — a row-locked increment (same pattern as `decrement_stock`, migration 003) so two simultaneous checkouts on one shop can't collide. Per-shop, not global — a shared global sequence would let one shop infer another's sales volume from the gaps.
+- **Invariant:** created only by the dashboard (`actions/pos.ts::checkoutSale`, `actions/invoices.ts::createInvoiceFromOrder`); nothing here writes it. Voiding a counter sale does **not** delete its invoice — the invoice trail is append-only, the UI marks it voided instead.
+
+### shops (extended, migration 022, Stage 12f)
+- **New fields:** `trn` (UAE Tax Registration Number, nullable), `invoice_name`, `invoice_address` — printed on every tax invoice. Nullable/unset shops print a "TRN missing" warning rather than blocking a sale (a keeper can sell before finishing onboarding paperwork).
+
+### products.barcode  (migration 022, Stage 12f)
+- **New field:** `barcode` (nullable text) + index `(shop_id, barcode)`. Populated optionally at product creation/edit; read by the dashboard POS's camera scanner (`BarcodeDetector`) to jump straight to a cart line. No bot reads or writes it.
+
 ### pending_escalations
 - **Key fields:** `id`, `shop_id` FK, `phone`, `message`, `created_at`, `resolved_at`.
 - **Purpose:** Out-of-domain messages awaiting shopkeeper; freezes AI for that customer.
@@ -110,12 +137,16 @@ clients 1───* shops 1───* shopkeepers
   └── clients.telegram_id (shop-owner bot link, migration 009)
 blacklisted_phones *──?1 shops
 dashboard_users *──1 auth.users, *──?1 shops (keeper), *──?1 clients (owner)
+products 1───* product_units
+counter_sales 1──?1 product_units (via counter_sale_id)
+shops 1───* invoices ──1 invoice_counters (per-shop sequence)
+invoices ?──1 orders, ?──* counter_sales (via counter_sale_ids[])
 ```
 
 ## Storage notes
 
 - DB: **Supabase Postgres** (ADR-001).
-- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010, then **020** (see `migrations/` for the full list); all applied live. Numbering gap 011–019 is deliberate — the dashboard's plan (`PLAN.md` in the dashboard repo) reserved 020+ for its own share so the two repos' migrations never collide if both are worked in parallel.
+- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010, then **020–022** (see `migrations/` for the full list); all applied live. Numbering gap 011–019 is deliberate buffer room. **All dashboard-driven schema lives in this repo's `migrations/` folder too** — the dashboard repo has no migrations of its own; every dashboard-needed table/column is written and applied here (via `scripts/apply_migration.py`), since this is where the Supabase MCP tooling and the one shared project live. 020 = dashboard auth mapping, 021 = the AI-relay flag (`messages.relay_pending`), 022 = POS/invoices/IMEI schema.
 - Naming: tables `snake_case`, columns `snake_case`.
 - **RLS**: migration 006 (Stage-audit) locked the data API to service-role only across every table that existed at the time — RLS on, no policies, anon revoked. **Migrations 008/009/010 (added after 006) still ship a permissive `using(true)` scaffold on their new tables** (`cod_ledger`, `messages`, `counter_sales`) — a documented ponytail gap, not an oversight; the backend only ever talks with the service-role key, so app-layer `shop_id` scoping is what actually enforces isolation on those three tables today. Tighten alongside the rest if the anon key is ever exposed. `clients` is owner-level (no RLS).
 
