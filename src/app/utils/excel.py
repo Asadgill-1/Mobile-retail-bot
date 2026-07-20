@@ -23,7 +23,7 @@ _CENTER = Alignment(horizontal="center", vertical="center")
 
 _BASE = [
     "Order ID", "Customer Name", "Phone", "Address", "Product", "Brand", "Model",
-    "Color", "RAM", "Storage", "Qty", "Selling Price", "Delivery Date", "Status",
+    "Color", "RAM", "Storage", "Qty", "IMEI(s)", "Selling Price", "Delivery Date", "Status",
 ]
 _DETAIL = ["Order Time", "Rider Name", "Rider Phone", "Special Instructions"]  # SPEC §10 detailed
 
@@ -45,7 +45,8 @@ def _row(o: dict, detailed: bool) -> list[Any]:
         o.get("order_number"), o.get("customer_name"), o.get("phone"), o.get("address"),
         p.get("category"), p.get("brand"), p.get("model"), p.get("color"),
         _spec(p.get("specs"), "ram"), _spec(p.get("specs"), "storage", "rom"),
-        o.get("quantity"), net, o.get("delivery_date"), o.get("status"),
+        o.get("quantity"), "",  # IMEI(s): blank — the packer writes the shipped unit's IMEI here
+        net, o.get("delivery_date"), o.get("status"),
     ]
     if detailed:
         dp = o.get("delivery_persons") or {}

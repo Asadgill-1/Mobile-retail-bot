@@ -13,9 +13,38 @@ turns None into the same "not found" it uses for a wrong UUID — never a crash)
 from __future__ import annotations
 
 import re
+from datetime import date, datetime, timedelta, timezone
 
 _PRODUCT_PREFIX = "PR"
 _RIDER_PREFIX = "rider"
+
+# Dubai is UTC+4, no DST (matches reports/service.py DUBAI). Date refs reset per Dubai day.
+_DUBAI = timezone(timedelta(hours=4))
+
+
+def _dubai_date(when: date | datetime | str) -> date:
+    """Whatever the caller has (a date, an aware/naive datetime, or an ISO string) → the Dubai
+    calendar date the day sequence was allocated on. Naive datetimes are assumed already-Dubai."""
+    if isinstance(when, str):
+        when = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    if isinstance(when, datetime):
+        if when.tzinfo is not None:
+            when = when.astimezone(_DUBAI)
+        return when.date()
+    return when
+
+
+def order_ref(when: date | datetime | str, day_seq: int) -> str:
+    """(created_at, day_seq) → 'ODR-20-07-001' (20 July, 1st order of that Dubai day, per shop).
+    Display only — order_number stays the typed/lookup key (day_seq is not unique across years)."""
+    d = _dubai_date(when)
+    return f"ODR-{d.day:02d}-{d.month:02d}-{day_seq:03d}"
+
+
+def invoice_ref(when: date | datetime | str, day_seq: int) -> str:
+    """(issued_at, day_seq) → 'INV-20-07-001'. Display only — invoice_number stays the stored key."""
+    d = _dubai_date(when)
+    return f"INV-{d.day:02d}-{d.month:02d}-{day_seq:03d}"
 
 
 def product_code(n: int) -> str:
@@ -73,4 +102,12 @@ if __name__ == "__main__":
     assert parse_rider_code("7") == 7
     assert parse_rider_code("PR1") is None
     assert parse_rider_code("rider0") is None
+
+    # date refs (display only)
+    assert order_ref(date(2026, 7, 20), 1) == "ODR-20-07-001"
+    assert order_ref(date(2026, 7, 20), 42) == "ODR-20-07-042"
+    assert invoice_ref(date(2026, 12, 5), 7) == "INV-05-12-007"
+    # an aware UTC datetime just before Dubai midnight rolls into the next Dubai day
+    assert order_ref(datetime(2026, 7, 19, 21, 0, tzinfo=timezone.utc), 3) == "ODR-20-07-003"
+    assert order_ref("2026-07-20T08:00:00+00:00", 5) == "ODR-20-07-005"
     print("codes self-check OK")

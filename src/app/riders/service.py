@@ -215,6 +215,12 @@ def cod_trail(rows: list[dict], today_start: datetime) -> dict:
 # ---------------------------------------------------------------------------
 # Rider actions (rider bot)
 # ---------------------------------------------------------------------------
+def _rider_keeps_delivery(sb: Any, shop_id: str) -> bool:
+    """Per-shop setting (023): does the rider keep the delivery fee instead of handing it over?"""
+    rows = sb.table("shops").select("rider_keeps_delivery").eq("id", shop_id).limit(1).execute().data
+    return bool(rows and rows[0].get("rider_keeps_delivery"))
+
+
 async def _get_my_order(rider_ids: list[str], order_number: int, client: Any | None) -> dict:
     """The order by number IF it's assigned to one of this rider's rows (auth by assignment)."""
     sb = _sb(client)
@@ -326,6 +332,18 @@ async def deliver_order(
     sb = _sb(client)
     await _set_status(order["id"], "delivered", "rider", client)  # shared history writer
 
+    # Rider-keeps-delivery (023): the rider collects product+delivery from the customer but, when the
+    # shop lets riders keep delivery, only OWES the shop the product portion — so the 'collect' row
+    # (what the rider holds on the shop's behalf) records cash minus the kept delivery fee. Clamp at
+    # 0 so a short collection never writes a negative claim.
+    fee = Decimal(str(order.get("delivery_fee") or 0))
+    keeps = fee > 0 and _rider_keeps_delivery(sb, order["shop_id"])
+    kept = fee if keeps else Decimal("0")
+    owed = cash - kept
+    if owed < 0:
+        owed = Decimal("0")
+    note = f"order #{order_number} delivered" + (f" (rider kept {kept} AED delivery)" if keeps else "")
+
     def _q() -> None:
         sb.table("orders").update(
             {"delivered_at": delivered_at.isoformat(), "cash_received": str(cash)}
@@ -333,7 +351,7 @@ async def deliver_order(
         sb.table("cod_ledger").insert(
             {
                 "shop_id": order["shop_id"], "rider_id": order["rider_id"], "order_id": order["id"],
-                "entry": "collect", "amount": str(cash), "note": f"order #{order_number} delivered",
+                "entry": "collect", "amount": str(owed), "note": note,
             }
         ).execute()
 
@@ -350,7 +368,8 @@ async def deliver_order(
         shop,
         f"📬 Order #{order_number} delivered by {rider_name} at {delivered_at:%H:%M}.\n"
         f"Cash received: {cash} AED"
-        + (f" (COD was {order['cod_amount']} AED)" if order.get("cod_amount") is not None else ""),
+        + (f" (COD was {order['cod_amount']} AED)" if order.get("cod_amount") is not None else "")
+        + (f"\nRider keeps {kept} AED delivery — owes shop {owed} AED." if keeps else ""),
     )
     return order
 

@@ -416,9 +416,19 @@ async def test_confirm_order_decrements_stock_and_notifies_customer(monkeypatch)
         cap["customer"] = (identity, text)
         return True
 
+    async def _no_offer(shop_id, d, fee, client):  # no active offer in this test
+        from decimal import Decimal
+        return {"discount": Decimal(str(d["discount_amount"])), "fee": fee,
+                "free_delivery": False, "gift_text": None, "snapshot": None}
+
+    async def _update(oid, patch, client):  # DB persistence stubbed out
+        cap["patch"] = patch
+
     monkeypatch.setattr(svc, "_get_draft", _get_draft)
     monkeypatch.setattr(svc, "_decrement_stock", _dec)
     monkeypatch.setattr(svc, "_set_status", _set)
+    monkeypatch.setattr(svc, "_apply_offer_at_confirm", _no_offer)
+    monkeypatch.setattr(svc, "_update_order", _update)
     monkeypatch.setattr(svc, "send_to_customer", _to_customer)
 
     await confirm_order(_shop_obj(), 7)
@@ -721,3 +731,26 @@ async def test_notify_low_stock_skips_owner_without_telegram(low_stock_wire):
     assert await notify_low_stock(_LowStockShop(), uuid4()) is True
     assert low_stock_wire["shop_msg"] is not None  # shop still told
     assert low_stock_wire["owner_msg"] is None
+
+
+# --- offer discount math (023) ---
+def test_offer_discount_covers_every_type():
+    from decimal import Decimal
+
+    from app.orders.service import _offer_discount
+
+    unit = Decimal("100")
+    # percent: 10% of 100*2 = 20
+    assert _offer_discount({"type": "percent_off", "value": 10}, unit, 2) == Decimal("20")
+    # amount: flat 30, capped at the line total
+    assert _offer_discount({"type": "amount_off", "value": 30}, unit, 1) == Decimal("30")
+    assert _offer_discount({"type": "amount_off", "value": 500}, unit, 1) == Decimal("100")  # capped
+    # bogo buy-1-get-1: qty 2 → 1 free unit = 100; qty 3 → still 1 free (one full group)
+    assert _offer_discount({"type": "bogo", "value": 1}, unit, 2) == Decimal("100")
+    assert _offer_discount({"type": "bogo", "value": 1}, unit, 3) == Decimal("100")
+    # bulk: 10% off when qty ≥ min
+    assert _offer_discount({"type": "bulk", "value": 3}, unit, 3) == Decimal("30")
+    assert _offer_discount({"type": "bulk", "value": 3}, unit, 2) == Decimal("0")
+    # non-discount types produce no line discount here
+    assert _offer_discount({"type": "free_gift", "value": None}, unit, 1) == Decimal("0")
+    assert _offer_discount({"type": "free_delivery", "value": None}, unit, 1) == Decimal("0")

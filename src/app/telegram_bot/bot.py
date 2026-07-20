@@ -843,14 +843,28 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @keeper_command
 async def confirmorder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/confirmorder <#>` — accept a draft: decrement stock + notify the customer."""
-    parts = _split(update.message.text, maxsplit=1)
+    """`/confirmorder <#> [delivery_fee]` — accept a draft: decrement stock + notify the customer.
+
+    Optional delivery fee (023) is charged for home delivery; the customer gets a breakdown.
+    The inline ✅ button confirms with free delivery — set a fee via the command or the dashboard.
+    """
+    parts = _split(update.message.text, maxsplit=2)
     if not parts:
-        await _reply(update, context, "Usage: /confirmorder <order_number>")
+        await _reply(update, context, "Usage: /confirmorder <order_number> [delivery_fee]")
         return
     num = _order_number(parts[0])
-    await confirm_order(_shop_of(context), num)
-    await _reply(update, context, f"✅ Order #{num} confirmed. Stock updated, customer notified.")
+    fee = 0
+    if len(parts) > 1:
+        try:
+            fee = Decimal(parts[1])
+            if fee < 0:
+                raise ValueError
+        except (ValueError, ArithmeticError):
+            await _reply(update, context, "Delivery fee must be a number ≥ 0. e.g. /confirmorder 11 25")
+            return
+    await confirm_order(_shop_of(context), num, delivery_fee=fee)
+    note = f" (+{fee} AED delivery)" if fee else ""
+    await _reply(update, context, f"✅ Order #{num} confirmed{note}. Stock updated, customer notified.")
 
 
 @keeper_command

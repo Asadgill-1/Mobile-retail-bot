@@ -38,7 +38,7 @@ def _serialize(p: Any) -> dict[str, Any]:
     needs them to mention "clearance" naturally — and the system prompt forbids echoing them.
     Money crosses as a string: never float (CONVENTIONS).
     """
-    return {
+    data = {
         "id": str(p.id),
         "category": p.category,
         "brand": p.brand,
@@ -50,6 +50,9 @@ def _serialize(p: Any) -> dict[str, Any]:
         "price_aed": str(p.selling_price),
         "in_stock": p.quantity,
     }
+    if getattr(p, "active_offer", None):
+        data["offer"] = p.active_offer  # shop's current promo (023); the model may mention it
+    return data
 
 
 async def _handoff_to_human(

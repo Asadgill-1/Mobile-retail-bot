@@ -96,6 +96,23 @@
 ### products.barcode  (migration 022, Stage 12f)
 - **New field:** `barcode` (nullable text) + index `(shop_id, barcode)`. Populated optionally at product creation/edit; read by the dashboard POS's camera scanner (`BarcodeDetector`) to jump straight to a cart line. No bot reads or writes it.
 
+### daily_counters + next_day_seq  (migration 023, Stage 12h)
+- **Fields:** `daily_counters(shop_id, kind ∈ {order,invoice}, day DATE, last_no)` PK `(shop_id, kind, day)`. RPC `next_day_seq(p_shop, p_kind, p_day)` = row-locked increment (same pattern as `next_invoice_number`).
+- **Purpose:** the per-shop-per-Dubai-day sequence behind the `ODR-DD-MM-NNN` / `INV-DD-MM-NNN` **display** refs. The bigint `orders.order_number` / `invoices.invoice_number` are still the real keys — the ref is rendered from `created_at` + `day_seq` (`utils/codes.py`). Resets each Dubai day.
+
+### orders (extended, migration 023, Stage 12h)
+- **New fields:** `day_seq` (int, the date-ref sequence above), `delivery_fee numeric(12,2) default 0` (home-delivery charge, set at confirm; customer sees a breakdown; folded into COD at assign), `applied_offer` (jsonb snapshot of the offer applied at confirm — carries the free-gift name so the invoice can print a 0.00 line).
+
+### invoices.day_seq  (migration 023, Stage 12h)
+- **New field:** `day_seq` (int) — same date-ref sequence for `INV-DD-MM-NNN`. `invoice_number` stays the stored monotonic per-shop key.
+
+### shops.rider_keeps_delivery  (migration 023, Stage 12h)
+- **New field:** `rider_keeps_delivery boolean default false`. On = the rider keeps the delivery fee (COD `collect` ledger row records product-only in `deliver_order`; reports show it as rider-kept). Off = all cash flows to the shop (delivery is shop income).
+
+### offers  (migration 023, Stage 12h)
+- **Key fields:** `id`, `shop_id` FK, `product_id` FK (the qualifying product), `type ∈ {free_gift, percent_off, amount_off, free_delivery, bogo, bulk}`, `gift_product_id` FK (free_gift target), `value` (percent / AED / buy-N / min-qty), `label` (customer-facing text), `active`, `created_at`. Unique partial index `(shop_id, product_id) where active` — **one active offer per product**.
+- **Purpose:** shop promotions. The AI advertises the active offer's label (`search_products` attaches it → `orchestrator._serialize` → prompt). Auto-applied at confirm (both bot + dashboard): discount → `discount_amount`, free_delivery → `delivery_fee=0`, free_gift → decrement the gift's stock + snapshot to `orders.applied_offer`. `products.quantity` stays the stock source of truth (the gift decrements through the same `decrement_stock` RPC). POS (walk-in) does not auto-apply — cashier-manual by design.
+
 ### pending_escalations
 - **Key fields:** `id`, `shop_id` FK, `phone`, `message`, `created_at`, `resolved_at`.
 - **Purpose:** Out-of-domain messages awaiting shopkeeper; freezes AI for that customer.
@@ -138,6 +155,9 @@ clients 1───* shops 1───* shopkeepers
 blacklisted_phones *──?1 shops
 dashboard_users *──1 auth.users, *──?1 shops (keeper), *──?1 clients (owner)
 products 1───* product_units
+products 1──?1 offers (one active per product) ──?1 products (gift_product_id)
+shops 1───* daily_counters (per-shop-per-day ODR/INV sequence)
+orders 1──* product_units (via order_id, online-order IMEI — migration 023)
 counter_sales 1──?1 product_units (via counter_sale_id)
 shops 1───* invoices ──1 invoice_counters (per-shop sequence)
 invoices ?──1 orders, ?──* counter_sales (via counter_sale_ids[])

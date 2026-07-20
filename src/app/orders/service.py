@@ -9,10 +9,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
+
+_DUBAI = timezone(timedelta(hours=4))  # matches reports.service; date refs reset per Dubai day
+
+
+def _next_day_seq(sb: Any, shop_id: UUID, kind: str) -> int | None:
+    """Nth order/invoice of the current Dubai day for this shop (migration 023 RPC). Best-effort:
+    a numbering hiccup must never block an order — returns None and the row just has no date ref."""
+    try:
+        day = datetime.now(_DUBAI).date().isoformat()
+        return sb.rpc(
+            "next_day_seq", {"p_shop": str(shop_id), "p_kind": kind, "p_day": day}
+        ).execute().data
+    except Exception:  # noqa: BLE001 — numbering must never break order creation
+        logger.warning("next_day_seq failed shop=%s kind=%s", shop_id, kind, exc_info=True)
+        return None
 
 from app.orders.models import ProfitLine, ProfitSummary, line_profit
 from app.products.service import get_product
@@ -111,6 +126,7 @@ async def create_order(
     }
 
     def _q() -> dict:
+        row["day_seq"] = _next_day_seq(sb, shop_id, "order")  # ODR-DD-MM-NNN display ref (023)
         created = sb.table("orders").insert(row).execute().data[0]
         sb.table("order_status_history").insert(
             {"order_id": created["id"], "status": status, "changed_by": "system"}
@@ -565,21 +581,52 @@ async def _approved_price(
     return await asyncio.to_thread(_q)
 
 
-async def confirm_order(shop: Shop, order_number: int, client: Any | None = None) -> dict:
-    """Shopkeeper accepts a draft: atomic stock decrement, mark confirmed, tell the customer."""
+async def confirm_order(
+    shop: Shop, order_number: int, client: Any | None = None,
+    *, delivery_fee: Decimal | float | str = 0,
+) -> dict:
+    """Shopkeeper accepts a draft: atomic stock decrement, mark confirmed, tell the customer.
+
+    delivery_fee (023, keyword-only) is the home-delivery charge the keeper sets at confirm time
+    (0 = free). The customer gets a price breakdown: item + delivery = total.
+    """
+    from app.utils.codes import order_ref
+
     draft = await _get_draft(shop.id, order_number, client)
     if not await _decrement_stock(shop.id, draft["product_id"], draft["quantity"], client):
         raise OutOfStock(order_number)  # sold out between draft and confirm — nothing oversold
+    fee = Decimal(str(delivery_fee or 0))
     await _set_status(draft["id"], "confirmed", "system", client)
 
-    net = Decimal(str(draft["selling_price"])) - Decimal(str(draft["discount_amount"]))
+    # Active offer (023): auto-discount / free delivery / free gift, applied here so the customer's
+    # confirmation and the eventual invoice both reflect it (same as the dashboard confirm path).
+    applied = await _apply_offer_at_confirm(shop.id, draft, fee, client)
+    eff_fee = applied["fee"]
+    eff_discount = applied["discount"]
+    # Persist only what changed — a plain confirm (no fee, no offer) writes nothing extra.
+    patch: dict = {}
+    if eff_fee > 0:
+        patch["delivery_fee"] = str(eff_fee)
+    if eff_discount != Decimal(str(draft.get("discount_amount") or 0)):
+        patch["discount_amount"] = str(eff_discount)
+    if applied["snapshot"] is not None:
+        patch["applied_offer"] = applied["snapshot"]
+    if patch:
+        await _update_order(draft["id"], patch, client)
+
+    item_net = Decimal(str(draft["selling_price"])) - eff_discount
+    total = item_net + eff_fee
     p = draft.get("products") or {}
     name = f"{p.get('brand', '')} {p.get('model', '')}".strip() or "your order"
+    ref = order_ref(draft["created_at"], draft["day_seq"]) if draft.get("day_seq") else f"#{order_number}"
     msg = (
-        f"✅ Order #{order_number} confirmed!\n"
-        f"{draft['quantity']}× {name} — {net} AED\n"
-        f"Deliver to: {draft['address']}"
-        + (f"\nDelivery: {draft['delivery_date']}" if draft.get("delivery_date") else "")
+        f"✅ Order {ref} confirmed!\n"
+        f"{draft['quantity']}× {name} — {item_net} AED"
+        + (f"\n🎁 {applied['gift_text']}" if applied["gift_text"] else "")
+        + ("\nDelivery — FREE" if applied["free_delivery"] else f"\nDelivery — {eff_fee} AED" if eff_fee > 0 else "")
+        + (f"\nTotal — {total} AED" if eff_fee > 0 or applied["free_delivery"] else "")
+        + f"\nDeliver to: {draft['address']}"
+        + (f"\nDelivery date: {draft['delivery_date']}" if draft.get("delivery_date") else "")
         + "\nThank you! 🙏"
     )
     await send_to_customer(shop, draft["phone"], msg)
@@ -669,8 +716,12 @@ async def assign_delivery(
         )
     rider = await get_rider(shop.id, rider_id, client)  # raises RiderNotFound
 
-    # COD = the net charge; custody goes to 'offered' — the rider must /accept the pickup.
-    cod = Decimal(str(order["selling_price"])) - Decimal(str(order["discount_amount"]))
+    # COD = net product charge + delivery fee (the rider collects the full amount from the
+    # customer). custody goes to 'offered' — the rider must /accept the pickup. If the shop lets
+    # riders keep delivery, that split is settled at deliver/reconcile time, not here.
+    fee = Decimal(str(order.get("delivery_fee") or 0))
+    item_net = Decimal(str(order["selling_price"])) - Decimal(str(order["discount_amount"]))
+    cod = item_net + fee
     await _set_rider(order["id"], rider_id, cod, client)
 
     notified = False
@@ -686,7 +737,8 @@ async def assign_delivery(
             + (f"\nWhen: {order['delivery_date']}" if order.get("delivery_date") else "")
             + (f"\nNote: {order['special_instructions']}" if order.get("special_instructions") else "")
             + f"\n\n💵 Collect (COD): {cod} AED"
-            f"\n📊 Cash you already hold: {outstanding} AED"
+            + (f" (incl. {fee} AED delivery)" if fee > 0 else "")
+            + f"\n📊 Cash you already hold: {outstanding} AED"
             f"\n\nTap below — or /accept {order_number} / /notreceived {order_number}"
         )
         notified = await send_to_rider(
@@ -950,6 +1002,75 @@ async def _set_rider(order_id: str, rider_id: UUID, cod: Decimal, client: Any | 
         ).eq("id", order_id).execute()
 
     await asyncio.to_thread(_q)
+
+
+async def _update_order(order_id: str, patch: dict, client: Any | None) -> None:
+    """Small generic patch (delivery_fee, applied_offer — migration 023)."""
+    sb = _sb(client)
+    await asyncio.to_thread(lambda: sb.table("orders").update(patch).eq("id", order_id).execute())
+
+
+def _offer_discount(offer: dict, unit_price: Decimal, qty: int) -> Decimal:
+    """AED off the line for a discounting offer (mirror of lib/offers.ts computeOffer). Capped at
+    the line total; free_gift/free_delivery return 0 here (handled separately)."""
+    line = unit_price * qty
+    v = Decimal(str(offer.get("value") or 0))
+    t = offer.get("type")
+    if t == "percent_off":
+        d = line * v / 100
+    elif t == "amount_off":
+        d = v
+    elif t == "bogo":
+        group = v + 1
+        d = (Decimal(qty) // group) * unit_price if group > 0 else Decimal("0")
+    elif t == "bulk":
+        d = line * Decimal("0.1") if v > 0 and qty >= v else Decimal("0")
+    else:
+        return Decimal("0")
+    return max(Decimal("0"), min(d, line))
+
+
+async def _apply_offer_at_confirm(shop_id: UUID, draft: dict, fee: Decimal, client: Any | None) -> dict:
+    """Load the product's active offer (023) and apply it at confirm: best-of discount, zeroed
+    delivery, stock-decremented free gift snapshotted for the invoice. Returns
+    {discount, fee, free_delivery, gift_text, snapshot}. Best-effort — never blocks a confirm."""
+    out = {
+        "discount": Decimal(str(draft.get("discount_amount") or 0)),
+        "fee": fee, "free_delivery": False, "gift_text": None, "snapshot": None,
+    }
+    try:
+        sb = _sb(client)
+        rows = (
+            sb.table("offers").select("*")
+            .eq("product_id", draft["product_id"]).eq("active", True).limit(1).execute().data or []
+        )
+        if not rows:
+            return out
+        offer = rows[0]
+        qty = int(draft["quantity"])
+        unit = Decimal(str(draft["selling_price"])) / qty if qty else Decimal("0")
+        snapshot: dict = {"type": offer["type"], "label": offer["label"]}
+
+        if offer["type"] == "free_gift" and offer.get("gift_product_id"):
+            if await _decrement_stock(shop_id, offer["gift_product_id"], 1, client):
+                g = await get_product(shop_id, offer["gift_product_id"], client)
+                gift_name = f"{g.brand} {g.model}".strip() or "gift"
+                out["gift_text"] = f"Free {gift_name}"
+                snapshot["gift_product_id"] = offer["gift_product_id"]
+                snapshot["gift_name"] = gift_name
+        elif offer["type"] == "free_delivery":
+            out["free_delivery"] = True
+            out["fee"] = Decimal("0")
+            snapshot["free_delivery"] = True
+        else:
+            d = _offer_discount(offer, unit, qty)
+            if d > out["discount"]:
+                out["discount"] = d
+                snapshot["discount"] = str(d)
+        out["snapshot"] = snapshot
+    except Exception:  # noqa: BLE001 — an offer must never break order confirmation
+        logger.warning("offer apply failed order=%s", draft.get("id"), exc_info=True)
+    return out
 
 
 async def _decrement_stock(shop_id: UUID, product_id: str, qty: int, client: Any | None) -> bool:

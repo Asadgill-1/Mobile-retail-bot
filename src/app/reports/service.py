@@ -210,6 +210,9 @@ _HUMAN_ACTIONS: dict[str, str] = {
     "dedit": "edited product #{0}: {1}",
     "counter_sale": "recorded a counter sale",
     "kprodadd": "added product #{0}",
+    "dash_rider_delivery": "set riders to {0} the delivery fee",
+    "dash_offer_new": "added a {0} offer on product #{1}",
+    "dash_offer_off": "removed the offer on product #{0}",
 }
 
 

@@ -32,4 +32,5 @@ class Product(BaseModel):
     is_featured: bool = False
     product_number: int | None = None  # friendly ref "PR0001" (migration 010); null until backfilled
     min_qty: int = 0  # low-stock alert threshold; 0 = alerts off (migration 010)
+    active_offer: str | None = None  # customer-facing offer label (migration 023); the AI may mention it
     created_at: datetime | None = None

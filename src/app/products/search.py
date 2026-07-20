@@ -147,4 +147,25 @@ async def search_products(
         )
         return [Product(**row) for row in (resp.data or [])]
 
-    return rank(await asyncio.to_thread(_q), requirements, limit, max_price=cap, sort=sort)
+    ranked = rank(await asyncio.to_thread(_q), requirements, limit, max_price=cap, sort=sort)
+
+    # Attach the active offer label to the shortlisted products (023) so the AI can mention it.
+    # Only the ranked few are queried, not the whole catalogue.
+    if ranked:
+        ids = [str(p.id) for p in ranked]
+
+        def _offers() -> dict[str, str]:
+            rows = (
+                sb.table("offers").select("product_id,label")
+                .in_("product_id", ids).eq("active", True).execute().data or []
+            )
+            return {r["product_id"]: r["label"] for r in rows}
+
+        try:
+            labels = await asyncio.to_thread(_offers)
+            for p in ranked:
+                p.active_offer = labels.get(str(p.id))
+        except Exception:  # noqa: BLE001 — an offer lookup must never break product search
+            pass
+
+    return ranked
