@@ -43,8 +43,16 @@ def stub_side_effects(monkeypatch) -> dict:
     async def _write_incident(shop_id, identity, attack, snapshot, client):
         return "inc-1"
 
+    # still_frozen verifies the freeze against pending_escalations (dashboard handover);
+    # routing tests only need the Redis state, so skip the DB leg here — it has its own tests.
+    from app.escalations.service import is_frozen
+
+    async def _still_frozen(redis_, shop_id, identity, client=None):
+        return await is_frozen(redis_, shop_id, identity)
+
     monkeypatch.setattr(pipeline, "answer_customer", _answer)
     monkeypatch.setattr(pipeline, "forward_to_shopkeepers", _forward)
+    monkeypatch.setattr(pipeline, "still_frozen", _still_frozen)
     monkeypatch.setattr(security, "send_to_owner", _to_owner)
     monkeypatch.setattr(security, "_write_incident", _write_incident)
     return forwarded

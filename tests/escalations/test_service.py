@@ -259,3 +259,70 @@ async def test_handover_still_resolves_through_the_shared_path(redis, wire):
     await handover(redis, shop, "p1")
     assert wire["resolved"] == [(shop.id, "p1")]
     assert await is_frozen(redis, shop.id, "p1") is False
+
+
+# --- still_frozen: DB-verified freeze check (dashboard resolves without Redis) ---
+from app.escalations.service import still_frozen  # noqa: E402
+
+
+class _FakeSb:
+    """Query chain stub for pending_escalations reads. rows=None → .table() raises (DB down)."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def table(self, _name):
+        if self._rows is None:
+            raise RuntimeError("db down")
+        return self
+
+    def select(self, *_a):
+        return self
+
+    def eq(self, *_a):
+        return self
+
+    def is_(self, *_a):
+        return self
+
+    def limit(self, *_a):
+        return self
+
+    def execute(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=self._rows)
+
+
+@pytest.mark.asyncio
+async def test_still_frozen_unfreezes_when_dashboard_resolved_the_row(redis):
+    """Redis says frozen, DB row already closed by the dashboard → lazy unfreeze, AI resumes."""
+    shop = _shop()
+    await freeze(redis, shop.id, "p1")
+
+    assert await still_frozen(redis, shop.id, "p1", client=_FakeSb([])) is False
+    assert await is_frozen(redis, shop.id, "p1") is False  # Redis key cleaned up too
+
+
+@pytest.mark.asyncio
+async def test_still_frozen_holds_while_the_escalation_is_open(redis):
+    shop = _shop()
+    await freeze(redis, shop.id, "p1")
+    assert await still_frozen(redis, shop.id, "p1", client=_FakeSb([{"id": "x"}])) is True
+    assert await is_frozen(redis, shop.id, "p1")
+
+
+@pytest.mark.asyncio
+async def test_still_frozen_not_frozen_never_touches_the_db(redis):
+    # _FakeSb(None) raises on any table() call — passing it proves the fast path skips the DB.
+    shop = _shop()
+    assert await still_frozen(redis, shop.id, "p1", client=_FakeSb(None)) is False
+
+
+@pytest.mark.asyncio
+async def test_still_frozen_db_error_keeps_the_freeze(redis):
+    """Never hand an escalated customer back to the AI because the DB check failed."""
+    shop = _shop()
+    await freeze(redis, shop.id, "p1")
+    assert await still_frozen(redis, shop.id, "p1", client=_FakeSb(None)) is True
+    assert await is_frozen(redis, shop.id, "p1")

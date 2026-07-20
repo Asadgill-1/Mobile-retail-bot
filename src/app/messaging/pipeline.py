@@ -19,7 +19,7 @@ from uuid import UUID
 
 from app.ai.orchestrator import answer_customer
 from app.escalations.context import remember
-from app.escalations.service import forward_to_shopkeepers, is_frozen
+from app.escalations.service import forward_to_shopkeepers, still_frozen
 from app.security.detectors import MAX_MESSAGE_CHARS, detect_attack
 from app.core.config import settings
 from app.security.service import bump_daily, bump_rate, is_blacklisted, is_bypassed, is_quarantined, quarantine
@@ -136,7 +136,9 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
 
     # Step 4b — AI frozen by an escalation (SPEC §3 step 4). The shopkeeper owns this
     # conversation now; the customer keeps talking to the same channel and never sees a change.
-    if await is_frozen(redis, shop.id, msg.identity):
+    # DB-verified: the dashboard resolves escalations without Redis, so a Redis "frozen" is
+    # confirmed against pending_escalations and lazily unfrozen when the row was closed there.
+    if await still_frozen(redis, shop.id, msg.identity):
         await _to_humans(redis, shop, msg, "escalation_frozen")
         return PipelineResult(None, "frozen")
 

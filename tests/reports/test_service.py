@@ -162,6 +162,22 @@ def test_format_activity_humanizes_dashboard_pos_actions():
     assert "issued invoice INV-000042" in out
 
 
+def test_format_activity_humanizes_p4_transparency_actions():
+    rows = [
+        _log("dreply", actor="dashboard:k@shop.local", detail={"args": ["p1"]}),
+        _log("dhandover", actor="dashboard:k@shop.local", detail={"args": ["p1"]}),
+        _log("dedit", actor="dashboard:k@shop.local", detail={"args": ["7", "price 1,200→1,100"]}),
+        _log("kprodadd", detail={"args": ["9"]}),
+        _log("counter_sale", detail={"text": "saved"}),
+    ]
+    out = format_activity("Shop 01", rows, {})
+    assert "replied to customer p1 from the dashboard" in out
+    assert "returned customer p1 to the AI" in out
+    assert "edited product #7: price 1,200→1,100" in out
+    assert "added product #9" in out
+    assert "recorded a counter sale" in out
+
+
 def test_format_activity_slash_and_button_read_the_same():
     button = format_activity("S", [_log("kconf", detail={"args": ["7"]})], {})
     command = format_activity("S", [_log("confirmorder_cmd", detail={"args": ["7"]})], {})

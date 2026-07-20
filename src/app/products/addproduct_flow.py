@@ -219,6 +219,17 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data.pop(_DRAFT, None)
+
+    # Owner transparency: catalogue additions show up in the activity log / dashboard Shop logs.
+    from app.audit.service import record
+
+    await record(
+        str(update.effective_user.id) if update.effective_user else "system",
+        "kprodadd",
+        shop_id=shop.id,
+        detail={"args": [product.product_number]},
+    )
+
     # brand/model are shopkeeper free-text: a name like 'Galaxy_S24' or 'Note*' would break
     # Markdown parsing (400 Bad Request → no confirmation shown). Use Telegram HTML with the
     # dynamic parts escaped so any characters render literally and the send can never 400.

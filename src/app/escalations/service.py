@@ -53,6 +53,42 @@ async def is_frozen(redis: Any, shop_id: UUID, identity: str) -> bool:
     return bool(await redis.exists(frozen_key(shop_id, identity)))
 
 
+async def still_frozen(
+    redis: Any, shop_id: UUID, identity: str, client: Any | None = None
+) -> bool:
+    """DB-verified freeze check for the pipeline (SPEC §3 step 4).
+
+    Redis is the hot-path cache; `pending_escalations` is the authority. The dashboard has no
+    Redis, so its "Return to AI" button only sets `resolved_at` — the frozen customer's next
+    message lands here, finds no open row, and unfreezes. Mirrors context.sync_relay. The DB
+    read runs only when Redis says frozen (rare), so the normal path costs nothing. On a DB
+    error the freeze stands: never hand an escalated customer back to the AI by accident.
+    """
+    if not await is_frozen(redis, shop_id, identity):
+        return False
+    try:
+        sb = _sb(client)
+
+        def _q() -> int:
+            r = (
+                sb.table("pending_escalations")
+                .select("id")
+                .eq("shop_id", str(shop_id))
+                .eq("phone", identity)
+                .is_("resolved_at", "null")
+                .limit(1)
+                .execute()
+            )
+            return len(r.data or [])
+
+        if await asyncio.to_thread(_q) == 0:
+            await unfreeze(redis, shop_id, identity)
+            return False
+    except Exception:  # noqa: BLE001 — degraded check must not break the message pipeline
+        logger.warning("still_frozen: DB check failed; keeping freeze", exc_info=True)
+    return True
+
+
 async def freeze(redis: Any, shop_id: UUID, identity: str) -> None:
     await redis.set(frozen_key(shop_id, identity), "1", ex=FREEZE_TTL_SECONDS)
 
