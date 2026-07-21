@@ -21,6 +21,10 @@ class ClientStatus(StrEnum):
 class ShopStatus(StrEnum):
     ACTIVE = "active"
     SUSPENDED = "suspended"
+    # Soft delete (migration 026): the platform owner "removes" a shop without deleting history
+    # (orders/invoices/COD reference it). Archived shops are hidden from every list and from the
+    # bot builders — the pipeline treats them like any non-active shop.
+    ARCHIVED = "archived"
 
 
 class Client(BaseModel):

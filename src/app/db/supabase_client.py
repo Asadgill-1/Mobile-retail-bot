@@ -182,8 +182,11 @@ class SupabaseTenantRepo(TenantRepo):
         return await asyncio.to_thread(_q)
 
     async def list_shops(self, client_id: UUID | None = None) -> list[Shop]:
+        """Archived shops (migration 026) are excluded everywhere this feeds — bot builders, owner
+        listings, analytics — so an offboarded shop disappears from the running system. The
+        platform-owner console reads the table directly when it needs to show archived ones."""
         def _q() -> list[Shop]:
-            q = self.sb.table("shops").select("*")
+            q = self.sb.table("shops").select("*").neq("status", "archived")
             if client_id is not None:
                 q = q.eq("client_id", str(client_id))
             r = q.execute()

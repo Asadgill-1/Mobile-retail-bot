@@ -113,6 +113,23 @@
 - **Key fields:** `id`, `shop_id` FK, `product_id` FK (the qualifying product), `type ∈ {free_gift, percent_off, amount_off, free_delivery, bogo, bulk}`, `gift_product_id` FK (free_gift target), `value` (percent / AED / buy-N / min-qty), `label` (customer-facing text), `active`, `created_at`. Unique partial index `(shop_id, product_id) where active` — **one active offer per product**.
 - **Purpose:** shop promotions. The AI advertises the active offer's label (`search_products` attaches it → `orchestrator._serialize` → prompt). Auto-applied at confirm (both bot + dashboard): discount → `discount_amount`, free_delivery → `delivery_fee=0`, free_gift → decrement the gift's stock + snapshot to `orders.applied_offer`. `products.quantity` stays the stock source of truth (the gift decrements through the same `decrement_stock` RPC). POS (walk-in) does not auto-apply — cashier-manual by design.
 
+### platform_settings  (migration 024, Stage 12i)
+- **Key fields:** `key` (PK), `value` jsonb, `updated_at`.
+- **Purpose:** runtime config owned by the platform-owner console + the backend→console status channel. Known keys: `ai_provider`, `ai_base_url`, `ai_model`, `ai_api_key` (overlaid over `.env` by `llm/llm_client.py` on a 60s TTL — a model switch reaches every bot without a restart), and `health_snapshot` (written by the 60s health beat; the console renders it and treats a stale one as "backend offline").
+- **Security:** RLS enabled with **no policies** — service-role only. The API key is stored here by owner decision and is never returned to a browser.
+
+### pipeline_events  (migration 025, Stage 12i)
+- **Key fields:** `id`, `shop_id` FK?, `identity`, `action`, `created_at`.
+- **Purpose:** every NON-`ai` pipeline outcome (suspended/blacklisted/quarantined/frozen/bypass/attack/too_long/rate_capped/locked/duplicate), so the platform owner can answer "why did this customer never get a reply?". Written fire-and-forget from `messaging/pipeline.py`; `ai` is deliberately not logged (the message archive already covers it).
+
+### redis_ops  (migration 025, Stage 12i)
+- **Key fields:** `id`, `op` (quarantine_lift|quarantine_extend|blacklist|bypass_set|bypass_remove|forward_to_shop|llm_test), `args` jsonb, `requested_by`, `created_at`, `applied_at`, `error`, `result` jsonb.
+- **Purpose:** outbox for the platform console, which runs on Vercel and cannot reach the owner's Redis. The 60s health beat drains pending rows through the real `security/service.py` functions and stamps `applied_at` (or `error`). Effect lands within a minute; the owner bot stays the instant path. Service-role only (RLS on, no policies).
+
+### delivery_persons.active / shops 'archived'  (migration 026, Stage 12i)
+- **New:** `delivery_persons.active boolean default true`; `shops.status` gains `'archived'` (`ShopStatus.ARCHIVED`).
+- **Purpose:** offboarding without deletion — orders, invoices, COD and audit rows all reference these tenants, so hard deletes are impossible. `list_shops` excludes archived shops, so an archived shop also disappears from the bot builders. Clients already had `'offboarded'` (migration 001).
+
 ### pending_escalations
 - **Key fields:** `id`, `shop_id` FK, `phone`, `message`, `created_at`, `resolved_at`.
 - **Purpose:** Out-of-domain messages awaiting shopkeeper; freezes AI for that customer.

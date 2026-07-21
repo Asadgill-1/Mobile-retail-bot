@@ -129,10 +129,18 @@ async def run_health_check(repo: Any, redis: Any, *, include_celery: bool = True
     Uses `send_to_owner` (not `escalations.alert_owner`, whose signature is shop+customer-scoped) —
     a system-wide health failure has no shop/customer. ADR-009: only the owner learns of a failure.
     """
+    from app.console.service import drain_ops, publish_snapshot
     from app.reports.health import check_health, format_health
     from app.telegram_bot.notify import send_to_owner
 
     report = await check_health(redis, repo, include_celery=include_celery)
+
+    # Platform-owner console channel (migrations 024/025): publish health where the console can
+    # read it, and execute anything it queued (quarantine/bypass/blacklist/llm-test). Both are
+    # best-effort by construction — neither can change the health verdict or raise.
+    await publish_snapshot(report, redis)
+    await drain_ops(redis)
+
     if not report.ok:
         await send_to_owner("🚨 CRITICAL — health check failed\n\n" + format_health(report))
         return "alerted"

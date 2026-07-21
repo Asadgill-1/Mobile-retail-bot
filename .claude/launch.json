@@ -29,6 +29,20 @@
         "C:/Users/HPUSER/Desktop/mobile-shop-and-shop-owner-dashboard"
       ],
       "port": 3000
+    },
+    {
+      "name": "console",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "C:/Users/HPUSER/Desktop/owner-dashboard-mobile",
+        "--",
+        "--port",
+        "3100"
+      ],
+      "port": 3100
     }
   ]
 }

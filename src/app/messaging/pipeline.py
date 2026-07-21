@@ -11,6 +11,7 @@ Stage 4 AI service). Steps 4/5 do real Redis reads — only their *setters* are 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -106,16 +107,37 @@ async def process_message(msg: InboundMessage, redis: Any) -> PipelineResult:
     if not await redis.set(lock, "1", nx=True, ex=_LOCK_TTL):
         # Another message for this session is mid-flight. Telegram: unreachable (sequential).
         # ponytail: Twilio/Celery path should `self.retry` on this action once it's live (Stage 13).
-        return PipelineResult(None, "locked")
+        return await _logged(msg, PipelineResult(None, "locked"))
     try:
         if msg.message_sid and await _is_duplicate(redis, msg.message_sid):
-            return PipelineResult(None, "duplicate")
-        return await _dispatch(msg, redis)
+            return await _logged(msg, PipelineResult(None, "duplicate"))
+        return await _logged(msg, await _dispatch(msg, redis))
     finally:
         # ponytail: plain DEL release (no owner token). ceiling: if processing outlives the 30s TTL
         # the lock can be re-acquired by another message and this DEL frees that one too.
         # upgrade: compare-and-delete with a per-hold token (Lua) if a session can run >30s.
         await redis.delete(lock)
+
+
+async def _logged(msg: InboundMessage, result: PipelineResult) -> PipelineResult:
+    """Record every NON-AI outcome in `pipeline_events` (migration 025) so the platform owner can
+    answer "why did this customer never get a reply?". `ai` is the normal path and would be a row
+    per message — the archive already has those. Fire-and-forget: this must never delay or break
+    a reply, so failures are swallowed."""
+    if result.action == "ai":
+        return result
+    try:
+        from app.db.supabase_client import get_supabase
+
+        sb = get_supabase()
+        await asyncio.to_thread(
+            lambda: sb.table("pipeline_events").insert(
+                {"shop_id": str(msg.shop.id), "identity": msg.identity, "action": result.action}
+            ).execute()
+        )
+    except Exception:  # noqa: BLE001 — observability must never cost a customer their answer
+        logger.debug("pipeline_events insert failed (action=%s)", result.action, exc_info=True)
+    return result
 
 
 async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:

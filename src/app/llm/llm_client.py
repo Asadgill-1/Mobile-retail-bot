@@ -11,8 +11,10 @@ is composed by `ai/orchestrator.py`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,18 +81,71 @@ def _to_response(raw: Any) -> LLMResponse:
     )
 
 
+# Runtime config overlay (migration 024): the platform-owner console writes ai_provider /
+# ai_base_url / ai_model / ai_api_key into `platform_settings`; env stays the fallback for any
+# key the console hasn't set. Checked at most once per TTL, off the event loop — a model switch
+# reaches every bot/worker process within ~a minute, no restart.
+_OVERLAY_KEYS = ("ai_provider", "ai_base_url", "ai_model", "ai_api_key")
+_OVERLAY_TTL_SECONDS = 60.0
+
+
 class LLMClient:
     """Thin async wrapper over an OpenAI-compatible Chat Completions API."""
 
     def __init__(self) -> None:
-        self.provider = settings.ai_provider
-        self.base_url = settings.ai_base_url
-        self.model = settings.ai_model
-        self.api_key = settings.ai_api_key
+        # env values are the floor; the console overlay may replace any of them at runtime
+        self._env = {
+            "ai_provider": settings.ai_provider,
+            "ai_base_url": settings.ai_base_url,
+            "ai_model": settings.ai_model,
+            "ai_api_key": settings.ai_api_key,
+        }
         self.temperature = settings.ai_temperature
         self.max_tokens = settings.ai_max_tokens
         self.timeout = settings.ai_request_timeout
         self._http: Any = None
+        self._overlay_at = 0.0
+        self._apply({})
+
+    def _apply(self, overlay: dict[str, str]) -> None:
+        """Effective config = overlay value if set, else env. Rebuilds the HTTP client when the
+        connection identity (base_url/api_key) changed — a model-only switch reuses it."""
+        eff = {k: (overlay.get(k) or self._env[k]) for k in _OVERLAY_KEYS}
+        if eff["ai_base_url"] != getattr(self, "base_url", None) or eff["ai_api_key"] != getattr(
+            self, "api_key", None
+        ):
+            self._http = None
+        self.provider = eff["ai_provider"]
+        self.base_url = eff["ai_base_url"]
+        self.model = eff["ai_model"]
+        self.api_key = eff["ai_api_key"]
+
+    def _read_overlay(self) -> dict[str, str]:
+        """Sync Supabase read (called via to_thread). Values are jsonb scalars."""
+        from app.db.supabase_client import get_supabase
+
+        rows = (
+            get_supabase().table("platform_settings").select("key,value")
+            .in_("key", list(_OVERLAY_KEYS)).execute().data or []
+        )
+        out: dict[str, str] = {}
+        for r in rows:
+            v = r.get("value")
+            if isinstance(v, str) and v.strip():
+                out[r["key"]] = v.strip()
+        return out
+
+    async def _sync_overlay(self) -> None:
+        """Refresh the console overlay at most once per TTL. Best-effort: a settings-table
+        outage must never stop the AI answering — we keep whatever config we already have."""
+        now = time.monotonic()
+        if now - self._overlay_at < _OVERLAY_TTL_SECONDS:
+            return
+        self._overlay_at = now  # stamp first: a failing read must not retry on every message
+        try:
+            self._apply(await asyncio.to_thread(self._read_overlay))
+        except Exception:
+            logger.warning("platform_settings overlay read failed; keeping current config", exc_info=True)
 
     @property
     def is_configured(self) -> bool:
@@ -118,6 +173,7 @@ class LLMClient:
         `model` overrides the configured chat model for this call — the vision model reads
         counter-sale sheets; everything else stays on the chat model.
         """
+        await self._sync_overlay()  # console-set provider/model land here (migration 024)
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": [_to_wire(m) for m in messages],

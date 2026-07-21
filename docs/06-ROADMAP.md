@@ -134,6 +134,14 @@
 - [x] **Gaps wave** (Stage 12h, migration 023) — date-based `ODR-DD-MM-NNN`/`INV-DD-MM-NNN` display refs (bigint keys kept); home-delivery charge at confirm with a customer breakdown + `rider_keeps_delivery` COD/report split; `offers` (6 types, stock-linked free gift, AI-advertised, auto-applied at confirm); online-order IMEI on the pick-&-pack sheet + captured at invoice (`product_units.order_id`). POS offers stay cashier-manual. Live E2E verified.
 - [ ] **P5** — polish: empty/error/loading states everywhere, AED + Dubai-TZ sweep, dark-mode contrast audit.
 
+### Stage 15 — Platform-owner console (separate repo: `owner-dashboard-mobile`) ✅ Stage 12i
+> The operator's console — a different audience from Stage 14 (that one is for shop staff/owners). Access via the `OWNER_EMAILS` allowlist, not `dashboard_users`. Schema lives in THIS repo (migrations 024–026), like every other front end.
+- [x] **Backend channel** — `platform_settings` (runtime config + a health snapshot the 60s beat publishes) and `redis_ops` (outbox the beat drains through the real security functions). No bridge, no tunnel, no public port on the owner's PC.
+- [x] **Runtime AI model switching** — provider/base-url/model/key overlaid over `.env` in `LLMClient` on a 60s TTL; Moonshot · OpenAI · OpenRouter · any OpenAI-compatible. Keys service-role-only; vision model stays env-pinned.
+- [x] **Full tenant control** — onboarding (client→shop→keeper→rider→bot tokens), pause/resume, offboard, archive, rider deactivate, and provisioning of the *shop* dashboard's logins.
+- [x] **Ops surfaces** — analytics (recharts), health, security incidents + quarantine/bypass/blacklist, `pipeline_events` ("no message silently lost"), escalations reply/handover, message archive + scoped delete, unified audit explorer.
+- [ ] Follow-ups: per-view transcript auditing (YAGNI for now), health history graph (skipped — the beat already pages the owner).
+
 ## Definition of "done" per stage
 
 A stage is done when:
