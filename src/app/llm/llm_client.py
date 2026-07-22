@@ -48,6 +48,8 @@ class LLMResponse:
     tool_calls: list[LLMToolCall] = field(default_factory=list)
     finish_reason: str = ""
     raw: Any = None
+    tokens_in: int = 0  # prompt tokens billed for this call (0 when the provider omits usage)
+    tokens_out: int = 0
 
 
 def _to_wire(m: LLMMessage) -> dict[str, Any]:
@@ -73,11 +75,14 @@ def _to_response(raw: Any) -> LLMResponse:
             logger.warning("LLM returned unparsable tool arguments: %r", tc.function.arguments)
             args = {}
         calls.append(LLMToolCall(id=tc.id, name=tc.function.name, arguments=args))
+    usage = getattr(raw, "usage", None)
     return LLMResponse(
         content=choice.message.content,
         tool_calls=calls,
         finish_reason=choice.finish_reason or "",
         raw=raw,
+        tokens_in=getattr(usage, "prompt_tokens", 0) or 0,
+        tokens_out=getattr(usage, "completion_tokens", 0) or 0,
     )
 
 

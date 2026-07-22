@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ import pytest
 import app.messaging.pipeline as pipeline
 from app.db.in_memory import InMemoryTenantRepo
 from app.messaging.pipeline import _USAGE_KEY, parse_usage_key
-from app.tasks.tasks import _run, flush_usage
+from app.tasks.tasks import _run, flush_usage, heartbeat_forever
 
 
 def _repo() -> InMemoryTenantRepo:
@@ -24,7 +25,7 @@ def _repo() -> InMemoryTenantRepo:
 def stub_ai(monkeypatch):
     """`_run` reaches pipeline step 7 → the real AI service. Mock it: no network in unit tests."""
 
-    async def _answer(shop, identity, text, redis, media_sink=None):
+    async def _answer(shop, identity, text, redis, media_sink=None, usage_sink=None):
         return "stubbed AI reply"
 
     monkeypatch.setattr(pipeline, "answer_customer", _answer)
@@ -61,7 +62,7 @@ async def _seed_repo_and_ids():
 
 
 @pytest.mark.asyncio
-async def test_flush_drains_completed_day_but_leaves_today():
+async def test_flush_drains_completed_day_and_mirrors_today_without_draining_it():
     repo, cid, sid = await _seed_repo_and_ids()
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     await redis.set(_key(cid, sid, "2026-07-09"), "5")  # yesterday — complete
@@ -69,11 +70,26 @@ async def test_flush_drains_completed_day_but_leaves_today():
 
     flushed = await flush_usage(repo, redis, today=_TODAY)
 
-    assert flushed == 1
+    assert flushed == 2
     rows = {(r.metric): r.count for r in await repo.get_usage(cid, date(2026, 7, 9))}
     assert rows == {"messages": 5}                       # yesterday persisted
     assert await redis.get(_key(cid, sid, "2026-07-09")) is None   # drained key deleted
-    assert await redis.get(_key(cid, sid, "2026-07-10")) == "3"    # today untouched
+    assert await redis.get(_key(cid, sid, "2026-07-10")) == "3"    # today's counter kept live
+    # today is mirrored into the DB so the console can show the current day at all
+    assert {r.metric: r.count for r in await repo.get_usage(cid, date(2026, 7, 10))} == {"messages": 3}
+
+
+@pytest.mark.asyncio
+async def test_flush_overwrites_today_as_it_grows():
+    """Today is upserted, not accumulated — a second pass must replace, never add."""
+    repo, cid, sid = await _seed_repo_and_ids()
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await redis.set(_key(cid, sid, "2026-07-10"), "3")
+    await flush_usage(repo, redis, today=_TODAY)
+    await redis.set(_key(cid, sid, "2026-07-10"), "8")  # three more messages arrived
+    await flush_usage(repo, redis, today=_TODAY)
+
+    assert [r.count for r in await repo.get_usage(cid, date(2026, 7, 10))] == [8]
 
 
 @pytest.mark.asyncio
@@ -105,3 +121,51 @@ def test_parse_usage_key_roundtrip_and_rejects_junk():
     assert parse_usage_key("usage:garbage") is None          # wrong field count
     assert parse_usage_key(f"usage:not-a-uuid:{sid}:2026-07-09:messages") is None
     assert parse_usage_key(f"usage:{cid}:{sid}:not-a-date:messages") is None
+
+
+# --- in-process heartbeat (replaces Celery Beat when the owner runs bots alone) ---
+@pytest.mark.asyncio
+async def test_heartbeat_runs_health_every_tick_and_flush_on_schedule(monkeypatch):
+    import app.tasks.tasks as tasks
+
+    calls: list[str] = []
+
+    async def _health():
+        calls.append("health")
+        if calls.count("health") == 3:
+            raise asyncio.CancelledError  # stop after three ticks
+        return "ok"
+
+    async def _flush():
+        calls.append("flush")
+        return 0
+
+    monkeypatch.setattr(tasks, "_health_task", _health)
+    monkeypatch.setattr(tasks, "_flush_task", _flush)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_forever(interval=0, flush_every=2)
+
+    # health every tick; flush on ticks 0 and 2 (the third tick cancels before its flush)
+    assert calls == ["health", "flush", "health", "health"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_survives_a_failing_tick(monkeypatch):
+    """A dead subsystem must not silently kill the heartbeat and take the console dark."""
+    import app.tasks.tasks as tasks
+
+    ticks = []
+
+    async def _health():
+        ticks.append(1)
+        if len(ticks) == 1:
+            raise RuntimeError("redis down")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(tasks, "_health_task", _health)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_forever(interval=0, flush_every=1000)
+
+    assert len(ticks) == 2  # it kept going after the failure

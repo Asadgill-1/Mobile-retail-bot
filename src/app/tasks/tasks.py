@@ -71,12 +71,15 @@ async def _flush_task() -> int:
 
 
 async def flush_usage(repo: Any, redis: Any, *, today: date | None = None) -> int:
-    """Testable core. Drain every `usage:*` key for a **completed** day into `usage_daily`.
+    """Testable core. Drain every `usage:*` key into `usage_daily`.
 
-    Only days strictly before `today` (UTC) are flushed. `upsert_usage` OVERWRITES the row's
-    count, and today's counter is still incrementing — draining it mid-day would lose every
-    later message. A past day is final, so its key is read-once + deleted; a re-run is a no-op
-    (idempotent). `getdel` is atomic, but a completed day gets no more writes anyway.
+    A **completed** day is final: read-once + delete (`getdel`), so a re-run is a no-op.
+
+    **Today** is still incrementing, so it is read WITHOUT deleting and upserted as a running
+    total. `upsert_usage` overwrites the row's count, so every pass simply replaces today's number
+    with the newer one and the final pass after midnight writes the true total — nothing is lost
+    or double-counted. Without this the console shows nothing for the current day, which is the
+    day an operator actually cares about.
     """
     today = today or datetime.now(timezone.utc).date()
     from app.messaging.pipeline import USAGE_KEY_PREFIX, parse_usage_key
@@ -88,9 +91,7 @@ async def flush_usage(repo: Any, redis: Any, *, today: date | None = None) -> in
             logger.warning("flush_usage: skipping malformed key %r", key)
             continue
         client_id, shop_id, day, metric = parsed
-        if day >= today:
-            continue  # still accumulating — flush tomorrow (overwrite-upsert can't double-count)
-        count = await redis.getdel(key)
+        count = await redis.get(key) if day >= today else await redis.getdel(key)
         if count is None:  # expired between scan and read
             continue
         await repo.upsert_usage(client_id, shop_id, day, metric, int(count))
@@ -145,3 +146,33 @@ async def run_health_check(repo: Any, redis: Any, *, include_celery: bool = True
         await send_to_owner("🚨 CRITICAL — health check failed\n\n" + format_health(report))
         return "alerted"
     return "ok"
+
+
+# ---------------------------------------------------------------------------
+# In-process heartbeat: the same two beat jobs, run from the bot process.
+# ---------------------------------------------------------------------------
+HEARTBEAT_SECONDS = 60
+FLUSH_EVERY_TICKS = 10  # usage lands in the console ~10 min after it happens
+
+async def heartbeat_forever(
+    *, interval: float = HEARTBEAT_SECONDS, flush_every: int = FLUSH_EVERY_TICKS
+) -> None:
+    """Run the health snapshot (and periodically the usage flush) forever, in-process.
+
+    Celery Beat owns these in a Docker deployment, but the owner runs the bots alone on a PC —
+    without this the console's health snapshot is never published (strip reads "backend offline"
+    while the bots are up) and queued console operations are never drained. Both jobs are
+    idempotent, so a Beat running alongside is harmless. Cancelled by the caller on shutdown.
+    """
+    tick = 0
+    while True:
+        try:
+            await _health_task()
+            if tick % flush_every == 0:
+                await _flush_task()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # a heartbeat must never take the bots down with it
+            logger.exception("heartbeat tick failed")
+        tick += 1
+        await asyncio.sleep(interval)

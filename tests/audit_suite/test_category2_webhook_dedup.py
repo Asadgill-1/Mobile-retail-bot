@@ -35,7 +35,7 @@ def count_llm(monkeypatch) -> dict:
     """Count LLM executions; each call is slow (yields) so the 3 requests truly overlap."""
     calls = {"n": 0}
 
-    async def _answer(shop, identity, text, redis, media_sink=None):
+    async def _answer(shop, identity, text, redis, media_sink=None, usage_sink=None):
         calls["n"] += 1
         await asyncio.sleep(0.05)  # simulate a slow LLM completion loop → provider retries fire
         return f"AI reply for {shop.name}"

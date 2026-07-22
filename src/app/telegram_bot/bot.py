@@ -2875,6 +2875,12 @@ async def _run_apps_forever(service: TenantService) -> None:
         await app.start()
     logger.info("polling started: %d bot(s)", len(apps))
 
+    # The owner runs the bots without Celery Beat, so the beat jobs ride along here: the health
+    # snapshot the console reads, plus the usage flush that bills tokens (tasks.heartbeat_forever).
+    from app.tasks.tasks import heartbeat_forever
+
+    heartbeat = asyncio.create_task(heartbeat_forever())
+
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -2887,6 +2893,7 @@ async def _run_apps_forever(service: TenantService) -> None:
     try:
         await stop.wait()
     finally:
+        heartbeat.cancel()
         for app in reversed(apps):
             try:
                 await app.stop()

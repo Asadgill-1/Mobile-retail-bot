@@ -173,7 +173,7 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
     # counter first so a flood trips even when each individual message looks innocent.
     attack = detect_attack(msg.text, msg_count_60s=await bump_rate(redis, msg.identity))
     if attack is not None:
-        await quarantine(redis, shop, msg.identity, attack)
+        await quarantine(redis, shop, msg.identity, attack, message=msg.text)
         return PipelineResult(_QUARANTINE_REPLY, "attack")
 
     # Over-length but clean (detect_attack already ruled out injection payloads above): a verbose
@@ -192,7 +192,16 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
     # Step 7 — normal AI processing (SPEC §9). Usage meter (ADR-006) + AI service (Stage 4).
     await _incr_usage(redis, shop, "messages")
     media: list = []  # the AI may choose to show product photos/video (SPEC §4 step 10)
-    reply = await answer_customer(shop, msg.identity, msg.text, redis, media_sink=media)
+    usage: dict = {}  # llm_calls + token counts, for per-shop billing (console Analytics)
+    reply = await answer_customer(
+        shop, msg.identity, msg.text, redis, media_sink=media, usage_sink=usage
+    )
+    # Metered after the answer so a slow/failed LLM never delays the reply. Tokens are what the
+    # platform owner is actually billed for; ai_calls is one per LLM round-trip, not per message.
+    for metric in ("llm_calls", "tokens_in", "tokens_out"):
+        if usage.get(metric):
+            await _incr_usage(redis, shop, "ai_calls" if metric == "llm_calls" else metric,
+                              by=usage[metric])
     return PipelineResult(reply, "ai", media=tuple(media))
 
 
@@ -217,10 +226,10 @@ def _suspended_reply(shop: Shop) -> str:
     return f"{shop.name} is temporarily unavailable. Please try again later."
 
 
-async def _incr_usage(redis: Any, shop: Shop, metric: str) -> None:
+async def _incr_usage(redis: Any, shop: Shop, metric: str, *, by: int = 1) -> None:
     """Per-client daily usage counter (ADR-006). Flushed to usage_daily by the Stage 10 beat job."""
     day = datetime.now(timezone.utc).date().isoformat()
     key = _USAGE_KEY.format(client_id=shop.client_id, shop_id=shop.id, day=day, metric=metric)
-    count = await redis.incr(key)
-    if count == 1:  # first hit today → cap lifetime so a missed flush can't leak keys forever
+    count = await redis.incrby(key, by)
+    if count == by:  # first hit today → cap lifetime so a missed flush can't leak keys forever
         await redis.expire(key, _USAGE_TTL_SECONDS)

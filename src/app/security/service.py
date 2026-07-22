@@ -91,15 +91,21 @@ def _sb(client: Any | None) -> Any:
 
 # --- quarantine + incident capture (SPEC §7) ---
 async def quarantine(
-    redis: Any, shop: Shop, identity: str, attack: AttackResult, client: Any | None = None
+    redis: Any, shop: Shop, identity: str, attack: AttackResult, client: Any | None = None,
+    *, message: str = "",
 ) -> str | None:
     """Auto-quarantine an attacker: Redis lock (1h), snapshot the last 25 msgs, alert the owner.
+
+    `message` is the triggering text itself — it is NOT in history yet (the pipeline stores
+    messages only on the AI path), so without it a first-message attack captures nothing.
 
     Returns the incident id (None if the DB write failed — quarantine + alert still happen).
     """
     await redis.set(quarantine_key(identity), attack.attack_type, ex=QUARANTINE_TTL_SECONDS)
 
     snapshot = await history(redis, shop.id, identity)  # last 25, oldest→newest (SPEC §7)
+    if message:
+        snapshot = [*snapshot, {"role": "customer", "content": message}]
     incident_id = await _write_incident(shop.id, identity, attack, snapshot, client)
 
     await send_to_owner(

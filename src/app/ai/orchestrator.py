@@ -262,7 +262,8 @@ async def _replay(redis: Any, shop: Shop, identity: str) -> list[LLMMessage]:
 
 
 async def answer_customer(
-    shop: Shop, identity: str, message: str, redis: Any, media_sink: list | None = None
+    shop: Shop, identity: str, message: str, redis: Any, media_sink: list | None = None,
+    usage_sink: dict | None = None,
 ) -> str:
     """Answer one customer message. Returns the reply text (SPEC §3). Never raises.
 
@@ -272,8 +273,19 @@ async def answer_customer(
     `media_sink`: optional list the caller passes to receive any product media the model chose to
     show ({"type": "photo"|"video", "url": ...}). The channel adapter (customer bot now, Twilio at
     Stage 13) sends it. An out-param, not the return, so every existing caller/test stays str-typed.
+
+    `usage_sink`: optional dict that accumulates `llm_calls` / `tokens_in` / `tokens_out` across
+    tool rounds (ADR-006 metering; same out-param pattern as media_sink). Partial counts on an
+    escalation or failure are correct — those calls were still billed.
     """
     llm = get_llm_client()
+
+    def _meter(resp: Any) -> Any:
+        if usage_sink is not None:
+            usage_sink["llm_calls"] = usage_sink.get("llm_calls", 0) + 1
+            usage_sink["tokens_in"] = usage_sink.get("tokens_in", 0) + resp.tokens_in
+            usage_sink["tokens_out"] = usage_sink.get("tokens_out", 0) + resp.tokens_out
+        return resp
     # Load history BEFORE recording this turn, or the current message appears twice.
     messages = [LLMMessage(role="system", content=system_prompt(shop.name))]
     reference = await _id_reference(shop)  # real product ids survive across turns (see _id_reference)
@@ -290,7 +302,7 @@ async def answer_customer(
         logger.exception("could not record customer turn shop=%s identity=%s", shop.id, identity)
 
     try:
-        resp = await llm.chat(messages, tools=TOOLS)
+        resp = _meter(await llm.chat(messages, tools=TOOLS))
 
         media = media_sink if media_sink is not None else []
         # Bounded tool rounds: the model may need to search, THEN show that product's media, THEN
@@ -330,7 +342,7 @@ async def answer_customer(
                 messages.append(
                     LLMMessage(role="tool", content=content, tool_call_id=call.id, name=call.name)
                 )
-            resp = await llm.chat(messages, tools=TOOLS)
+            resp = _meter(await llm.chat(messages, tools=TOOLS))
 
         if not resp.content:
             # The model produced no text. That is an anomaly, not an answer — hand it to a person.

@@ -30,7 +30,9 @@ def stub_side_effects(monkeypatch) -> dict:
 
     forwarded: dict[str, list] = {"to_humans": [], "owner": []}
 
-    async def _answer(shop, identity, text, redis, media_sink=None):
+    async def _answer(shop, identity, text, redis, media_sink=None, usage_sink=None):
+        if usage_sink is not None:  # what a real 2-round answer would bill (ADR-006)
+            usage_sink.update({"llm_calls": 2, "tokens_in": 900, "tokens_out": 120})
         return f"AI reply for {shop.name}"
 
     async def _forward(shop, identity, text):
@@ -65,9 +67,17 @@ async def test_active_shop_gets_ai_reply_and_meters_usage(redis):
     assert res.action == "ai"
     assert shop.name in res.reply
     day = datetime.now(timezone.utc).date().isoformat()
-    key = _USAGE_KEY.format(client_id=shop.client_id, shop_id=shop.id, day=day, metric="messages")
-    assert await redis.get(key) == "1"
-    assert await redis.ttl(key) > 0  # first hit set an expiry (no unbounded leak)
+
+    def _key(metric: str) -> str:
+        return _USAGE_KEY.format(client_id=shop.client_id, shop_id=shop.id, day=day, metric=metric)
+
+    assert await redis.get(_key("messages")) == "1"
+    assert await redis.ttl(_key("messages")) > 0  # first hit set an expiry (no unbounded leak)
+    # Tokens are what the platform owner is billed for — one message can cost several LLM rounds.
+    assert await redis.get(_key("ai_calls")) == "2"
+    assert await redis.get(_key("tokens_in")) == "900"
+    assert await redis.get(_key("tokens_out")) == "120"
+    assert await redis.ttl(_key("tokens_in")) > 0  # a bulk incrby must arm the TTL too
 
 
 @pytest.mark.asyncio
