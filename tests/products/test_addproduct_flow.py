@@ -81,7 +81,7 @@ async def test_button_entry_answers_callback_and_starts_flow():
     state = await flow.start(u, ctx)
     assert state == flow.CATEGORY
     assert u.callback_query.answered is True  # otherwise Telegram spins the button forever
-    assert "1/12 Category?" in u.message.replies[0]
+    assert "1/13 Category?" in u.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -89,7 +89,7 @@ async def test_command_entry_still_works():
     ctx = _Ctx()
     u = _Update("/addproduct")
     assert await flow.start(u, ctx) == flow.CATEGORY
-    assert "1/12 Category?" in u.message.replies[0]
+    assert "1/13 Category?" in u.message.replies[0]
 
 
 def test_handler_has_both_entry_points():
@@ -107,7 +107,51 @@ def test_summary_shows_the_alert_threshold():
         "quantity": 5, "min_qty": 2, "images": [], "video": None,
     }
     out = flow._summary(draft)
-    assert "12/12 Confirm" in out and "Low-stock alert: 2" in out
+    assert "12/13 Confirm" in out and "Low-stock alert: 2" in out
 
     draft["min_qty"] = 0
     assert "Low-stock alert: off" in flow._summary(draft)  # 0 reads as off, not "0"
+
+
+# --- optional bargaining floor (migration 027) ---
+def _priced_ctx(cost="1000", sell="1500"):
+    ctx = _Ctx()
+    ctx.user_data[flow._DRAFT] = {
+        "specs": {}, "images": [], "video": None,
+        "cost_price": Decimal(cost), "selling_price": Decimal(sell),
+    }
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_min_price_can_be_skipped():
+    ctx = _priced_ctx()
+    u = _Update("-")
+    assert await flow.min_price(u, ctx) == flow.QUANTITY
+    assert ctx.user_data[flow._DRAFT]["min_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_min_price_stores_a_valid_floor():
+    ctx = _priced_ctx()
+    u = _Update("1200")
+    assert await flow.min_price(u, ctx) == flow.QUANTITY
+    assert ctx.user_data[flow._DRAFT]["min_price"] == Decimal("1200")
+
+
+@pytest.mark.asyncio
+async def test_min_price_below_cost_is_refused_not_silently_clamped():
+    """The engine clamps at cost anyway; the shopkeeper still needs to see the mistake."""
+    ctx = _priced_ctx(cost="1000")
+    u = _Update("800")
+    assert await flow.min_price(u, ctx) is None  # stays on this step
+    assert "below your cost" in u.message.replies[0]
+    assert "min_price" not in ctx.user_data[flow._DRAFT]
+
+
+@pytest.mark.asyncio
+async def test_min_price_above_list_is_refused():
+    ctx = _priced_ctx(sell="1500")
+    u = _Update("1600")
+    assert await flow.min_price(u, ctx) is None
+    assert "above your selling price" in u.message.replies[0]

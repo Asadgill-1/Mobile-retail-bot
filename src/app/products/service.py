@@ -40,6 +40,12 @@ VALID_TAGS: frozenset[str] = frozenset(
     }
 )
 
+# Tags that describe the SHOP's economics, not the product. They rank (server-side, in
+# products/search.py) but must never reach the model: there is no honest customer-facing phrasing
+# for "high_margin", and the prompt simultaneously asks the model to colour its wording with tags.
+# Filtered in ai/orchestrator._serialize — a code guarantee instead of a prompt promise.
+INTERNAL_TAGS: frozenset[str] = frozenset({"high_margin"})
+
 MIN_BOOST, MAX_BOOST = 1, 10
 
 
@@ -158,6 +164,7 @@ async def create_product(
     selling_price: Decimal,
     quantity: int,
     min_qty: int = 0,
+    min_price: Decimal | None = None,
     images: list[str] | None = None,
     video_url: str | None = None,
     client: Any | None = None,
@@ -177,6 +184,7 @@ async def create_product(
         "selling_price": str(selling_price),
         "quantity": quantity,
         "min_qty": min_qty,
+        "min_price": str(min_price) if min_price is not None else None,
         "images": images or [],
         "video_url": video_url,
     }

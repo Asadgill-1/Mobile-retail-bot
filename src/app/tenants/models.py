@@ -7,6 +7,7 @@ DB columns in migrations/001_init.sql.
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
@@ -49,6 +50,15 @@ class Shop(BaseModel):
     status: ShopStatus = ShopStatus.ACTIVE
     suspension_reason: str | None = None
     negotiation_enabled: bool = True  # ADR-010 rev.: shop lets the AI raise price requests (else no discounts)
+    # Persona (migration 027). All optional: unset = speak as the shop, exactly as before.
+    # `assistant_gender` is grammatical, not cosmetic — Hindi/Urdu/Arabic conjugate verbs by the
+    # speaker's gender, and most of this customer base writes in romanized Hindi/Urdu.
+    assistant_name: str | None = None
+    assistant_gender: str | None = None  # 'female' | 'male'
+    assistant_style: str | None = None  # shop-written vibe note; UNTRUSTED — see llm/prompts.py
+    # Bargaining authority (migration 027). Default keeps today's behaviour: ask the shop every time.
+    haggle_ask_every_time: bool = True
+    ai_max_discount_pct: Decimal = Decimal("0")
     # ADR-005: per-shop Telegram bots. keeper = shopkeeper-side staff bot;
     # customer = customer-facing bot (the "WhatsApp" channel in Telegram-first testing).
     # Persisted on live shops rows (migrations/001_init.sql) and mapped by

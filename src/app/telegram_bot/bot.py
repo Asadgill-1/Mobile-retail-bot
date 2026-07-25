@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -1826,21 +1827,40 @@ def build_shopkeeper_application(service: TenantService, shop: Shop) -> Applicat
 
 # --- application factory: per-shop CUSTOMER bot (ADR-005; = "WhatsApp" channel in testing) ---
 async def _customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Customer inbound → SPEC §9 pipeline (Stage 3). WhatsApp mocked; this is the test channel (ADR-002)."""
+    """Customer inbound → SPEC §9 pipeline (Stage 3), paced like a person (Stage 12k).
+
+    The handler no longer answers directly: it hands the text to the shop's `Pacer`, which waits
+    for the customer to finish typing, answers the whole thought once, and types the reply out in
+    short messages. See telegram_bot/pacing.py for the interruption rules.
+    """
     from app.db.redis_client import get_redis
     from app.messaging.pipeline import InboundMessage, process_message
 
     shop: Shop = context.application.bot_data["shop"]
+    pacer = context.application.bot_data["pacer"]
     user = update.effective_user
     # Customer identity: Telegram user id in testing, phone in prod — same field (SPEC §1, ADR-005).
     identity = str(user.id) if user else str(update.effective_chat.id)
-    msg = InboundMessage(shop=shop, identity=identity, text=update.message.text or "")
-    result = await process_message(msg, get_redis())
-    logger.info("customer msg shop=%s identity=%s action=%s media=%d",
-                shop.id, identity, result.action, len(result.media))
-    if result.reply is not None:
-        await _reply(update, context, result.reply)
-    await _send_media(update, context, result.media)
+    chat_id = update.effective_chat.id
+
+    async def _answer(text: str):
+        msg = InboundMessage(shop=shop, identity=identity, text=text)
+        result = await process_message(msg, get_redis())
+        logger.info("customer msg shop=%s identity=%s action=%s media=%d",
+                    shop.id, identity, result.action, len(result.media))
+        await _send_media(update, context, result.media)
+        return result
+
+    async def _send(text: str) -> None:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+    async def _typing() -> None:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    pacer.submit(
+        shop.id, identity, update.message.text or "",
+        answer=_answer, send=_send, typing=_typing,
+    )
 
 
 async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media: tuple) -> None:
@@ -1859,11 +1879,24 @@ async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media:
 
 def build_customer_application(service: TenantService, shop: Shop) -> Application:
     """Per-shop customer bot: customer-facing channel (Telegram-first testing)."""
+    from app.telegram_bot.pacing import Pacer
+
     if not shop.telegram_customer_bot_token:
         raise RuntimeError(f"shop {shop.id} has no telegram_customer_bot_token")
-    app = ApplicationBuilder().token(shop.telegram_customer_bot_token).build()
+    # concurrent_updates: REQUIRED by the pacer (Stage 12k). PTB otherwise runs a bot's updates
+    # strictly one at a time, so one customer's typing pause would block every other customer of
+    # this shop — at peak that is the whole shop stalled behind one conversation. Per-customer
+    # serialization is still guaranteed: one pacer worker per conversation, plus the pipeline's
+    # own Redis session lock.
+    app = (
+        ApplicationBuilder()
+        .token(shop.telegram_customer_bot_token)
+        .concurrent_updates(True)
+        .build()
+    )
     app.bot_data["tenant_service"] = service
     app.bot_data["shop"] = shop
+    app.bot_data["pacer"] = Pacer()
     app.add_handler(MessageHandler(filters.ALL, _log_inbound), group=-1)
     app.add_handler(CommandHandler("start", _customer_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _customer_message))

@@ -60,6 +60,12 @@ def _row_to_shop(row: dict) -> Shop:
         status=ShopStatus(row.get("status", "active")),
         suspension_reason=row.get("suspension_reason"),
         negotiation_enabled=row.get("negotiation_enabled", True),
+        # Persona + bargaining authority (migration 027).
+        assistant_name=row.get("assistant_name"),
+        assistant_gender=row.get("assistant_gender"),
+        assistant_style=row.get("assistant_style"),
+        haggle_ask_every_time=row.get("haggle_ask_every_time", True),
+        ai_max_discount_pct=row.get("ai_max_discount_pct") or 0,
         # ADR-005 per-shop bot tokens (persisted on the live shops rows).
         telegram_keeper_bot_token=row.get("telegram_keeper_bot_token"),
         telegram_customer_bot_token=row.get("telegram_customer_bot_token"),

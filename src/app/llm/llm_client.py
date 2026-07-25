@@ -110,6 +110,8 @@ class LLMClient:
         self.timeout = settings.ai_request_timeout
         self._http: Any = None
         self._overlay_at = 0.0
+        self._sem: asyncio.Semaphore | None = None
+        self._sem_loop: Any = None
         self._apply({})
 
     def _apply(self, overlay: dict[str, str]) -> None:
@@ -191,11 +193,24 @@ class LLMClient:
             payload["tool_choice"] = tool_choice
 
         client = self._client()
-        try:
-            return _to_response(await client.chat.completions.create(**payload))
-        except Exception:
-            logger.warning("LLM call failed; retrying once (SPEC §11)", exc_info=True)
-            return _to_response(await client.chat.completions.create(**payload))
+        # 30 shops at peak means hundreds of customers in flight at once (and the pacer lets a
+        # bot run them concurrently). Uncapped, that becomes a burst of provider 429s that the
+        # single retry below cannot absorb. Queue instead: a customer waiting an extra moment is
+        # invisible; a rate-limit failure hands them to a human for nothing.
+        async with self._gate():
+            try:
+                return _to_response(await client.chat.completions.create(**payload))
+            except Exception:
+                logger.warning("LLM call failed; retrying once (SPEC §11)", exc_info=True)
+                return _to_response(await client.chat.completions.create(**payload))
+
+    def _gate(self) -> asyncio.Semaphore:
+        """Lazily built so the semaphore binds to the running loop, not import time (the bots,
+        Celery tasks and tests each run their own)."""
+        if self._sem is None or self._sem_loop is not asyncio.get_running_loop():
+            self._sem = asyncio.Semaphore(max(1, settings.ai_max_concurrency))
+            self._sem_loop = asyncio.get_running_loop()
+        return self._sem
 
 
 _client: LLMClient | None = None

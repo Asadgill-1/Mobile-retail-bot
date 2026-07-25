@@ -1,4 +1,4 @@
-"""`/addproduct` — the 12-step conversational flow (SPEC §4).
+"""`/addproduct` — the 13-step conversational flow (SPEC §4).
 
 Built on PTB's `ConversationHandler` (native state machine — nothing hand-rolled here).
 Runs on the per-shop keeper bot, so `bot_data["shop"]` scopes every write; the shopkeeper
@@ -43,11 +43,12 @@ from app.products.service import (
 
 logger = logging.getLogger(__name__)
 
-# SPEC §4 steps 1-12 (MINQTY added with migration 010's low-stock alerts)
+# SPEC §4 steps 1-13 (MINQTY added with migration 010's low-stock alerts;
+# MINPRICE with migration 027's AI bargaining floor)
 (
     CATEGORY, BRAND, MODEL, COLOR, CONDITION, SPECS,
-    COST, SELLING, QUANTITY, MINQTY, MEDIA, CONFIRM,
-) = range(12)
+    COST, SELLING, MINPRICE, QUANTITY, MINQTY, MEDIA, CONFIRM,
+) = range(13)
 
 _DRAFT = "addproduct_draft"
 
@@ -63,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop(_DRAFT, None)
     _draft(context)
     await update.effective_message.reply_text(
-        "🆕 New product.\n\n1/12 Category? " + " / ".join(VALID_CATEGORIES) + "\n(/cancel to abort)"
+        "🆕 New product.\n\n1/13 Category? " + " / ".join(VALID_CATEGORIES) + "\n(/cancel to abort)"
     )
     return CATEGORY
 
@@ -84,28 +85,28 @@ def _step(field: str, parse, prompt: str, next_state: int):
 
 
 _SPECS_PROMPT = (
-    "6/12 Specs — one `key: value` per line, e.g. `camera: 108MP`.\n"
+    "6/13 Specs — one `key: value` per line, e.g. `camera: 108MP`.\n"
     "Send them one message at a time. /done when finished."
 )
 _MINQTY_PROMPT = (
-    "10/12 Alert me when stock drops to? (0 = never alert)\n"
+    "10/13 Alert me when stock drops to? (0 = never alert)\n"
     "You and the shop owner get a message the moment stock hits this number."
 )
 _MEDIA_PROMPT = (
-    f"11/12 Send up to {MAX_IMAGES} images, and optionally one video.\n"
+    f"11/13 Send up to {MAX_IMAGES} images, and optionally one video.\n"
     "/skip or /done when finished."
 )
 
-category = _step("category", parse_category, "2/12 Brand?", BRAND)
-brand = _step("brand", lambda t: parse_non_empty(t, "brand"), "3/12 Model?", MODEL)
-model = _step("model", lambda t: parse_non_empty(t, "model"), "4/12 Color? (or `-`)", COLOR)
+category = _step("category", parse_category, "2/13 Brand?", BRAND)
+brand = _step("brand", lambda t: parse_non_empty(t, "brand"), "3/13 Model?", MODEL)
+model = _step("model", lambda t: parse_non_empty(t, "model"), "4/13 Color? (or `-`)", COLOR)
 condition = _step("condition", parse_condition, _SPECS_PROMPT, SPECS)
 
 
 async def color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.message.text or "").strip()
     _draft(context)["color"] = None if raw == "-" else raw  # `-` means "no colour"
-    await update.message.reply_text("5/12 Condition? " + " / ".join(VALID_CONDITIONS))
+    await update.message.reply_text("5/13 Condition? " + " / ".join(VALID_CONDITIONS))
     return CONDITION
 
 
@@ -125,14 +126,53 @@ async def specs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def specs_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("7/12 Cost price (AED)?")
+    await update.message.reply_text("7/13 Cost price (AED)?")
     return COST
 
 
-cost = _step("cost_price", parse_price, "8/12 Selling price (AED)?", SELLING)
-selling = _step("selling_price", parse_price, "9/12 Quantity?", QUANTITY)
+_MINPRICE_PROMPT = (
+    "9/13 Lowest price you'd ever accept for this one? (or `-` to skip)\n"
+    "Only used when you let the assistant bargain on its own — it will never go below this."
+)
+
+cost = _step("cost_price", parse_price, "8/13 Selling price (AED)?", SELLING)
+selling = _step("selling_price", parse_price, _MINPRICE_PROMPT, MINPRICE)
 quantity = _step("quantity", parse_quantity, _MINQTY_PROMPT, MINQTY)
 min_qty = _step("min_qty", parse_quantity, _MEDIA_PROMPT, MEDIA)
+
+
+async def min_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Optional bargaining floor (migration 027). `-` skips it.
+
+    Rejected below cost or above the selling price: a floor under cost would be a loss the
+    shopkeeper didn't mean to authorise, and one above list is not a floor at all. The engine
+    clamps at cost regardless — this is here so the shopkeeper sees the mistake, not silence.
+    """
+    draft = _draft(context)
+    raw = (update.message.text or "").strip()
+    if raw == "-":
+        draft["min_price"] = None
+    else:
+        try:
+            price = parse_price(raw)
+        except InvalidProductField as e:
+            await update.message.reply_text(f"⚠️ {e}\nTry again, or `-` to skip.")
+            return None
+        if price < draft["cost_price"]:
+            await update.message.reply_text(
+                f"⚠️ That's below your cost of {draft['cost_price']} AED — you'd lose money.\n"
+                "Send a higher number, or `-` to skip."
+            )
+            return None
+        if price > draft["selling_price"]:
+            await update.message.reply_text(
+                f"⚠️ That's above your selling price of {draft['selling_price']} AED.\n"
+                "Send a lower number, or `-` to skip."
+            )
+            return None
+        draft["min_price"] = price
+    await update.message.reply_text("10/13 Quantity?")
+    return QUANTITY
 
 
 async def media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -163,13 +203,15 @@ def _summary(draft: dict) -> str:
     specs_txt = "\n".join(f"  {k}: {v}" for k, v in draft["specs"].items()) or "  (none)"
     profit = draft["selling_price"] - draft["cost_price"]
     alert = draft.get("min_qty") or 0
+    floor = draft.get("min_price")
     return (
-        f"12/12 Confirm:\n\n"
+        f"12/13 Confirm:\n\n"
         f"{draft['category']} · {draft['brand']} {draft['model']}\n"
         f"Color: {draft.get('color') or '—'} · Condition: {draft['condition']}\n"
         f"Specs:\n{specs_txt}\n"
         f"Cost: {draft['cost_price']} AED · Selling: {draft['selling_price']} AED "
         f"(margin {profit} AED)\n"
+        f"Lowest accepted: {f'{floor} AED' if floor else 'not set'}\n"
         f"Qty: {draft['quantity']} · Low-stock alert: {alert or 'off'} · "
         f"Images: {len(draft['images'])} · Video: {'yes' if draft['video'] else 'no'}\n\n"
         f"/save to store it, /cancel to discard."
@@ -210,6 +252,7 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             selling_price=draft["selling_price"],
             quantity=draft["quantity"],
             min_qty=draft.get("min_qty") or 0,
+            min_price=draft.get("min_price"),
             images=image_paths,
             video_url=video_path,
         )
@@ -285,6 +328,7 @@ def _build(text) -> ConversationHandler:
             SPECS: [CommandHandler("done", specs_done), MessageHandler(text, specs)],
             COST: [MessageHandler(text, cost)],
             SELLING: [MessageHandler(text, selling)],
+            MINPRICE: [MessageHandler(text, min_price)],
             QUANTITY: [MessageHandler(text, quantity)],
             MINQTY: [MessageHandler(text, min_qty)],
             MEDIA: [

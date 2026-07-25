@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +30,7 @@ def _next_day_seq(sb: Any, shop_id: UUID, kind: str) -> int | None:
         return None
 
 from app.orders.models import ProfitLine, ProfitSummary, line_profit
+from app.products.models import Product
 from app.products.service import get_product
 from app.telegram_bot.notify import send_to_customer, send_to_shopkeepers
 from app.tenants.models import Shop
@@ -392,28 +393,73 @@ class NoPriceRequest(Exception):
     """`/approveprice` / `/denyprice` / `/custom` for a request this shop has no pending one of."""
 
 
+def bargain_floor(product: Product, max_discount_pct: Decimal) -> Decimal:
+    """Lowest price the AI may settle at ON ITS OWN. Pure — the whole policy lives here.
+
+    An explicit per-product `min_price` beats the shop-wide percentage: a shop that typed a
+    minimum on this product meant that number, whether it is tighter or looser than the default.
+    `cost_price` is an absolute clamp — no combination of settings can sell below cost.
+
+    Rounded UP to whole dirhams: shops quote whole numbers, and up is the protective direction
+    for a floor (rounding down would authorise a price below the one the shop configured).
+    """
+    if product.min_price is not None:
+        floor = product.min_price
+    else:
+        pct = Decimal(str(max_discount_pct or 0))
+        floor = product.selling_price * (Decimal("1") - pct / Decimal("100"))
+    return max(floor, product.cost_price).quantize(Decimal("1"), rounding=ROUND_UP)
+
+
 async def request_price(
     shop: Shop, identity: str, product_id: UUID, requested_price: Decimal, client: Any | None = None
 ) -> dict:
-    """Customer haggled. Raise a price request for the shop to decide — never quote a discount here.
+    """Customer haggled. Either settle it within the shop's granted authority, or ask the shop.
+
+    Two modes, chosen by the shop (migration 027, read fresh — see `_haggle_settings`):
+    - `haggle_ask_every_time` (default): unchanged behaviour — every haggle goes to a shopkeeper.
+    - off: the AI may settle once per customer+product, at the requested price if it clears
+      `bargain_floor`, otherwise AT the floor (a counter-offer). Anything the customer wants
+      BELOW what we already granted goes to a human — "I already gave you my best, let me ask my
+      manager" — which is both the honest answer and the natural close.
 
     Idempotent so the model can't flood duplicates (it re-asked and made #3/#4 in testing):
-    - already an APPROVED price for this customer+product → tell the model to just place the order;
+    - already an APPROVED price this customer can't beat → tell the model to just place the order;
     - already a PENDING request → say it's still with the shop, don't open a second one.
     """
-    # Read the toggle FRESH, not from the (startup-snapshot) shop object: a shop that just turned
-    # negotiation off must be respected on the very next haggle. "When off, do not give a discount."
-    if not await _negotiation_on(shop.id, client):
+    # Read settings FRESH, not from the (startup-snapshot) shop object: a shop that just changed
+    # them must be respected on the very next haggle. "When off, do not give a discount."
+    enabled, ask_every_time, max_pct = await _haggle_settings(shop.id, client)
+    if not enabled:
         return {"error": "negotiation_off"}  # shop opted out → the AI must hold at list price
     product = await get_product(shop.id, product_id, client)  # tenant guard + list/cost for the notice
     if requested_price <= 0:  # a haggle for 0 or negative is not a real offer (guard bad LLM args)
         return {"error": "bad_price"}
 
+    # A held-back offer (027) is revealed HERE and nowhere else: the customer has demonstrably
+    # started bargaining by the time this runs. Handing it to the model with the product listing
+    # instead just meant it spent the card in its opening line.
+    sweetener = await _haggle_offer(shop.id, product.id, client)
+
     approved = await _approved_price(shop.id, identity, product.id, client)
-    if approved is not None:  # shop already said yes — steer the model to book, not re-ask
-        return {"status": "already_approved", "price_aed": str(approved)}
+    if approved is not None and requested_price >= approved:
+        # We already beat what they're asking for — book it, don't re-ask.
+        return _with(sweetener, {"status": "already_approved", "price_aed": str(approved)})
+
+    # The AI's own authority: usable once per customer+product, and never when the customer is
+    # pushing below a price we already granted (that's the shopkeeper's call).
+    if approved is None and not ask_every_time:
+        floor = bargain_floor(product, max_pct)
+        settled = requested_price if requested_price >= floor else floor
+        await _grant_price(shop, identity, product, settled, client)
+        return _with(sweetener, {
+            "status": "approved" if requested_price >= floor else "counter",
+            "price_aed": str(settled),
+        })
+
     if await _pending_price_request(shop.id, identity, product.id, client) is not None:
-        return {"status": "asked_shop"}  # one open request per customer+product — no duplicate
+        # one open request per customer+product — no duplicate
+        return _with(sweetener, {"status": "asked_shop"})
 
     row = await _open_price_request(shop.id, identity, product.id, requested_price, client)
     num = row["request_number"]
@@ -431,7 +477,7 @@ async def request_price(
         f"/ /denyprice {num}",
         keeper_price_actions(num),
     )
-    return {"status": "asked_shop"}
+    return _with(sweetener, {"status": "asked_shop"})
 
 
 async def approve_price(
@@ -504,17 +550,88 @@ async def set_negotiation(shop_id: UUID, enabled: bool, client: Any | None = Non
     await asyncio.to_thread(_q)
 
 
-async def _negotiation_on(shop_id: UUID, client: Any | None) -> bool:
+def _with(sweetener: str | None, result: dict) -> dict:
+    """Attach the held-back freebie, if the shop has one for this product."""
+    if sweetener:
+        result["sweetener"] = sweetener
+    return result
+
+
+async def _haggle_offer(shop_id: UUID, product_id: UUID, client: Any | None) -> str | None:
+    """The `on_haggle` offer label for this product, if any (migration 027)."""
     sb = _sb(client)
 
-    def _q() -> bool:
+    def _q() -> str | None:
         rows = (
-            sb.table("shops").select("negotiation_enabled").eq("id", str(shop_id)).limit(1).execute().data
+            sb.table("offers").select("label")
+            .eq("shop_id", str(shop_id)).eq("product_id", str(product_id))
+            .eq("active", True).eq("reveal", "on_haggle").limit(1).execute().data or []
+        )
+        return rows[0]["label"] if rows else None
+
+    try:
+        return await asyncio.to_thread(_q)
+    except Exception:  # noqa: BLE001 — a missing sweetener must never break a price request
+        logger.warning("haggle offer lookup failed shop=%s product=%s", shop_id, product_id)
+        return None
+
+
+async def _haggle_settings(shop_id: UUID, client: Any | None) -> tuple[bool, bool, Decimal]:
+    """(negotiation_enabled, haggle_ask_every_time, ai_max_discount_pct), read live (migration 027).
+
+    Defaults on a missing row are the SAFE ones: negotiation on, ask the shop every time, no
+    autonomous discount. A settings read that finds nothing must never hand the AI authority.
+    """
+    sb = _sb(client)
+
+    def _q() -> tuple[bool, bool, Decimal]:
+        rows = (
+            sb.table("shops")
+            .select("negotiation_enabled,haggle_ask_every_time,ai_max_discount_pct")
+            .eq("id", str(shop_id)).limit(1).execute().data
             or []
         )
-        return bool(rows[0]["negotiation_enabled"]) if rows else True
+        if not rows:
+            return True, True, Decimal("0")
+        r = rows[0]
+        return (
+            bool(r.get("negotiation_enabled", True)),
+            bool(r.get("haggle_ask_every_time", True)),
+            Decimal(str(r.get("ai_max_discount_pct") or 0)),
+        )
 
     return await asyncio.to_thread(_q)
+
+
+async def _grant_price(
+    shop: Shop, identity: str, product: Product, price: Decimal, client: Any | None
+) -> None:
+    """Record a price the AI settled on its own, and tell the shop after the fact.
+
+    The row is what makes the number real: `draft_order` reads `_approved_price`, so this is the
+    ONLY way an AI-negotiated price reaches an order. A number the model merely says in chat has
+    no effect — which is why no amount of customer pressure can move the actual charge.
+    """
+    sb = _sb(client)
+
+    def _q() -> None:
+        sb.table("price_requests").insert(
+            {
+                "shop_id": str(shop.id), "phone": identity, "product_id": str(product.id),
+                "requested_price": str(price), "approved_price": str(price), "status": "approved",
+            }
+        ).execute()
+
+    await asyncio.to_thread(_q)
+    # FYI, not a question — the shop delegated this decision, so it must not need an answer.
+    await _notify_shop(
+        shop,
+        f"🤝 Auto-settled within your limit\n"
+        f"{identity} — {product.brand} {product.model}\n"
+        f"Price: {price} AED  ·  List: {product.selling_price} AED\n"
+        f"Margin: {price - product.cost_price} AED\n\n"
+        f"Turn this off any time with 'Ask me before every discount' in Settings.",
+    )
 
 
 async def _open_price_request(

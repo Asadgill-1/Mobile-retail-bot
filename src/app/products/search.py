@@ -149,22 +149,23 @@ async def search_products(
 
     ranked = rank(await asyncio.to_thread(_q), requirements, limit, max_price=cap, sort=sort)
 
-    # Attach the active offer label to the shortlisted products (023) so the AI can mention it.
-    # Only the ranked few are queried, not the whole catalogue.
+    # Attach offer labels to the shortlisted products (023/027) so the AI can use them.
+    # Two kinds: 'always' is advertised on sight; 'on_haggle' is held back as a bargaining chip
+    # and is only spent once the customer pushes on price. Only the ranked few are queried.
     if ranked:
         ids = [str(p.id) for p in ranked]
 
-        def _offers() -> dict[str, str]:
-            rows = (
-                sb.table("offers").select("product_id,label")
+        def _offers() -> list[dict]:
+            return (
+                sb.table("offers").select("product_id,label,reveal")
                 .in_("product_id", ids).eq("active", True).execute().data or []
             )
-            return {r["product_id"]: r["label"] for r in rows}
 
         try:
-            labels = await asyncio.to_thread(_offers)
+            rows = await asyncio.to_thread(_offers)
+            advertised = {r["product_id"]: r["label"] for r in rows if r.get("reveal") != "on_haggle"}
             for p in ranked:
-                p.active_offer = labels.get(str(p.id))
+                p.active_offer = advertised.get(str(p.id))
         except Exception:  # noqa: BLE001 — an offer lookup must never break product search
             pass
 

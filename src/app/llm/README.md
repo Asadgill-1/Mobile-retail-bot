@@ -13,7 +13,7 @@ Provider-agnostic LLM access (ADR-004). One async `LLMClient` over the OpenAI-co
 |------|------|-------|
 | `llm_client.py` | provider-agnostic client: `chat()` + tool-calling + retry-once | 4 ✅ |
 | `functions.py` | `search_products` + `escalate_to_human` tool schemas | 4 ✅ |
-| `prompts.py` | anti-hallucination + superlative + promotion + no-AI-disclosure prompt, `ESCALATION_REPLY` | 4 ✅ |
+| `prompts.py` | anti-hallucination + superlative + promotion + no-AI-disclosure prompt, **voice/persona/consultant/bargaining-ladder/no-invention blocks (12k)**, `system_prompt(shop)`, `ESCALATION_REPLY` | 4 / 12k ✅ |
 
 ## Status
 🟢 Stage 4 ✅ — `chat()` implemented via `AsyncOpenAI` pointed at `settings.ai_base_url`. **Transport retry-once lives here** (SPEC §11); the user-facing fallback message is composed by `ai/orchestrator.py`. Unparsable tool arguments degrade to `{}` rather than crash.

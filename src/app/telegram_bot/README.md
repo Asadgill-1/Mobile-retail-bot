@@ -19,7 +19,7 @@ live customer/staff/rider channel today, not a stand-in for something else.
 |-----|----------|-------|
 | Owner control | `build_application` | admin commands, cross-shop dashboards, security ops |
 | Shopkeeper (×1 per shop) | `build_shopkeeper_application` | staff commands, scoped to one shop, gated by `_keeper_auth_gate` |
-| Customer (×1 per shop) | `build_customer_application` | routes to `messaging.pipeline.process_message` |
+| Customer (×1 per shop) | `build_customer_application` | routes to `messaging.pipeline.process_message` via `pacing.Pacer`; `concurrent_updates=True` |
 | Rider (global, 1 total) | `build_rider_application` | link Telegram, work assignments — only if `TELEGRAM_RIDER_BOT_TOKEN` is set |
 
 `run_all_polling` builds owner + per-shop bots + (if configured) the rider bot, and runs them
@@ -63,3 +63,21 @@ MSC_USE_INMEMORY=1 ./scripts/run_bot.sh   # offline, InMemoryTenantRepo
 🟢 Done through Stage 12b. 6 bots polling live. See `docs/07-CURRENT-STATE.md` for the full stage
 history — this file only describes current shape, not the build order.
 Spec ref: §2, §3, §5, §6, §7, §8, §10, §12, §16.
+
+## Pacing (`pacing.py`, Stage 12k)
+The customer bot does not answer inline any more. `Pacer` runs **one worker per conversation**:
+it waits ~2.5s for the customer to finish typing, answers the whole thought in a single pipeline
+call, then types the reply out as ≤3 short messages with a typing indicator. Markdown is stripped
+in the sender because the send path uses no `parse_mode` — `**bold**` reached customers as literal
+asterisks.
+
+Interruption rules (the part that matters — customers here fire off new questions mid-answer):
+a message arriving while the worker is **waiting or typing** cancels it and joins the batch
+(nothing sent, no tokens spent); a message arriving while the **LLM call is in flight** never
+cancels it — that answer is delivered, then the worker loops and answers the follow-up. Nothing
+is ever dropped.
+
+`concurrent_updates=True` is a prerequisite, not a preference: PTB otherwise processes a bot's
+updates strictly one at a time, so a single customer's typing pause would stall every other
+customer of that shop. Per-customer serialization still holds (one worker per conversation, plus
+the pipeline's Redis session lock).

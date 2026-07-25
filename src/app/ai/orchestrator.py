@@ -35,9 +35,14 @@ def _serialize(p: Any) -> dict[str, Any]:
 
     `boost_level` is never included: ranking already applied it, and the model must not be
     able to reveal it (SPEC §5, CONVENTIONS anti-patterns). `tags` ARE included — the model
-    needs them to mention "clearance" naturally — and the system prompt forbids echoing them.
+    needs them to mention "clearance" naturally — minus INTERNAL_TAGS, which describe the shop's
+    economics rather than the product and have no honest customer-facing phrasing (027).
+    `min_price` and `cost_price` never cross: the floor is enforced server-side in
+    orders.service.bargain_floor, and a model that knows the floor will negotiate to it.
     Money crosses as a string: never float (CONVENTIONS).
     """
+    from app.products.service import INTERNAL_TAGS
+
     data = {
         "id": str(p.id),
         "category": p.category,
@@ -46,12 +51,15 @@ def _serialize(p: Any) -> dict[str, Any]:
         "color": p.color,
         "condition": p.condition,
         "specs": p.specs,
-        "tags": p.tags,
+        "tags": [t for t in p.tags if t not in INTERNAL_TAGS],
         "price_aed": str(p.selling_price),
         "in_stock": p.quantity,
     }
     if getattr(p, "active_offer", None):
         data["offer"] = p.active_offer  # shop's current promo (023); the model may mention it
+    # An `on_haggle` offer is deliberately NOT here. Telling the model "you have a freebie but
+    # don't mention it yet" does not work — in testing it spent the card in its opening reply.
+    # It is returned by `request_price` instead, so it cannot exist before bargaining starts.
     return data
 
 
@@ -287,7 +295,7 @@ async def answer_customer(
             usage_sink["tokens_out"] = usage_sink.get("tokens_out", 0) + resp.tokens_out
         return resp
     # Load history BEFORE recording this turn, or the current message appears twice.
-    messages = [LLMMessage(role="system", content=system_prompt(shop.name))]
+    messages = [LLMMessage(role="system", content=system_prompt(shop))]
     reference = await _id_reference(shop)  # real product ids survive across turns (see _id_reference)
     if reference:
         messages.append(LLMMessage(role="system", content=reference))

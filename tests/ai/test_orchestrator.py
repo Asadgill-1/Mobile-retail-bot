@@ -402,3 +402,50 @@ async def test_unknown_sort_from_the_model_falls_back_to_relevance(monkeypatch, 
     monkeypatch.setattr(orch, "search_products", _search)
     await orch.answer_customer(_shop(), "p1", "cheapest?", redis)
     assert seen["sort"] == "relevance"
+
+
+# --- what the model may and may not see about a product (SPEC §5; migrations 023/027) ---
+def test_serialize_hides_internal_tags_and_the_price_floor():
+    """`high_margin` ranks server-side but has no honest customer-facing phrasing, and a model
+    that can see the floor will negotiate straight to it."""
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from app.ai.orchestrator import _serialize
+    from app.products.models import Product
+
+    p = Product(
+        id=uuid4(), shop_id=uuid4(), category="Mobile", brand="Samsung", model="S23",
+        condition="New", cost_price=Decimal("2800"), selling_price=Decimal("3400"), quantity=3,
+        tags=["clearance", "high_margin", "best_camera"], boost_level=7,
+    )
+    p.min_price = Decimal("3000")
+
+    data = _serialize(p)
+
+    assert data["tags"] == ["clearance", "best_camera"]
+    assert "high_margin" not in str(data)
+    for leak in ("boost_level", "cost_price", "min_price"):
+        assert leak not in data, f"{leak} must never reach the model"
+
+
+def test_serialize_never_leaks_a_held_back_bargaining_offer():
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from app.ai.orchestrator import _serialize
+    from app.products.models import Product
+
+    p = Product(
+        id=uuid4(), shop_id=uuid4(), category="Mobile", brand="Apple", model="16",
+        condition="New", cost_price=Decimal("3000"), selling_price=Decimal("3400"), quantity=1,
+    )
+    p.active_offer = "Free delivery this week"
+
+    data = _serialize(p)
+
+    assert data["offer"] == "Free delivery this week"
+    # An on_haggle offer must not reach the model with the listing: given one, it spent the card
+    # in its opening reply. request_price hands it over once bargaining has actually started.
+    assert "bargaining_card" not in data
+    assert "sweetener" not in data

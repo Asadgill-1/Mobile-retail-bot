@@ -32,5 +32,8 @@ class Product(BaseModel):
     is_featured: bool = False
     product_number: int | None = None  # friendly ref "PR0001" (migration 010); null until backfilled
     min_qty: int = 0  # low-stock alert threshold; 0 = alerts off (migration 010)
+    # Hard price floor for AI bargaining (migration 027). None = no per-product floor; the shop's
+    # ai_max_discount_pct and cost_price still bound it. Never sent to the model.
+    min_price: Decimal | None = None
     active_offer: str | None = None  # customer-facing offer label (migration 023); the AI may mention it
     created_at: datetime | None = None

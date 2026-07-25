@@ -248,10 +248,20 @@ async def test_draft_order_applies_only_a_shop_approved_price(draft_wire, monkey
 @pytest.fixture
 def price_wire(monkeypatch):
     cap = {"opened": None, "notified": None, "status": None, "customer": None, "on": True,
-           "approved": None, "pending": None, "remembered": None}
+           "approved": None, "pending": None, "remembered": None,
+           # migration 027: ask-every-time is the default, so these tests keep the old behaviour
+           # unless a test opts into AI authority.
+           "ask_every_time": True, "max_pct": Decimal("0"), "granted": None,
+           "sweetener": None}
 
-    async def _on(shop_id, client):
-        return cap["on"]
+    async def _settings(shop_id, client):
+        return cap["on"], cap["ask_every_time"], cap["max_pct"]
+
+    async def _sweetener(shop_id, product_id, client):
+        return cap["sweetener"]
+
+    async def _grant(shop, identity, product, price, client):
+        cap["granted"] = price
 
     async def _open(shop_id, identity, pid, price, client):
         cap["opened"] = price
@@ -283,7 +293,9 @@ def price_wire(monkeypatch):
         return _product()  # list price 3400 — approve bound check (0 < price <= list) passes at 3100/3250
 
     monkeypatch.setattr(svc, "get_product", _get_product)
-    monkeypatch.setattr(svc, "_negotiation_on", _on)
+    monkeypatch.setattr(svc, "_haggle_settings", _settings)
+    monkeypatch.setattr(svc, "_grant_price", _grant)
+    monkeypatch.setattr(svc, "_haggle_offer", _sweetener)
     monkeypatch.setattr(svc, "_open_price_request", _open)
     monkeypatch.setattr(svc, "_notify_shop", _notify)
     monkeypatch.setattr(svc, "_get_price_request", _get_req)
@@ -341,7 +353,27 @@ async def test_request_price_deduped_when_one_is_pending(price_wire, monkeypatch
 
 @pytest.mark.asyncio
 async def test_request_price_steers_to_order_when_already_approved(price_wire, monkeypatch):
-    """If the shop already approved, don't re-ask — tell the model to place the order."""
+    """A re-ask the approval already beats must not re-open anything — just go book it.
+
+    This is the anti-flood guard: the model re-asked and made requests #3/#4 in testing.
+    """
+    price_wire["approved"] = Decimal("3250")
+
+    async def _get(shop_id, pid, client):
+        return _product()
+
+    monkeypatch.setattr(svc, "get_product", _get)
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
+    assert res == {"status": "already_approved", "price_aed": "3250"}
+    assert price_wire["opened"] is None and price_wire["notified"] is None
+
+
+@pytest.mark.asyncio
+async def test_pushing_below_an_approved_price_asks_the_shop(price_wire, monkeypatch):
+    """Approved at 3250, now they want 3100 — that is a new concession, so a human decides.
+
+    The dedup guard still bounds it: a second push opens no further row (see the pending test).
+    """
     price_wire["approved"] = Decimal("3250")
 
     async def _get(shop_id, pid, client):
@@ -349,8 +381,8 @@ async def test_request_price_steers_to_order_when_already_approved(price_wire, m
 
     monkeypatch.setattr(svc, "get_product", _get)
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3100"))
-    assert res == {"status": "already_approved", "price_aed": "3250"}
-    assert price_wire["opened"] is None and price_wire["notified"] is None
+    assert res == {"status": "asked_shop"}
+    assert price_wire["opened"] == Decimal("3100")
 
 
 @pytest.mark.asyncio
@@ -754,3 +786,131 @@ def test_offer_discount_covers_every_type():
     # non-discount types produce no line discount here
     assert _offer_discount({"type": "free_gift", "value": None}, unit, 1) == Decimal("0")
     assert _offer_discount({"type": "free_delivery", "value": None}, unit, 1) == Decimal("0")
+
+
+# --- AI bargaining authority (migration 027) ---
+def _floor_product(sell="3400", cost="2800", floor=None):
+    p = _product(sell=sell, cost=cost)
+    p.min_price = Decimal(floor) if floor is not None else None
+    return p
+
+
+@pytest.mark.parametrize(
+    "sell,cost,min_price,pct,expected,why",
+    [
+        ("3400", "2800", None, "0",  "3400", "no authority granted -> the floor IS the list price"),
+        ("3400", "2800", None, "5",  "3230", "5% of 3400 = 170 off"),
+        ("3400", "2800", None, "50", "2800", "50% would break cost -> clamped at cost"),
+        ("3400", "2800", "3100", "5", "3100", "explicit product floor wins over the 5% default"),
+        ("3400", "2800", "3350", "20", "3350", "explicit floor is TIGHTER than 20% -> it still wins"),
+        ("3400", "2800", "2000", "5", "2800", "a floor under cost is clamped up to cost"),
+        ("1000", "900", None, "3",  "970", "rounds UP (970.0 exact) — never below the configured floor"),
+        ("999",  "500", None, "10", "900", "899.1 rounds UP to 900, the protective direction"),
+    ],
+)
+def test_bargain_floor(sell, cost, min_price, pct, expected, why):
+    got = svc.bargain_floor(_floor_product(sell, cost, min_price), Decimal(pct))
+    assert got == Decimal(expected), why
+    assert got >= Decimal(cost), "cost clamp is absolute"
+
+
+@pytest.mark.asyncio
+async def test_ai_settles_at_the_asked_price_when_it_clears_the_floor(price_wire):
+    """Authority granted, customer's offer is above the floor -> instant yes, no shopkeeper."""
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")  # floor 3060
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3200"))
+
+    assert res == {"status": "approved", "price_aed": "3200"}
+    assert price_wire["granted"] == Decimal("3200")
+    assert price_wire["opened"] is None, "the shopkeeper must not be asked"
+
+
+@pytest.mark.asyncio
+async def test_ai_counters_at_the_floor_on_a_lowball(price_wire):
+    """Below the floor -> counter AT the floor, and record it so an accept books at that price."""
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")  # 3400 -> floor 3060
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("2000"))
+
+    assert res == {"status": "counter", "price_aed": "3060"}
+    assert price_wire["granted"] == Decimal("3060")
+    assert price_wire["opened"] is None
+
+
+@pytest.mark.asyncio
+async def test_pushing_below_a_granted_price_goes_to_the_shopkeeper(price_wire):
+    """The AI spends its authority once. More than that is a human decision."""
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")
+    price_wire["approved"] = Decimal("3060")  # already settled there
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("2500"))
+
+    assert res == {"status": "asked_shop"}
+    assert price_wire["opened"] == Decimal("2500")
+    assert price_wire["granted"] is None, "authority already spent — must not grant again"
+
+
+@pytest.mark.asyncio
+async def test_asking_above_a_granted_price_just_books(price_wire):
+    price_wire["ask_every_time"] = False
+    price_wire["approved"] = Decimal("3060")
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
+
+    assert res == {"status": "already_approved", "price_aed": "3060"}
+    assert price_wire["opened"] is None
+
+
+@pytest.mark.asyncio
+async def test_ask_every_time_keeps_the_shopkeeper_in_the_loop(price_wire):
+    """The default. Authority settings are irrelevant while this is on."""
+    price_wire["ask_every_time"] = True
+    price_wire["max_pct"] = Decimal("50")
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3000"))
+
+    assert res == {"status": "asked_shop"}
+    assert price_wire["granted"] is None
+
+
+@pytest.mark.asyncio
+async def test_negotiation_off_beats_every_authority_setting(price_wire):
+    price_wire["on"] = False
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("30")
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3000"))
+
+    assert res == {"error": "negotiation_off"}
+    assert price_wire["granted"] is None and price_wire["opened"] is None
+
+
+@pytest.mark.asyncio
+async def test_held_back_freebie_arrives_with_the_price_answer(price_wire):
+    """The sweetener rides on request_price, not on the product listing.
+
+    Handed to the model alongside the catalogue it spent the card in its opening line, before the
+    customer had haggled at all — so the reveal is structural, not a prompt instruction.
+    """
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")
+    price_wire["sweetener"] = "Free cover + screen protector"
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("2000"))
+
+    assert res["status"] == "counter"
+    assert res["sweetener"] == "Free cover + screen protector"
+
+
+@pytest.mark.asyncio
+async def test_no_sweetener_key_when_the_shop_has_no_bargaining_offer(price_wire):
+    price_wire["ask_every_time"] = False
+    price_wire["sweetener"] = None
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
+
+    assert "sweetener" not in res, "the model must never see an empty freebie to embellish"

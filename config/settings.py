@@ -104,6 +104,10 @@ class Settings(BaseSettings):
     # Per-customer daily cap on AI-answered messages (cost/abuse ceiling; 0 disables). Far above any
     # real customer — rapid-fire (20/60s) catches bursts, this catches a sustained flood under it.
     ai_daily_msg_cap: int = 1000
+    # Ceiling on simultaneous chat completions across this process. 30 shops at peak put hundreds
+    # of customers in flight at once; uncapped that is a burst of provider 429s. Queueing costs a
+    # customer a moment, a rate-limit failure costs them the conversation.
+    ai_max_concurrency: int = 40
 
     # --- Celery / Flower (ADR-001; §13) ---
     celery_broker_url: str = ""  # defaults to redis_url if empty
