@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.llm.llm_client import LLMClient
+from app.llm.llm_client import _NEVER, LLMClient
 
 
 def _client(overlay: dict[str, str]) -> LLMClient:
@@ -61,7 +61,7 @@ async def test_clearing_a_console_setting_reverts_to_env():
     assert c.model == "kimi-k2.7"
 
     c._read_overlay = lambda: {}  # type: ignore[method-assign]
-    c._overlay_at = 0.0           # allow an immediate re-check
+    c._overlay_at = _NEVER        # allow an immediate re-check
     await c._sync_overlay()
     assert c.model == c._env["ai_model"]  # env is the floor, not a one-way door
 
@@ -75,7 +75,7 @@ async def test_a_settings_outage_keeps_the_last_good_config():
         raise RuntimeError("supabase down")
 
     c._read_overlay = _boom  # type: ignore[method-assign]
-    c._overlay_at = 0.0
+    c._overlay_at = _NEVER
     await c._sync_overlay()  # must not raise — the AI keeps answering
 
     assert c.model == "kimi-k2.7"
@@ -91,8 +91,22 @@ async def test_overlay_is_not_re_read_on_every_message():
 
     c = LLMClient()
     c._read_overlay = _count  # type: ignore[method-assign]
-    c._overlay_at = 0.0
+    c._overlay_at = _NEVER
     await c._sync_overlay()
     await c._sync_overlay()
     await c._sync_overlay()
     assert calls["n"] == 1  # TTL-gated: one DB read per minute per process, not per message
+
+
+@pytest.mark.asyncio
+async def test_first_read_happens_even_on_a_freshly_booted_machine(monkeypatch):
+    """`time.monotonic()` is seconds since boot on Linux. With 0.0 as the "never read" stamp, a
+    container up for 26s looked like it had just read the overlay, so it silently ran on env
+    defaults and ignored the console's model switch for its first minute. Six CI failures and a
+    real production bug — the sentinel has to be uptime-independent."""
+    monkeypatch.setattr("app.llm.llm_client.time.monotonic", lambda: 26.0)
+
+    c = _client({"ai_model": "kimi-k2.7"})
+    await c._sync_overlay()
+
+    assert c.model == "kimi-k2.7"

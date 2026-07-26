@@ -92,6 +92,11 @@ def _to_response(raw: Any) -> LLMResponse:
 # reaches every bot/worker process within ~a minute, no restart.
 _OVERLAY_KEYS = ("ai_provider", "ai_base_url", "ai_model", "ai_api_key")
 _OVERLAY_TTL_SECONDS = 60.0
+# "never read yet". NOT 0.0: `time.monotonic()` is seconds since boot on Linux, so on a freshly
+# booted machine 0.0 reads as "a few seconds ago" and the TTL below skips the very first read —
+# the process then runs on env defaults, ignoring the console's model switch, until it has been
+# up a minute. -inf is unambiguous at any uptime.
+_NEVER = float("-inf")
 
 
 class LLMClient:
@@ -109,7 +114,7 @@ class LLMClient:
         self.max_tokens = settings.ai_max_tokens
         self.timeout = settings.ai_request_timeout
         self._http: Any = None
-        self._overlay_at = 0.0
+        self._overlay_at = _NEVER
         self._sem: asyncio.Semaphore | None = None
         self._sem_loop: Any = None
         self._apply({})
