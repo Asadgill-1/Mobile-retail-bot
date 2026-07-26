@@ -18,10 +18,13 @@ would break coalescing again. At ~7 messages/second of I/O-bound work that is no
 
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import APIRouter, Request, Response
 from twilio.request_validator import RequestValidator
+
+from app.whatsapp import client as wa_client
 
 from app.core.config import settings
 from app.db.factory import get_tenant_repo
@@ -68,8 +71,62 @@ def _deliver(shop: Shop, identity: str, text: str) -> None:
     _pacer.submit(shop.id, identity, text, answer=answer, send=send, typing=typing)
 
 
+async def _accept(shop, identity: str, text: str) -> bool:
+    """Shared gate for both providers. False means we ack and do nothing."""
+    if shop is None:
+        return False
+    # A shop still on Telegram must not be drivable through this endpoint: its customers are a
+    # different identity space (Telegram user ids, not phone numbers), so accepting one here would
+    # start a parallel conversation under a stranger's identity.
+    if shop.customer_channel != WHATSAPP:
+        logger.warning(
+            "whatsapp webhook: shop=%s is on the %s channel; ignoring", shop.id, shop.customer_channel
+        )
+        return False
+    if not identity or not text:
+        return False
+    return True
+
+
+@router.get("/webhook/whatsapp")
+async def whatsapp_verify(request: Request) -> Response:
+    """Meta's one-time subscription handshake: echo hub.challenge if the verify token matches.
+    Twilio has no equivalent, so this is inert when Twilio is the provider."""
+    q = request.query_params
+    expected = await wa_client.app_secret()
+    if q.get("hub.mode") == "subscribe" and expected and q.get("hub.verify_token") == expected:
+        return Response(content=q.get("hub.challenge", ""), status_code=200)
+    logger.warning("whatsapp webhook: verification handshake rejected")
+    return Response(status_code=403)
+
+
 @router.post("/webhook/whatsapp")
 async def whatsapp_inbound(request: Request) -> Response:
+    """One URL, both providers. Meta posts JSON signed with X-Hub-Signature-256; Twilio posts a
+    form signed with X-Twilio-Signature. Dispatching on the header rather than on the configured
+    provider means a stray delivery during a provider switch is still verified correctly instead
+    of being waved through or rejected."""
+    raw = await request.body()
+
+    if request.headers.get("X-Hub-Signature-256"):
+        from app.whatsapp import meta
+
+        secret = await wa_client.app_secret()
+        if not meta.verify_signature(secret, raw, request.headers.get("X-Hub-Signature-256")):
+            logger.warning("whatsapp webhook: bad Meta signature")
+            return Response(status_code=403)
+        try:
+            payload = json.loads(raw or b"{}")
+        except ValueError:
+            return Response(status_code=200)  # malformed: ack, never retry-storm us
+
+        repo = get_tenant_repo()
+        for msg in meta.parse_inbound(payload):
+            shop = await repo.get_shop_by_whatsapp_phone_id(msg["phone_id"])
+            if await _accept(shop, msg["from"], msg["text"]):
+                _deliver(shop, msg["from"], msg["text"])
+        return Response(status_code=200)
+
     form = dict(await request.form())
     if not verify_twilio_signature(str(request.url), form, request.headers.get("X-Twilio-Signature")):
         logger.warning("whatsapp webhook: bad Twilio signature")
@@ -81,14 +138,7 @@ async def whatsapp_inbound(request: Request) -> Response:
         logger.warning("whatsapp webhook: no shop for To=%s", to)
         return Response(status_code=200)  # ack silently — don't leak which numbers are live
 
-    # A shop still on Telegram must not be drivable through this endpoint: its customers are a
-    # different identity space (Telegram user ids, not phone numbers), so accepting one here would
-    # start a parallel conversation under a stranger's identity.
-    if shop.customer_channel != WHATSAPP:
-        logger.warning(
-            "whatsapp webhook: shop=%s is on the %s channel; ignoring", shop.id, shop.customer_channel
-        )
-        return Response(status_code=200)
-
-    _deliver(shop, _strip_whatsapp(form.get("From", "")), form.get("Body", ""))
+    identity, text = _strip_whatsapp(form.get("From", "")), form.get("Body", "")
+    if await _accept(shop, identity, text):
+        _deliver(shop, identity, text)
     return Response(status_code=200)  # SPEC §11: return immediately, the worker answers

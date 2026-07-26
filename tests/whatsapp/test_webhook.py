@@ -111,3 +111,83 @@ def test_unknown_shop_returns_200_without_delivering(client, monkeypatch, delive
     r = client.post("/webhook/whatsapp", data={"To": "whatsapp:+1404", "Body": "hi"})
     assert r.status_code == 200
     delivered.assert_not_called()
+
+
+# --- Meta Cloud API path (same URL, different shape) ---
+def _meta_body(phone_id: str = "PID1", text: str = "hi") -> bytes:
+    import json as _json
+
+    return _json.dumps({"entry": [{"changes": [{"value": {
+        "metadata": {"phone_number_id": phone_id},
+        "messages": [{"id": "w1", "from": "971500000000", "type": "text", "text": {"body": text}}],
+    }}]}]}).encode()
+
+
+class _PhoneIdRepo:
+    def __init__(self, shop: Shop | None) -> None:
+        self._shop = shop
+
+    async def get_shop_by_whatsapp_phone_id(self, phone_id: str) -> Shop | None:
+        return self._shop
+
+
+@pytest.fixture
+def meta_secret(monkeypatch):
+    """Both the signature check and the GET handshake read the app secret from platform_settings."""
+    import app.whatsapp.client as wa_client
+
+    async def _secret():
+        return "app-secret"
+
+    monkeypatch.setattr(wa_client, "app_secret", _secret)
+    return "app-secret"
+
+
+def _sig(body: bytes, secret: str) -> str:
+    import hashlib
+    import hmac
+
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def test_meta_message_is_routed_by_phone_number_id(client, monkeypatch, delivered, meta_secret):
+    shop = _shop()
+    monkeypatch.setattr(webhook, "get_tenant_repo", lambda: _PhoneIdRepo(shop))
+    body = _meta_body()
+    r = client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body, meta_secret), "Content-Type": "application/json"},
+    )
+    assert r.status_code == 200
+    delivered.assert_called_once()
+    got_shop, identity, text = delivered.call_args.args
+    assert got_shop.id == shop.id and identity == "971500000000" and text == "hi"
+
+
+def test_a_forged_meta_signature_is_rejected(client, monkeypatch, delivered, meta_secret):
+    monkeypatch.setattr(webhook, "get_tenant_repo", lambda: _PhoneIdRepo(_shop()))
+    body = _meta_body()
+    r = client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body, "wrong-secret"), "Content-Type": "application/json"},
+    )
+    assert r.status_code == 403
+    delivered.assert_not_called()
+
+
+def test_meta_verification_handshake_echoes_the_challenge(client, meta_secret):
+    r = client.get(
+        "/webhook/whatsapp",
+        params={"hub.mode": "subscribe", "hub.verify_token": meta_secret, "hub.challenge": "12345"},
+    )
+    assert r.status_code == 200 and r.text == "12345"
+
+
+def test_the_handshake_rejects_a_wrong_verify_token(client, meta_secret):
+    r = client.get(
+        "/webhook/whatsapp",
+        params={"hub.mode": "subscribe", "hub.verify_token": "nope", "hub.challenge": "12345"},
+    )
+    assert r.status_code == 403

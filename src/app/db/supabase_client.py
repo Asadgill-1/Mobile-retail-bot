@@ -190,6 +190,22 @@ class SupabaseTenantRepo(TenantRepo):
 
         return await asyncio.to_thread(_q)
 
+    async def get_shop_by_whatsapp_phone_id(self, phone_id: str) -> Shop | None:
+        """Meta routes inbound on the receiving number's phone_number_id, not on the number. The
+        column is uniquely indexed (028) — two shops sharing one would cross-deliver customers
+        between tenants."""
+        def _q() -> Shop | None:
+            r = (
+                self.sb.table("shops")
+                .select("*")
+                .eq("whatsapp_phone_id", phone_id)
+                .maybe_single()
+                .execute()
+            )
+            return _row_to_shop(r.data) if r and r.data else None
+
+        return await asyncio.to_thread(_q)
+
     async def list_shops(self, client_id: UUID | None = None) -> list[Shop]:
         """Archived shops (migration 026) are excluded everywhere this feeds — bot builders, owner
         listings, analytics — so an offboarded shop disappears from the running system. The

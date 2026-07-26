@@ -54,6 +54,10 @@ class TenantRepo(ABC):
         """Resolve a shop from a Twilio `To` number (SPEC §1)."""
 
     @abstractmethod
+    async def get_shop_by_whatsapp_phone_id(self, phone_id: str) -> Shop | None:
+        """Resolve a shop from a Meta `phone_number_id` (migration 028)."""
+
+    @abstractmethod
     async def list_shops(self, client_id: UUID | None = None) -> list[Shop]:
         """List shops, optionally scoped to a client (ADR-006)."""
 

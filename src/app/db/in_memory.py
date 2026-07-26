@@ -135,6 +135,11 @@ class InMemoryTenantRepo(TenantRepo):
         shop_id = self._by_number.get(whatsapp_number)
         return self._shops.get(shop_id) if shop_id else None
 
+    async def get_shop_by_whatsapp_phone_id(self, phone_id: str) -> Shop | None:
+        if not phone_id:
+            return None
+        return next((s for s in self._shops.values() if s.whatsapp_phone_id == phone_id), None)
+
     async def list_shops(self, client_id: UUID | None = None) -> list[Shop]:
         if client_id is None:
             return list(self._shops.values())
