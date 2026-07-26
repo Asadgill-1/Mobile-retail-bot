@@ -450,8 +450,12 @@ async def request_price(
     # pushing below a price we already granted (that's the shopkeeper's call).
     if approved is None and not ask_every_time:
         floor = bargain_floor(product, max_pct)
-        settled = requested_price if requested_price >= floor else floor
-        await _grant_price(shop, identity, product, settled, client)
+        # Clamp both ways. Below the floor we counter AT the floor; at or above the list price
+        # there is nothing to discount, and granting it would make draft_order compute a NEGATIVE
+        # discount — which `orders.discount_amount >= 0` (migration 001) rejects outright, so the
+        # customer's order would simply fail after we had already promised them a price.
+        settled = min(max(requested_price, floor), product.selling_price)
+        await _grant_price(shop, identity, product, settled, client, asked=requested_price)
         return _with(sweetener, {
             "status": "approved" if requested_price >= floor else "counter",
             "price_aed": str(settled),
@@ -604,7 +608,8 @@ async def _haggle_settings(shop_id: UUID, client: Any | None) -> tuple[bool, boo
 
 
 async def _grant_price(
-    shop: Shop, identity: str, product: Product, price: Decimal, client: Any | None
+    shop: Shop, identity: str, product: Product, price: Decimal, client: Any | None,
+    *, asked: Decimal | None = None,
 ) -> None:
     """Record a price the AI settled on its own, and tell the shop after the fact.
 
@@ -618,7 +623,10 @@ async def _grant_price(
         sb.table("price_requests").insert(
             {
                 "shop_id": str(shop.id), "phone": identity, "product_id": str(product.id),
-                "requested_price": str(price), "approved_price": str(price), "status": "approved",
+                # What they asked for and what we settled at are different numbers on a counter,
+                # and the shop's record of the negotiation should show both.
+                "requested_price": str(asked if asked is not None else price),
+                "approved_price": str(price), "status": "approved",
             }
         ).execute()
 

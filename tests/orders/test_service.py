@@ -252,7 +252,7 @@ def price_wire(monkeypatch):
            # migration 027: ask-every-time is the default, so these tests keep the old behaviour
            # unless a test opts into AI authority.
            "ask_every_time": True, "max_pct": Decimal("0"), "granted": None,
-           "sweetener": None}
+           "sweetener": None, "granted_ask": None}
 
     async def _settings(shop_id, client):
         return cap["on"], cap["ask_every_time"], cap["max_pct"]
@@ -260,8 +260,9 @@ def price_wire(monkeypatch):
     async def _sweetener(shop_id, product_id, client):
         return cap["sweetener"]
 
-    async def _grant(shop, identity, product, price, client):
+    async def _grant(shop, identity, product, price, client, *, asked=None):
         cap["granted"] = price
+        cap["granted_ask"] = asked
 
     async def _open(shop_id, identity, pid, price, client):
         cap["opened"] = price
@@ -914,3 +915,29 @@ async def test_no_sweetener_key_when_the_shop_has_no_bargaining_offer(price_wire
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
 
     assert "sweetener" not in res, "the model must never see an empty freebie to embellish"
+
+
+@pytest.mark.asyncio
+async def test_a_counter_records_what_the_customer_actually_asked(price_wire):
+    """The shop's record of the negotiation should show the lowball AND what we settled at."""
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")  # 3400 -> floor 3060
+
+    await request_price(_shop_obj(), "p1", uuid4(), Decimal("2000"))
+
+    assert price_wire["granted"] == Decimal("3060")      # settled at the floor
+    assert price_wire["granted_ask"] == Decimal("2000")  # but they asked for 2000
+
+
+@pytest.mark.asyncio
+async def test_never_grants_above_the_list_price(price_wire):
+    """A model asking MORE than list would otherwise write an above-list "approved" row, and
+    draft_order turns that into a negative discount that `discount_amount >= 0` rejects — the
+    customer would be promised a price and then have their order fail."""
+    price_wire["ask_every_time"] = False
+    price_wire["max_pct"] = Decimal("10")
+
+    res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("4000"))  # list is 3400
+
+    assert price_wire["granted"] == Decimal("3400"), "clamped down to the list price"
+    assert res["price_aed"] == "3400"
