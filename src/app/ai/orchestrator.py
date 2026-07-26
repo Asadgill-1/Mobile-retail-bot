@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _ROLE_TO_LLM = {"customer": "user", "assistant": "assistant", "shopkeeper": "assistant"}
 
 
-def _serialize(p: Any) -> dict[str, Any]:
+def _serialize(p: Any, *, need: int | None = None) -> dict[str, Any]:
     """Product → what the model may see.
 
     `boost_level` is never included: ranking already applied it, and the model must not be
@@ -40,6 +40,13 @@ def _serialize(p: Any) -> dict[str, Any]:
     `min_price` and `cost_price` never cross: the floor is enforced server-side in
     orders.service.bargain_floor, and a model that knows the floor will negotiate to it.
     Money crosses as a string: never float (CONVENTIONS).
+
+    The unit COUNT never crosses either. It used to, and the model repeated it, which hands a
+    competitor the shop's whole stock position for the price of a chat. Search already filters
+    `quantity > 0`, so "we have it" needs no number. `need` is the quantity the customer actually
+    asked for: only then does the shop's position matter, and only the part they need to know —
+    enough, or, when it is not, the true figure so they can decide. Same lesson as `high_margin`
+    and the held-back offer: what the model cannot see, it cannot say.
     """
     from app.products.service import INTERNAL_TAGS
 
@@ -53,8 +60,12 @@ def _serialize(p: Any) -> dict[str, Any]:
         "specs": p.specs,
         "tags": [t for t in p.tags if t not in INTERNAL_TAGS],
         "price_aed": str(p.selling_price),
-        "in_stock": p.quantity,
+        "in_stock": True,
     }
+    if need:
+        data["enough"] = p.quantity >= need
+        if p.quantity < need:
+            data["available"] = p.quantity  # the one case a real count may be said out loud
     if getattr(p, "active_offer", None):
         data["offer"] = p.active_offer  # shop's current promo (023); the model may mention it
     # An `on_haggle` offer is deliberately NOT here. Telling the model "you have a freebie but
@@ -114,6 +125,10 @@ async def _run_tool(
         if sort not in _SORTS:  # models improvise enums; don't hand junk to the query layer
             logger.warning("LLM sent unknown sort %r; falling back to relevance", sort)
             sort = "relevance"
+        try:  # models improvise; a junk quantity means "they didn't ask for one", not a crash
+            need = int(args.get("need_quantity") or 0)
+        except (ValueError, TypeError):
+            need = 0
         products = await search_products(
             shop.id,
             args.get("requirements", ""),
@@ -121,7 +136,7 @@ async def _run_tool(
             sort=sort,
             rows=catalogue,
         )
-        return json.dumps([_serialize(p) for p in products])
+        return json.dumps([_serialize(p, need=need if need > 0 else None) for p in products])
     if call.name == "place_order":
         return json.dumps(await _place_order(call.arguments, shop, identity))
     if call.name == "request_price":

@@ -47,6 +47,15 @@ SEARCH_PRODUCTS: dict[str, Any] = {
                         "customer states a budget, e.g. 'under 3000' or 'around 2500 max'."
                     ),
                 },
+                "need_quantity": {
+                    "type": "integer",
+                    "description": (
+                        "How many units the customer says they want, e.g. 'I need 10'. Set this "
+                        "whenever they name a number, and each result will tell you whether we "
+                        "have enough (`enough`) and, only if we do not, how many we actually "
+                        "have (`available`). Leave it out for a normal one-unit enquiry."
+                    ),
+                },
             },
             "required": ["requirements"],
         },

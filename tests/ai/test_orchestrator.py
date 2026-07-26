@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -449,3 +450,72 @@ def test_serialize_never_leaks_a_held_back_bargaining_offer():
     # in its opening reply. request_price hands it over once bargaining has actually started.
     assert "bargaining_card" not in data
     assert "sweetener" not in data
+
+
+# --- the stock count is the shop's business, not the model's (competitor recon) ---
+def _stocked(qty: int):
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from app.products.models import Product
+
+    return Product(
+        id=uuid4(), shop_id=uuid4(), category="Mobile", brand="Apple", model="16 Pro",
+        color="Green", condition="New", cost_price=Decimal("3000"),
+        selling_price=Decimal("3400"), quantity=qty,
+    )
+
+
+def test_serialize_never_reveals_the_unit_count():
+    """A rival can walk the whole catalogue by asking "do you have X?" thirty times. Availability
+    is a yes; the number behind it is not the customer's business unless we cannot fill their order.
+    """
+    from app.ai.orchestrator import _serialize
+
+    data = _serialize(_stocked(137))  # 137 shares no digits with the 3400 price, so a hit is real
+
+    assert data["in_stock"] is True
+    assert 137 not in data.values()
+    assert "137" not in str(data)  # not smuggled in as a string anywhere either
+    assert "available" not in data and "quantity" not in data
+
+
+def test_asking_for_a_quantity_we_have_says_enough_but_still_no_number():
+    from app.ai.orchestrator import _serialize
+
+    data = _serialize(_stocked(137), need=10)
+
+    assert data["enough"] is True
+    assert "available" not in data, "we can fill it — the count stays private"
+    assert "137" not in str(data)
+
+
+def test_asking_for_more_than_we_have_gives_the_true_figure():
+    """The one case a real number may be spoken: they cannot have what they asked for, so they
+    need the honest figure to decide."""
+    from app.ai.orchestrator import _serialize
+
+    data = _serialize(_stocked(4), need=10)
+
+    assert data["enough"] is False
+    assert data["available"] == 4
+
+
+async def test_junk_need_quantity_is_ignored_rather_than_crashing_the_turn(monkeypatch):
+    """Models improvise arguments. A bad quantity must degrade to a plain availability answer,
+    never take the customer's turn down with it."""
+    from app.ai.orchestrator import _run_tool
+    from app.llm.llm_client import LLMToolCall
+
+    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance", rows=None):
+        return [_stocked(5)]
+
+    monkeypatch.setattr(orch, "search_products", _search)
+    shop = SimpleNamespace(id=uuid4())
+
+    for junk in ("lots", None, -3, 0, ""):
+        call = LLMToolCall(id="c", name="search_products",
+                           arguments={"requirements": "iphone", "need_quantity": junk})
+        payload = json.loads(await _run_tool(call, shop, "cust"))
+        assert payload[0]["in_stock"] is True
+        assert "enough" not in payload[0] and "available" not in payload[0]
