@@ -118,20 +118,16 @@ def rank(
     return candidates[:limit]
 
 
-async def search_products(
-    shop_id: UUID,
-    requirements: str,
-    limit: int = _DEFAULT_LIMIT,
-    *,
-    max_price: Decimal | float | str | None = None,
-    sort: SortOrder = "relevance",
-    client: Any | None = None,
-) -> list[Product]:
-    """Fetch this shop's in-stock products and rank them (SPEC §4). Tenant-scoped by shop_id."""
+async def fetch_catalogue(shop_id: UUID, client: Any | None = None) -> list[Product]:
+    """This shop's in-stock rows, unranked. Tenant-scoped by shop_id.
+
+    Split out of `search_products` so one turn can read the catalogue once and rank it several
+    ways. A round-trip here measured ~800ms against the live project, so the count per message is
+    the number that matters, not the query.
+    """
     from app.db.supabase_client import get_supabase
 
     sb = client if client is not None else get_supabase()
-    cap = Decimal(str(max_price)) if max_price is not None else None  # never compare against float
 
     # supabase-py is sync; run it off the event loop or every bot stalls (see SupabaseTenantRepo).
     # ponytail: fetch the shop's in-stock rows, rank in Python. ceiling: O(catalogue) per message.
@@ -147,7 +143,29 @@ async def search_products(
         )
         return [Product(**row) for row in (resp.data or [])]
 
-    ranked = rank(await asyncio.to_thread(_q), requirements, limit, max_price=cap, sort=sort)
+    return await asyncio.to_thread(_q)
+
+
+async def search_products(
+    shop_id: UUID,
+    requirements: str,
+    limit: int = _DEFAULT_LIMIT,
+    *,
+    max_price: Decimal | float | str | None = None,
+    sort: SortOrder = "relevance",
+    client: Any | None = None,
+    rows: list[Product] | None = None,
+) -> list[Product]:
+    """Fetch this shop's in-stock products and rank them (SPEC §4). Tenant-scoped by shop_id.
+
+    `rows` supplies an already-fetched catalogue so a caller that needs it twice in one turn pays
+    for one read. Pass the RAW rows, never another call's ranked output — ranking is capped by
+    `limit`, so recycling a shortlist would silently hide the rest of the catalogue.
+    """
+    cap = Decimal(str(max_price)) if max_price is not None else None  # never compare against float
+
+    pool = rows if rows is not None else await fetch_catalogue(shop_id, client)
+    ranked = rank(pool, requirements, limit, max_price=cap, sort=sort)
 
     # Attach offer labels to the shortlisted products (023/027) so the AI can use them.
     # Two kinds: 'always' is advertised on sight; 'on_haggle' is held back as a bargaining chip
@@ -155,15 +173,24 @@ async def search_products(
     if ranked:
         ids = [str(p.id) for p in ranked]
 
-        def _offers() -> list[dict]:
-            return (
-                sb.table("offers").select("product_id,label,reveal")
-                .in_("product_id", ids).eq("active", True).execute().data or []
-            )
-
         try:
-            rows = await asyncio.to_thread(_offers)
-            advertised = {r["product_id"]: r["label"] for r in rows if r.get("reveal") != "on_haggle"}
+            from app.db.supabase_client import get_supabase
+
+            # Resolving the client lives INSIDE the try on purpose: an unconfigured client raises
+            # here too, and the promise below is that nothing about offers can cost a customer
+            # their product list.
+            sb = client if client is not None else get_supabase()
+
+            def _offers() -> list[dict]:
+                return (
+                    sb.table("offers").select("product_id,label,reveal")
+                    .in_("product_id", ids).eq("active", True).execute().data or []
+                )
+
+            offer_rows = await asyncio.to_thread(_offers)
+            advertised = {
+                r["product_id"]: r["label"] for r in offer_rows if r.get("reveal") != "on_haggle"
+            }
             for p in ranked:
                 p.active_offer = advertised.get(str(p.id))
         except Exception:  # noqa: BLE001 — an offer lookup must never break product search

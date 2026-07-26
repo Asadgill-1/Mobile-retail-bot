@@ -137,3 +137,40 @@ def test_phone_query_now_matches_mobile_category():
     mobile = _p("Galaxy", category="Mobile")
     laptop = _p("MacBook", category="Laptop", brand="Apple")
     assert relevance(mobile, _tokens("a phone")) > relevance(laptop, _tokens("a phone"))
+
+
+# --- reusing one turn's catalogue read (E1): the query count per message is the cost ---
+async def test_supplied_rows_skip_the_catalogue_query():
+    """A live catalogue round-trip measured ~800ms, and the turn needs it twice. Passing `rows`
+    must do zero I/O — if this ever silently re-reads, peak load pays double again."""
+    import app.products.search as search
+
+    async def _boom(*a, **k):
+        raise AssertionError("fetch_catalogue was called despite rows= being supplied")
+
+    original, search.fetch_catalogue = search.fetch_catalogue, _boom
+    try:
+        out = await search.search_products(_SHOP, "phone", rows=[_p("Galaxy"), _p("Pixel")])
+    finally:
+        search.fetch_catalogue = original
+    assert {p.model for p in out} == {"Galaxy", "Pixel"}  # ranked from the supplied rows, no read
+
+
+async def test_no_rows_still_reads_for_itself():
+    """`answer` passes None (not []) when its own fetch failed. None must mean 'go and read',
+    never 'the shop has nothing' — answering 'we stock nothing' on a transient error is worse
+    than a slow reply."""
+    import app.products.search as search
+
+    called = {"n": 0}
+
+    async def _fetch(shop_id, client=None):
+        called["n"] += 1
+        return [_p("Galaxy")]
+
+    original, search.fetch_catalogue = search.fetch_catalogue, _fetch
+    try:
+        out = await search.search_products(_SHOP, "phone", rows=None)
+    finally:
+        search.fetch_catalogue = original
+    assert called["n"] == 1 and [p.model for p in out] == ["Galaxy"]

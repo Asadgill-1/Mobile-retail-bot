@@ -15,6 +15,7 @@ import functools
 import logging
 import signal
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
@@ -2898,6 +2899,17 @@ async def _build_all_applications(service: TenantService) -> list[Application]:
 
 
 async def _run_apps_forever(service: TenantService) -> None:
+    # Every Supabase query in this process runs on the loop's default executor. Python sizes that
+    # at min(32, cpu_count + 4) — 8 threads on a 4-core box — and a live round-trip is ~800ms, so
+    # the default caps the WHOLE process at ~10 queries/sec while a 400 msg/min peak wants ~40.
+    # Measured, the default does not degrade gracefully: the queue backs up until sessions overlap
+    # and messages are dropped (scripts/loadtest.py). asyncio.run closes this on exit.
+    from app.core.config import settings as _settings
+
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=_settings.db_thread_pool_size, thread_name_prefix="sb")
+    )
+
     apps = await _build_all_applications(service)
     if len(apps) == 1:
         logger.warning("no per-shop bots configured — running owner bot only")

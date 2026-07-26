@@ -20,7 +20,7 @@ from app.escalations.service import alert_owner, escalate
 from app.llm.functions import TOOLS
 from app.llm.llm_client import LLMMessage, LLMResponse, LLMToolCall, get_llm_client
 from app.llm.prompts import ESCALATION_REPLY, system_prompt
-from app.products.search import search_products
+from app.products.search import fetch_catalogue, search_products
 from app.tenants.models import Shop
 
 logger = logging.getLogger(__name__)
@@ -100,8 +100,14 @@ async def _handoff_to_human(
 _SORTS = ("relevance", "price_asc", "price_desc")
 
 
-async def _run_tool(call: LLMToolCall, shop: Shop, identity: str) -> str:
-    """Execute one tool call, return its JSON result for the model."""
+async def _run_tool(
+    call: LLMToolCall, shop: Shop, identity: str, catalogue: list[Any] | None = None
+) -> str:
+    """Execute one tool call, return its JSON result for the model.
+
+    `catalogue` is this turn's already-fetched rows (see `answer`). None means "not available" —
+    fetch again rather than answering from an empty shop.
+    """
     if call.name == "search_products":
         args = call.arguments
         sort = args.get("sort") or "relevance"
@@ -113,6 +119,7 @@ async def _run_tool(call: LLMToolCall, shop: Shop, identity: str) -> str:
             args.get("requirements", ""),
             max_price=args.get("max_price_aed"),
             sort=sort,
+            rows=catalogue,
         )
         return json.dumps([_serialize(p) for p in products])
     if call.name == "place_order":
@@ -229,20 +236,17 @@ def _assistant_wire(resp: LLMResponse) -> LLMMessage:
     )
 
 
-async def _id_reference(shop: Shop) -> str:
+def _id_reference(products: list[Any]) -> str:
     """A hidden 'name → id' table injected every turn so the model uses REAL product ids in
     place_order / request_price / show_product_media.
 
     The session replays only text turns (for handover), so the ids from an earlier search are gone
     by a later booking turn — without this the model invents an id ('prod_redmi_x11_blue'), the tool
-    rejects it, and the turn dies as an 'empty model response'. ponytail: one extra in-stock query
-    per turn; fine for a shop-sized catalogue.
+    rejects it, and the turn dies as an 'empty model response'.
+
+    Pure: it renders whatever `answer` already fetched. It used to run its own catalogue query,
+    which meant every message paid for the same ~800ms read twice.
     """
-    try:
-        products = await search_products(shop.id, "", limit=100)  # all in-stock
-    except Exception:
-        logger.exception("id reference fetch failed shop=%s", shop.id)  # never break the turn
-        return ""
     if not products:
         return ""
     lines = [f"- {p.brand} {p.model}{f' ({p.color})' if p.color else ''}: {p.id}" for p in products]
@@ -296,7 +300,15 @@ async def answer_customer(
         return resp
     # Load history BEFORE recording this turn, or the current message appears twice.
     messages = [LLMMessage(role="system", content=system_prompt(shop))]
-    reference = await _id_reference(shop)  # real product ids survive across turns (see _id_reference)
+    # One catalogue read for the whole turn: the id reference below and every search_products tool
+    # call share it. None (not []) on failure, so the tool re-reads instead of telling the customer
+    # the shop is empty.
+    try:
+        catalogue: list[Any] | None = await fetch_catalogue(shop.id)
+    except Exception:
+        logger.exception("catalogue fetch failed shop=%s", shop.id)  # never break the turn
+        catalogue = None
+    reference = _id_reference(catalogue or [])
     if reference:
         messages.append(LLMMessage(role="system", content=reference))
     messages += await _replay(redis, shop, identity)
@@ -346,7 +358,7 @@ async def answer_customer(
                     content = await _request_shop_media(
                         call.arguments, shop, identity, message, redis)
                 else:
-                    content = await _run_tool(call, shop, identity)
+                    content = await _run_tool(call, shop, identity, catalogue)
                 messages.append(
                     LLMMessage(role="tool", content=content, tool_call_id=call.id, name=call.name)
                 )

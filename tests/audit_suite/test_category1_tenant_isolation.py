@@ -45,7 +45,7 @@ def two_tenant_query(monkeypatch):
     catalogue = {alpha.id: [_product("ALPHA-PHONE")], omega.id: [_product("OMEGA-SECRET")]}
     queried: list = []
 
-    async def _spy_search(shop_id, requirements, limit=20, *, max_price=None, sort="relevance", client=None):
+    async def _spy_search(shop_id, requirements, limit=20, *, max_price=None, sort="relevance", client=None, rows=None):
         queried.append(shop_id)  # the ONLY tenant key the query can see is this positional arg
         return catalogue.get(shop_id, [])
 

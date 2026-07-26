@@ -92,7 +92,7 @@ async def test_search_tool_call_runs_search_then_answers(monkeypatch, redis):
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
     seen = {}
 
-    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance"):
+    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance", rows=None):
         seen.update(requirements=requirements, max_price=max_price, sort=sort)
         return [_product()]
 
@@ -121,7 +121,7 @@ async def test_show_product_media_fills_the_media_sink(monkeypatch, redis):
     )
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
 
-    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance"):
+    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance", rows=None):
         return [prod]
 
     async def _get_product(shop_id, product_id, client=None):
@@ -375,7 +375,7 @@ async def test_price_sort_and_budget_are_passed_through(monkeypatch, redis):
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
     seen = {}
 
-    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance"):
+    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance", rows=None):
         seen.update(max_price=max_price, sort=sort)
         return [_product()]
 
@@ -395,7 +395,7 @@ async def test_unknown_sort_from_the_model_falls_back_to_relevance(monkeypatch, 
     monkeypatch.setattr(orch, "get_llm_client", lambda: fake)
     seen = {}
 
-    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance"):
+    async def _search(shop_id, requirements, limit=5, *, max_price=None, sort="relevance", rows=None):
         seen["sort"] = sort
         return []
 

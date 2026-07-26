@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     # of customers in flight at once; uncapped that is a burst of provider 429s. Queueing costs a
     # customer a moment, a rate-limit failure costs them the conversation.
     ai_max_concurrency: int = 40
+    # Threads for the sync Supabase SDK (every query runs via asyncio.to_thread). Python's default
+    # executor is min(32, cpu_count + 4) — 8 threads on a 4-core box — and a live round-trip
+    # measures ~800ms, so the default ceiling is ~10 queries/sec for the WHOLE process. A 400
+    # msg/min peak needs ~40/sec, i.e. 4x more than the default can serve; measured, it does not
+    # degrade, it collapses (see scripts/loadtest.py).
+    db_thread_pool_size: int = 64
 
     # --- Celery / Flower (ADR-001; §13) ---
     celery_broker_url: str = ""  # defaults to redis_url if empty
