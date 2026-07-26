@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -214,10 +215,34 @@ async def test_session_lock_released_after_processing(redis):
 
 
 @pytest.mark.asyncio
-async def test_held_session_lock_defers_the_message(redis):
+async def test_a_lock_that_frees_up_gets_the_message_answered_not_dropped(redis, monkeypatch):
+    """The one that matters. A message arriving while the previous turn is still running used to
+    be answered with silence — under load that was 232 of 400 messages. It must wait its turn."""
+    monkeypatch.setattr(pipeline, "_LOCK_POLL_SECONDS", 0.01)
     shop = _shop()
-    await redis.set(pipeline.lock_key(shop.id, "p1"), "1")  # another message mid-flight
+    lock = pipeline.lock_key(shop.id, "p1")
+    await redis.set(lock, "1")  # the turn ahead of us is mid-flight
+
+    async def _finish_ahead_of_us():
+        await asyncio.sleep(0.05)
+        await redis.delete(lock)
+
+    asyncio.create_task(_finish_ahead_of_us())
     res = await process_message(InboundMessage(shop, "p1", "hi"), redis)
+
+    assert res.action == "ai", "the customer waited a moment and got a real answer"
+
+
+@pytest.mark.asyncio
+async def test_a_lock_that_never_frees_gives_up_rather_than_hanging(redis, monkeypatch):
+    """Waiting forever is its own outage. Bounded, and loud about it."""
+    monkeypatch.setattr(pipeline, "_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(pipeline, "_LOCK_POLL_SECONDS", 0.01)
+    shop = _shop()
+    await redis.set(pipeline.lock_key(shop.id, "p1"), "1")  # never released
+
+    res = await process_message(InboundMessage(shop, "p1", "hi"), redis)
+
     assert res.action == "locked" and res.reply is None
 
 

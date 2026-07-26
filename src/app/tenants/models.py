@@ -66,6 +66,11 @@ class Shop(BaseModel):
     telegram_keeper_bot_token: str | None = None
     telegram_customer_bot_token: str | None = None
     telegram_customer_chat_id: int | None = None  # test chat id (userbot side)
+    # Which channel THIS SHOP'S CUSTOMERS use (migration 028). Staff bots — keeper, shop-owner,
+    # rider, platform-owner — are always Telegram, so this governs exactly one bot per shop.
+    # Default 'telegram' keeps every existing shop where it is; the cutover is a console action.
+    customer_channel: str = "telegram"  # 'telegram' | 'whatsapp'
+    whatsapp_phone_id: str | None = None  # provider id for this shop's number; webhooks route on it
     created_at: datetime | None = None
 
 

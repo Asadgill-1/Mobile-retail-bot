@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -56,12 +57,31 @@ _TOO_LONG_REPLY = (
 # §11 concurrency/reliability. All state in Redis (no local memory).
 _LOCK_KEY = "lock:session:{shop_id}:{identity}"
 _LOCK_TTL = 30  # seconds — a session's messages are serialized (SPEC §11)
+# Wait for the session ahead of us instead of dropping the customer's message. Under the load
+# harness at 400 msg/min, 232 of 400 messages returned `locked` and were answered with silence;
+# serialising behind the turn in flight is what the lock is FOR. Bounded because a worker blocked
+# forever is its own outage: past this we log loudly and still refuse to pretend nothing happened.
+# ponytail: fixed delay, no backoff. ceiling: a very long turn still gives up. upgrade: block on a
+# Redis list per session if the give-ups ever show up in pipeline_events.
+_LOCK_WAIT_SECONDS = 12.0
+_LOCK_POLL_SECONDS = 0.25
 _DEDUP_KEY = "dedup:{sid}"
 _DEDUP_TTL = 300  # 5 min — a redelivered Twilio MessageSid is dropped (SPEC §11)
 
 
 def lock_key(shop_id: Any, identity: str) -> str:
     return _LOCK_KEY.format(shop_id=shop_id, identity=identity)
+
+
+async def _acquire(redis: Any, lock: str) -> bool:
+    """Take the session lock, waiting for the turn in flight. False only if it never came free."""
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    while True:
+        if await redis.set(lock, "1", nx=True, ex=_LOCK_TTL):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_LOCK_POLL_SECONDS)
 
 
 async def _is_duplicate(redis: Any, sid: str) -> bool:
@@ -99,14 +119,21 @@ async def process_message(msg: InboundMessage, redis: Any) -> PipelineResult:
 
     §11 wraps the pipeline in a per-session lock (serialize a customer's overlapping messages) and
     MessageSid dedup (drop a redelivered Twilio message). **Lock first, dedup second:** a lock miss
-    returns before the SID is marked seen, so the Celery retry that the Twilio path will do at
-    Stage 13 re-runs cleanly instead of being deduped away. The live Telegram path is sequential
-    per bot (no `concurrent_updates`), so `locked` never fires there today.
+    returns before the SID is marked seen, so a Celery retry re-runs cleanly instead of being
+    deduped away.
+
+    On the Telegram path the Pacer already runs one worker per (shop, identity) — the same
+    granularity as this lock — so contention is rare. It is NOT rare wherever the pipeline is
+    driven directly, which is the shape the WhatsApp path takes: any worker can pick up a
+    conversation another is mid-way through. So we wait for the turn ahead of us rather than
+    answering the customer with silence, which is the worst failure this system has.
     """
     lock = lock_key(msg.shop.id, msg.identity)
-    if not await redis.set(lock, "1", nx=True, ex=_LOCK_TTL):
-        # Another message for this session is mid-flight. Telegram: unreachable (sequential).
-        # ponytail: Twilio/Celery path should `self.retry` on this action once it's live (Stage 13).
+    if not await _acquire(redis, lock):
+        logger.warning(
+            "session still locked after %.0fs shop=%s identity=%s — message not answered",
+            _LOCK_WAIT_SECONDS, msg.shop.id, msg.identity,
+        )
         return await _logged(msg, PipelineResult(None, "locked"))
     try:
         if msg.message_sid and await _is_duplicate(redis, msg.message_sid):

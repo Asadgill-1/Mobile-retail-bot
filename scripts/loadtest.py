@@ -128,6 +128,13 @@ async def main() -> int:
     ap.add_argument("--rate", type=int, default=400, help="messages per minute")
     ap.add_argument("--seconds", type=int, default=60)
     ap.add_argument("--shop", default="Shop 01")
+    ap.add_argument(
+        "--paced",
+        action="store_true",
+        help="route through the Pacer, as the Telegram bot does and the WhatsApp webhook must. "
+             "Rapid messages from one customer coalesce into a single turn instead of queueing "
+             "behind each other on the session lock.",
+    )
     args = ap.parse_args()
 
     sb = get_supabase()
@@ -157,12 +164,46 @@ async def main() -> int:
     actions: Counter[str] = Counter()
     errors: list[str] = []
 
+    from app.telegram_bot.pacing import Pacer
+
+    pacer = Pacer()
+    sent: list[str] = []
+
     async def one(n: int) -> None:
         identity = f"{IDENT}{n % CUSTOMERS}"
-        msg = InboundMessage(shop, identity, LINES[n % len(LINES)])
+        text = LINES[n % len(LINES)]
         started = time.perf_counter()
+
+        if args.paced:
+            # What the bot does today and what the webhook must do: hand the message to this
+            # conversation's worker and return. Fragments inside the debounce window become ONE
+            # turn, so the same customer never contends for their own session lock.
+            #
+            # Deliberately NOT awaited: submit() cancels the in-flight worker when a newer message
+            # arrives, so awaiting it raises CancelledError. The bot doesn't await either — a
+            # webhook ACKs immediately. Latency is timed around the TURN instead, which is the
+            # thing a customer actually waits for.
+            async def answer(batch: str, _id=identity):
+                t0 = time.perf_counter()
+                try:
+                    result = await process_message(InboundMessage(shop, _id, batch), redis)
+                    actions[result.action] += 1
+                    return result
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{type(e).__name__}: {e}")
+                    actions["exception"] += 1
+                    raise
+                finally:
+                    latencies.append(time.perf_counter() - t0)
+
+            async def send(bubble: str):
+                sent.append(bubble)
+
+            pacer.submit(shop.id, identity, text, answer=answer, send=send)
+            return
+
         try:
-            result = await process_message(msg, redis)
+            result = await process_message(InboundMessage(shop, identity, text), redis)
             actions[result.action] += 1
         except Exception as e:  # noqa: BLE001 — an error here IS the measurement
             errors.append(f"{type(e).__name__}: {e}")
@@ -180,13 +221,24 @@ async def main() -> int:
         tasks.append(asyncio.create_task(one(n)))
     submitted_for = time.perf_counter() - started_at
     await asyncio.gather(*tasks)
+    if args.paced:  # the workers outlive submission — wait for every conversation to finish
+        for _ in range(2000):
+            live = [c.task for c in pacer._chats.values() if c.task and not c.task.done()]
+            if not live:
+                break
+            await asyncio.gather(*live, return_exceptions=True)
     wall = time.perf_counter() - started_at
 
     try:
         print("=" * 62)
+        print(f"mode: {'PACED (coalescing)' if args.paced else 'direct-to-pipeline'}")
         print(f"submitted {total} over {submitted_for:.1f}s, all done at {wall:.1f}s")
-        print(f"completed {sum(actions.values())}   errors {len(errors)}")
+        print(f"turns run {sum(actions.values())}   errors {len(errors)}")
         print(f"\naction breakdown: {dict(actions)}")
+        if args.paced:
+            turns = sum(actions.values())
+            print(f"  {total} messages -> {turns} turns "
+                  f"({total / turns if turns else 0:.1f} messages per AI call), {len(sent)} bubbles sent")
         if actions.get("locked"):
             print(f"  !! {actions['locked']} message(s) DROPPED on the session lock")
         print("\nend-to-end latency (s)")

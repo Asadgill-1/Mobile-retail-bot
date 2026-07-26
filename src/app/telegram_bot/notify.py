@@ -96,32 +96,45 @@ async def send_to_shopowner(telegram_id: int, text: str,
 async def send_to_customer(shop: Shop, identity: str, text: str) -> bool:
     """Reach the customer on the shop's customer-facing channel.
 
-    Testing: the shop's customer bot, `identity` is a Telegram user id (ADR-002/005).
-    Stage 13: this becomes the Twilio WhatsApp send and `identity` is a phone number.
+    THE outbound choke point: escalation replies, price decisions, order confirmations and rider
+    updates all arrive here, so the Telegram→WhatsApp cutover is a dispatch in this one function
+    rather than a change at nine call sites. `identity` is a Telegram user id today and an E.164
+    phone number once a shop is switched (migration 028).
     """
-    return await _send(shop.telegram_customer_bot_token, identity, text, what="customer message")
+    from app.messaging.channel import channel_for
+
+    return await channel_for(shop).send_text(shop, identity, text)
+
+
+async def _send_photo(
+    token: str | None, chat_id: int | str, photo: bytes, caption: str | None = None
+) -> bool:
+    """Raw Telegram photo send. Best-effort; never raises."""
+    if not token:
+        logger.error("cannot send photo: no bot token configured")
+        return False
+    try:
+        async with Bot(token) as bot:
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
+        return True
+    except TelegramError as e:
+        logger.error("failed to send photo to chat=%s: %s", chat_id, e)
+        return False
+    except Exception:
+        logger.exception("unexpected error sending photo to chat=%s", chat_id)
+        return False
 
 
 async def send_photo_to_customer(
     shop: Shop, identity: str, photo: bytes, caption: str | None = None
 ) -> bool:
-    """Send a photo to the customer on the shop's customer bot. Best-effort; never raises.
+    """Send a photo to the customer on whichever channel they are on. Best-effort; never raises.
 
     Takes raw bytes, not a Telegram file_id: file_ids are bound to the bot that received them, so a
     photo the keeper bot got cannot be re-sent by the customer bot by id — the caller downloads the
-    bytes off the keeper bot and hands them here (ADR-005).
+    bytes off the keeper bot and hands them here (ADR-005). WhatsApp needs an upload rather than a
+    re-send, which is why this goes through the channel too instead of straight to Telegram.
     """
-    token = shop.telegram_customer_bot_token
-    if not token:
-        logger.error("cannot send customer photo: no customer bot token for shop=%s", shop.id)
-        return False
-    try:
-        async with Bot(token) as bot:
-            await bot.send_photo(chat_id=identity, photo=photo, caption=caption)
-        return True
-    except TelegramError as e:
-        logger.error("failed to send customer photo to chat=%s: %s", identity, e)
-        return False
-    except Exception:
-        logger.exception("unexpected error sending customer photo to chat=%s", identity)
-        return False
+    from app.messaging.channel import channel_for
+
+    return await channel_for(shop).send_photo(shop, identity, photo, caption)

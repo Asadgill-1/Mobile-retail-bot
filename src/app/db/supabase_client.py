@@ -66,6 +66,9 @@ def _row_to_shop(row: dict) -> Shop:
         assistant_style=row.get("assistant_style"),
         haggle_ask_every_time=row.get("haggle_ask_every_time", True),
         ai_max_discount_pct=row.get("ai_max_discount_pct") or 0,
+        # Customer channel (migration 028); staff bots are always Telegram.
+        customer_channel=row.get("customer_channel") or "telegram",
+        whatsapp_phone_id=row.get("whatsapp_phone_id"),
         # ADR-005 per-shop bot tokens (persisted on the live shops rows).
         telegram_keeper_bot_token=row.get("telegram_keeper_bot_token"),
         telegram_customer_bot_token=row.get("telegram_customer_bot_token"),
