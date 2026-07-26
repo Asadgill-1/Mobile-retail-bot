@@ -130,6 +130,8 @@ async def _run_op(op: str, args: dict, redis: Any, client: Any | None) -> dict |
     identity = str(args.get("identity") or "").strip()
     if op == "llm_test":
         return await _llm_test()
+    if op == "customer_channel_changed":
+        return await _customer_channel_changed(args)
     if not identity:
         raise ValueError("identity is required")
 
@@ -152,6 +154,29 @@ async def _run_op(op: str, args: dict, redis: Any, client: Any | None) -> dict |
     else:
         raise ValueError(f"unknown op {op!r}")
     return None
+
+
+async def _customer_channel_changed(args: dict) -> dict:
+    """The console moved a shop's customers between Telegram and WhatsApp (028).
+
+    The bot process builds its applications once at start-up, so a shop switched to WhatsApp still
+    has a Telegram customer bot polling. Stopping it here means the customer never gets answers on
+    two channels at once, which would be worse than a delay: two identities, two sessions, and a
+    shopkeeper seeing half a conversation.
+
+    Only reachable when the drain runs INSIDE the bot process — which is where the heartbeat runs
+    it. Elsewhere (a Celery worker) there is nothing to stop and the op reports that honestly
+    rather than claiming success.
+    """
+    shop_id = str(args.get("shop_id") or "").strip()
+    channel = str(args.get("channel") or "").strip()
+    if not shop_id:
+        raise ValueError("shop_id is required")
+
+    from app.telegram_bot.bot import stop_customer_bot
+
+    stopped = await stop_customer_bot(shop_id) if channel == "whatsapp" else False
+    return {"shop_id": shop_id, "channel": channel, "telegram_customer_bot_stopped": stopped}
 
 
 async def drain_ops(redis: Any, client: Any | None = None) -> int:

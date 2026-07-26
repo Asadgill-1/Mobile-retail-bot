@@ -341,3 +341,37 @@ async def test_resolve_rider_unknown_code_is_rider_not_found(monkeypatch):
 def test_rider_ref_falls_back_to_uuid_before_backfill():
     assert bot._rider_ref({"id": "abc", "rider_number": 3}) == "rider003"
     assert bot._rider_ref({"id": "abc"}) == "abc"  # 010 hasn't numbered the row yet
+
+
+@pytest.mark.asyncio
+async def test_a_shop_switched_to_whatsapp_gets_no_telegram_customer_bot(monkeypatch):
+    """Its customers are on WhatsApp now. A customer bot still polling here would answer the same
+    person on two channels, under two identities, with the shopkeeper seeing half a conversation.
+    The KEEPER bot must keep running — only the customer moves (migration 028)."""
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg.settings, "telegram_shop_bots_json", _SHOP_BOTS_ENV)
+    monkeypatch.setattr(cfg.settings, "telegram_rider_bot_token", "")
+    monkeypatch.setattr(cfg.settings, "telegram_shopowner_bot_token", "")
+    from app.db.in_memory import InMemoryTenantRepo
+    from app.tenants.service import TenantService
+
+    repo = InMemoryTenantRepo()
+    repo.seed_default()
+    shops = await repo.list_shops()
+    shops[0].customer_channel = "whatsapp"
+
+    bot._customer_apps.clear()
+    apps = await bot._build_all_applications(TenantService(repo))
+
+    # 1 owner + 2 keepers + 1 remaining customer bot = 4 (was 5)
+    assert len(apps) == 4
+    assert str(shops[0].id) not in bot._customer_apps
+    assert str(shops[1].id) in bot._customer_apps, "the other shop is untouched"
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_customer_bot_is_idempotent():
+    """The console can queue the switch more than once, and the op may land in a process that
+    never ran that bot. Neither is an error."""
+    assert await bot.stop_customer_bot("00000000-0000-0000-0000-000000000000") is False

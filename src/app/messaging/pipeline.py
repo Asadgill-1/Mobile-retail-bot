@@ -171,6 +171,13 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
     """Steps 2–7 of the SPEC §9 pipeline, run under the session lock."""
     shop = msg.shop
 
+    # They wrote to us: this opens WhatsApp's 24h free-form reply window. Stamped before any
+    # branch below, because a quarantined or blacklisted customer still wrote to us — the stamp
+    # records a fact about them, not a decision about us.
+    from app.messaging.channel import note_inbound
+
+    await note_inbound(redis, shop.id, msg.identity)
+
     # Step 2 — shop suspended → auto-reply, stop (SPEC §2, §9). LIVE.
     if shop.status == ShopStatus.SUSPENDED:
         return PipelineResult(_suspended_reply(shop), "suspended")

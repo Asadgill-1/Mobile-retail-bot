@@ -87,7 +87,10 @@ async def test_suspended_shop_replies_unavailable_and_skips_metering(redis):
     res = await process_message(InboundMessage(shop, "p1", "hi"), redis)
     assert res.action == "suspended"
     assert "unavailable" in res.reply.lower()
-    assert await redis.dbsize() == 0  # suspended path must not meter usage
+    # The paused shop must not be billed for this. (Asserted on usage keys, not dbsize: the
+    # pipeline also stamps the 24h service window, which records that the CUSTOMER wrote — a fact
+    # about them, true whether or not we chose to answer.)
+    assert [k async for k in redis.scan_iter(match="usage:*")] == []
 
 
 @pytest.mark.asyncio

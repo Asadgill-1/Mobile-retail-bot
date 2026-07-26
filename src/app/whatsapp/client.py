@@ -33,7 +33,29 @@ _UNCONFIGURED = "shop=%s is on the whatsapp channel but no sender is configured 
 
 
 async def send_text(shop: Any, identity: str, text: str) -> bool:
+    if not await _free_form_allowed(shop, identity):
+        return False
     logger.error(_UNCONFIGURED, getattr(shop, "id", "?"))
+    return False
+
+
+async def _free_form_allowed(shop: Any, identity: str) -> bool:
+    """Whether we may still send an ordinary message, or need an approved template.
+
+    The tracking is live now so the implementation cannot forget it: outside the window the
+    provider accepts the call and drops the message, which looks like success. A shopkeeper who
+    approves a price the next morning would never learn the customer was not told.
+    """
+    from app.db.redis_client import get_redis
+    from app.messaging.channel import within_service_window
+
+    if await within_service_window(get_redis(), getattr(shop, "id", None), identity):
+        return True
+    logger.error(
+        "shop=%s identity=%s is outside the 24h service window — this needs an approved "
+        "template, not a free-form message. Not sent.",
+        getattr(shop, "id", "?"), identity,
+    )
     return False
 
 

@@ -2889,13 +2889,48 @@ async def _build_all_applications(service: TenantService) -> list[Application]:
     for shop in shops:
         if shop.telegram_keeper_bot_token:
             apps.append(build_shopkeeper_application(service, shop))
-        if shop.telegram_customer_bot_token:
-            apps.append(build_customer_application(service, shop))
+        # Keeper bots are always Telegram. The CUSTOMER bot only runs while the shop is still on
+        # the telegram channel (028) — once switched, its customers are on WhatsApp and a polling
+        # bot here would answer the same person twice, under two identities.
+        if shop.telegram_customer_bot_token and shop.customer_channel != "whatsapp":
+            customer_app = build_customer_application(service, shop)
+            _customer_apps[str(shop.id)] = customer_app  # so the console can stop it live
+            apps.append(customer_app)
     if settings.telegram_rider_bot_token:  # global rider bot (delivery assignments)
         apps.append(build_rider_application(service))
     if settings.telegram_shopowner_bot_token:  # global shop-owner bot (client reports, ADR-006)
         apps.append(build_shopowner_application(service))
     return apps
+
+
+# Customer bots that are currently polling, by shop id — so the console can switch a shop to
+# WhatsApp without waiting for a restart. Only populated in the process that actually runs them.
+_customer_apps: dict[str, Application] = {}
+
+
+async def stop_customer_bot(shop_id: str) -> bool:
+    """Stop this shop's Telegram customer bot. True if one was running here.
+
+    Called when the console moves a shop to WhatsApp. Leaving it polling would answer the same
+    customer on two channels under two identities, which is worse than the switch being slow.
+    Idempotent: a shop that is not running here is not an error, it just returns False.
+    """
+    app = _customer_apps.pop(str(shop_id), None)
+    if app is None:
+        return False
+    for step in ("updater_stop", "stop", "shutdown"):
+        try:
+            if step == "updater_stop":
+                if app.updater is not None:
+                    await app.updater.stop()
+            elif step == "stop":
+                await app.stop()
+            else:
+                await app.shutdown()
+        except Exception:  # noqa: BLE001 — a stuck bot must not block the switch
+            logger.exception("stopping customer bot for shop=%s failed at %s", shop_id, step)
+    logger.info("customer bot stopped for shop=%s (moved to WhatsApp)", shop_id)
+    return True
 
 
 async def _run_apps_forever(service: TenantService) -> None:
@@ -2939,6 +2974,7 @@ async def _run_apps_forever(service: TenantService) -> None:
         await stop.wait()
     finally:
         heartbeat.cancel()
+        _customer_apps.clear()  # anything still here is about to be shut down below
         for app in reversed(apps):
             try:
                 await app.stop()
