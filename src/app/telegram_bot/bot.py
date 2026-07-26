@@ -1832,7 +1832,7 @@ async def _customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     The handler no longer answers directly: it hands the text to the shop's `Pacer`, which waits
     for the customer to finish typing, answers the whole thought once, and types the reply out in
-    short messages. See telegram_bot/pacing.py for the interruption rules.
+    short messages. See messaging/pacing.py for the interruption rules.
     """
     from app.db.redis_client import get_redis
     from app.messaging.pipeline import InboundMessage, process_message
@@ -1880,7 +1880,7 @@ async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media:
 
 def build_customer_application(service: TenantService, shop: Shop) -> Application:
     """Per-shop customer bot: customer-facing channel (Telegram-first testing)."""
-    from app.telegram_bot.pacing import Pacer
+    from app.messaging.pacing import Pacer
 
     if not shop.telegram_customer_bot_token:
         raise RuntimeError(f"shop {shop.id} has no telegram_customer_bot_token")

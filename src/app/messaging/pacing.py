@@ -11,9 +11,15 @@ Three separate problems, all visible in real transcripts (Stage 12k):
 The fix is one worker per conversation. It waits a moment for the customer to finish, answers the
 whole thought at once, then types the reply out in a couple of short messages.
 
-Why this lives in the bot layer and not the pipeline: `process_message` holds a per-customer Redis
-lock while it runs. Sleeping inside it would hold that lock through every typing pause. Here the
-lock is already released before any of the waiting happens.
+Why this wraps the pipeline rather than living inside it: `process_message` holds a per-customer
+Redis lock while it runs. Sleeping inside it would hold that lock through every typing pause. Here
+the lock is already released before any of the waiting happens.
+
+Why it is channel-agnostic and no longer under `telegram_bot/`: it takes `answer`, `send` and
+`typing` as callables, so the Telegram bot supplies PTB sends and the WhatsApp webhook supplies its
+own. It also turns out to be a capacity mechanism, not only a humanising one — at 400 msg/min the
+same load answered 248 messages with zero drops through here, against 231 answered and 162 dropped
+going straight at the pipeline, using 38% fewer model round-trips (scripts/loadtest.py --paced).
 
 Interruption rules — the careful part, because customers here fire off new questions mid-answer:
   * A message arriving while we are WAITING or TYPING cancels the worker and restarts the window.

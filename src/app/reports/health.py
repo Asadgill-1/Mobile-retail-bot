@@ -17,7 +17,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.escalations.context import session_key
-from app.security.service import quarantine_key
+from app.security.service import quarantine_glob
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ async def check_health(redis: Any, repo: Any, *, include_celery: bool = True) ->
     metrics: dict[str, int] = {}
     try:
         metrics["active_conversations"] = await _count_keys(redis, session_key("*", "*"))
-        metrics["quarantined"] = await _count_keys(redis, quarantine_key("*"))
+        metrics["quarantined"] = await _count_keys(redis, quarantine_glob())
     except Exception as e:  # metrics are best-effort — never fail the check over a count
         logger.warning("health metrics failed: %s", e)
 

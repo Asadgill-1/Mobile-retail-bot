@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.telegram_bot.pacing import Pacer, split_bubbles, strip_markdown, typing_delay
+from app.messaging.pacing import Pacer, split_bubbles, strip_markdown, typing_delay
 
 
 # --- formatting the sender has to undo (the model slips; there is no parse_mode) ---

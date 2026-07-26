@@ -61,13 +61,16 @@ async def get_setting(key: str, client: Any | None = None) -> Any | None:
 # --- health snapshot --------------------------------------------------------
 async def _quarantined(redis: Any, limit: int = 200) -> list[str]:
     """Identities currently quarantined (the console's Security tab lists them)."""
-    from app.security.service import quarantine_key
+    from app.security.service import identity_from_quarantine_key, quarantine_glob
 
-    prefix = quarantine_key("")
+    # Keys are per shop (quarantine:{shop_id}:{identity}); the same person quarantined at two
+    # shops is one entry in this list, because the console asks "who is blocked", not "where".
     out: list[str] = []
-    async for key in redis.scan_iter(match=quarantine_key("*")):
+    async for key in redis.scan_iter(match=quarantine_glob()):
         k = key.decode() if isinstance(key, bytes) else key
-        out.append(k[len(prefix):] if k.startswith(prefix) else k)
+        identity = identity_from_quarantine_key(k)
+        if identity not in out:
+            out.append(identity)
         if len(out) >= limit:
             break
     return out

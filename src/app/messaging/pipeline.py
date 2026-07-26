@@ -180,7 +180,7 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
         return PipelineResult(None, "blacklisted")
 
     # Step 4 — quarantine → generic reply (SPEC §7). Set by step 6 or the owner's /blacklist path.
-    if await is_quarantined(redis, msg.identity):
+    if await is_quarantined(redis, shop.id, msg.identity):
         return PipelineResult(_QUARANTINE_REPLY, "quarantined")
 
     # Step 4b — AI frozen by an escalation (SPEC §3 step 4). The shopkeeper owns this
@@ -198,7 +198,7 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
 
     # Step 6 — attack detection → auto-quarantine + owner alert (SPEC §7). Bump the rapid-fire
     # counter first so a flood trips even when each individual message looks innocent.
-    attack = detect_attack(msg.text, msg_count_60s=await bump_rate(redis, msg.identity))
+    attack = detect_attack(msg.text, msg_count_60s=await bump_rate(redis, shop.id, msg.identity))
     if attack is not None:
         await quarantine(redis, shop, msg.identity, attack, message=msg.text)
         return PipelineResult(_QUARANTINE_REPLY, "attack")
@@ -212,7 +212,10 @@ async def _dispatch(msg: InboundMessage, redis: Any) -> PipelineResult:
     # Cost/abuse ceiling: a per-customer DAILY cap on AI-answered messages. Rapid-fire (step 6)
     # stops 60-second bursts; this stops a sustained flood just under that threshold from running up
     # the LLM bill (matters at 30 shops × high volume). Far above any real customer; 0 disables.
-    if settings.ai_daily_msg_cap and await bump_daily(redis, msg.identity) > settings.ai_daily_msg_cap:
+    if (
+        settings.ai_daily_msg_cap
+        and await bump_daily(redis, shop.id, msg.identity) > settings.ai_daily_msg_cap
+    ):
         logger.warning("daily AI cap hit identity=%s shop=%s", msg.identity, shop.id)
         return PipelineResult(_QUARANTINE_REPLY, "rate_capped")
 

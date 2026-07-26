@@ -29,7 +29,7 @@ def redis():
 async def test_healthy_when_all_up_and_counts_metrics(redis, monkeypatch):
     monkeypatch.setattr(health, "_worker_count", lambda: 1)
     await redis.set(session_key(uuid4(), "+199"), "[]")       # one active conversation
-    await redis.set(quarantine_key("+666"), "1")              # one quarantined
+    await redis.set(quarantine_key(uuid4(), "+666"), "1")     # one quarantined
 
     report = await check_health(redis, _repo())
 

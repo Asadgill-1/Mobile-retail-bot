@@ -1,9 +1,19 @@
 """Twilio WhatsApp inbound webhook (SPEC §1, §9 step 1, §11; ADR-002).
 
-Verifies the Twilio signature, resolves the shop from the `To` number, enqueues
-the SPEC §9 pipeline to Celery, and returns 200 immediately (SPEC §11). Mocked
-during Telegram-first testing (no real numbers); activated at Stage 13. Signature
-verification is real and unit-tested now so Stage 13 is a cutover, not a build.
+Verifies the Twilio signature, resolves the shop from the `To` number, hands the message to this
+conversation's paced worker, and returns 200 immediately (SPEC §11). Mocked during Telegram-first
+testing (no real numbers); activated once a shop is switched to the whatsapp channel (028).
+
+Why the Pacer and not Celery. The obvious shape — enqueue and let a worker run the pipeline — loses
+two things at once. Every bit of the paced, human-feeling delivery (debounce, fragment coalescing,
+typing, short bubbles) lives in in-process memory, so it cannot survive a hop to another process.
+And any worker could pick up a conversation another worker is mid-way through, which is exactly the
+session-lock contention the load harness measured: driven straight at the pipeline, 400 messages a
+minute lost 162 of them; through the Pacer, none, at half the p95 and 38% fewer model round-trips.
+
+So the `api` process owns the customer path end to end, the way the bot process owns Telegram. The
+cost is that the customer path wants ONE uvicorn worker — conversations sharded across processes
+would break coalescing again. At ~7 messages/second of I/O-bound work that is not the bottleneck.
 """
 
 from __future__ import annotations
@@ -15,10 +25,18 @@ from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
 from app.db.factory import get_tenant_repo
-from app.tasks.tasks import process_whatsapp_message
+from app.db.redis_client import get_redis
+from app.messaging.channel import WHATSAPP, channel_for
+from app.messaging.pacing import Pacer
+from app.messaging.pipeline import InboundMessage, process_message
+from app.tenants.models import Shop
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# One per process, keyed by (shop, identity) inside. The bot process holds its own in bot_data;
+# this is the same class serving the other channel.
+_pacer = Pacer()
 
 
 def verify_twilio_signature(url: str, form: dict[str, str], signature: str | None) -> bool:
@@ -31,6 +49,23 @@ def verify_twilio_signature(url: str, form: dict[str, str], signature: str | Non
 def _strip_whatsapp(number: str) -> str:
     """Twilio sends 'whatsapp:+123'; shops.whatsapp_number stores '+123' (SPEC §1)."""
     return number.removeprefix("whatsapp:")
+
+
+def _deliver(shop: Shop, identity: str, text: str) -> None:
+    """Queue the message on this conversation's worker. Returns at once; the worker does the rest."""
+    channel = channel_for(shop)
+    redis = get_redis()
+
+    async def answer(batch: str):
+        return await process_message(InboundMessage(shop, identity, batch), redis)
+
+    async def send(bubble: str) -> None:
+        await channel.send_text(shop, identity, bubble)
+
+    async def typing() -> None:
+        await channel.typing(shop, identity)
+
+    _pacer.submit(shop.id, identity, text, answer=answer, send=send, typing=typing)
 
 
 @router.post("/webhook/whatsapp")
@@ -46,10 +81,14 @@ async def whatsapp_inbound(request: Request) -> Response:
         logger.warning("whatsapp webhook: no shop for To=%s", to)
         return Response(status_code=200)  # ack silently — don't leak which numbers are live
 
-    process_whatsapp_message.delay(
-        shop_id=str(shop.id),
-        identity=_strip_whatsapp(form.get("From", "")),
-        body=form.get("Body", ""),
-        message_sid=form.get("MessageSid"),
-    )
-    return Response(status_code=200)  # SPEC §11: return immediately, process in Celery
+    # A shop still on Telegram must not be drivable through this endpoint: its customers are a
+    # different identity space (Telegram user ids, not phone numbers), so accepting one here would
+    # start a parallel conversation under a stranger's identity.
+    if shop.customer_channel != WHATSAPP:
+        logger.warning(
+            "whatsapp webhook: shop=%s is on the %s channel; ignoring", shop.id, shop.customer_channel
+        )
+        return Response(status_code=200)
+
+    _deliver(shop, _strip_whatsapp(form.get("From", "")), form.get("Body", ""))
+    return Response(status_code=200)  # SPEC §11: return immediately, the worker answers

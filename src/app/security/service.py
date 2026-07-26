@@ -27,11 +27,24 @@ from app.tenants.models import Shop
 logger = logging.getLogger(__name__)
 
 # --- Redis key templates (shared with the pipeline via the functions below) ---
-_QUARANTINE_KEY = "quarantine:{identity}"
+#
+# SCOPE, decided rather than inherited. Sessions have always been per shop
+# (`session:{shop_id}:{identity}`); these were not, and that only stayed invisible because a
+# Telegram customer would have to go and message several shops. On WhatsApp `identity` is a stable
+# phone number, so one person tripping the attack detector at one shop would have been answered
+# with "Your message could not be processed." by all 30, and one person's daily AI cap would have
+# been shared across every shop on the platform. The shops are independent businesses.
+#
+#   per shop  — quarantine, rate, dayrate: set automatically by the detector or the meter, and
+#               about one conversation with one shop.
+#   platform  — blacklist, bypass_ai: both are platform-OWNER commands (see the owner security
+#               commands in telegram_bot/bot.py). Banning someone from one shop but not the other
+#               29 is not what the owner means when they type /blacklist.
+_QUARANTINE_KEY = "quarantine:{shop_id}:{identity}"
 _BYPASS_KEY = "bypass_ai:{identity}"
 _BLACKLIST_KEY = "blacklist:{identity}"
-_RATE_KEY = "rate:{identity}"
-_DAYRATE_KEY = "dayrate:{identity}"
+_RATE_KEY = "rate:{shop_id}:{identity}"
+_DAYRATE_KEY = "dayrate:{shop_id}:{identity}"
 
 QUARANTINE_TTL_SECONDS = 3_600  # SPEC §7: 1-hour quarantine
 QUARANTINE_EXTEND_SECONDS = 86_400  # /quarantine_extend → 24h. ponytail: fixed; make an arg if asked.
@@ -39,8 +52,35 @@ RATE_WINDOW_SECONDS = 60  # SPEC §7 rapid-fire window
 DAY_WINDOW_SECONDS = 86_400  # per-customer daily cap window
 
 
-def quarantine_key(identity: str) -> str:
-    return _QUARANTINE_KEY.format(identity=identity)
+def quarantine_key(shop_id: Any, identity: str) -> str:
+    return _QUARANTINE_KEY.format(shop_id=shop_id, identity=identity)
+
+
+def quarantine_glob(identity: str = "*", shop_id: Any = "*") -> str:
+    """Match pattern for quarantine keys — every shop by default."""
+    return _QUARANTINE_KEY.format(shop_id=shop_id, identity=identity)
+
+
+def identity_from_quarantine_key(key: str) -> str:
+    """`quarantine:{shop_id}:{identity}` → identity. Shop ids contain no ':', so split from the
+    left twice; the identity itself is returned whole even if it somehow contains one."""
+    parts = key.split(":", 2)
+    return parts[2] if len(parts) == 3 else key
+
+
+async def clear_quarantine_everywhere(redis: Any, identity: str) -> int:
+    """Lift this person's quarantine at EVERY shop. Returns how many were cleared.
+
+    The owner's commands take an identity, not a shop — "/quarantine_lift +971..." means "this
+    person is not a threat", not "this person is not a threat at one of my thirty shops". The keys
+    are per shop so one shop's detector cannot silence a customer at the other twenty-nine; lifting
+    is the deliberate opposite.
+    """
+    cleared = 0
+    async for key in redis.scan_iter(match=quarantine_glob(identity)):
+        await redis.delete(key)
+        cleared += 1
+    return cleared
 
 
 def bypass_key(identity: str) -> str:
@@ -52,8 +92,8 @@ def blacklist_key(identity: str) -> str:
 
 
 # --- hot-path reads (called by messaging/pipeline.py) ---
-async def is_quarantined(redis: Any, identity: str) -> bool:
-    return bool(await redis.exists(quarantine_key(identity)))
+async def is_quarantined(redis: Any, shop_id: Any, identity: str) -> bool:
+    return bool(await redis.exists(quarantine_key(shop_id, identity)))
 
 
 async def is_bypassed(redis: Any, identity: str) -> bool:
@@ -64,18 +104,18 @@ async def is_blacklisted(redis: Any, identity: str) -> bool:
     return bool(await redis.exists(blacklist_key(identity)))
 
 
-async def bump_rate(redis: Any, identity: str) -> int:
-    """Increment this customer's 60-second message counter and return the new count."""
-    key = _RATE_KEY.format(identity=identity)
+async def bump_rate(redis: Any, shop_id: Any, identity: str) -> int:
+    """Increment this customer's 60-second counter AT THIS SHOP and return the new count."""
+    key = _RATE_KEY.format(shop_id=shop_id, identity=identity)
     count = await redis.incr(key)
     if count == 1:
         await redis.expire(key, RATE_WINDOW_SECONDS)
     return count
 
 
-async def bump_daily(redis: Any, identity: str) -> int:
-    """Increment this customer's 24h AI-message counter and return the new count (cost/abuse cap)."""
-    key = _DAYRATE_KEY.format(identity=identity)
+async def bump_daily(redis: Any, shop_id: Any, identity: str) -> int:
+    """Increment this customer's 24h AI-message counter AT THIS SHOP (cost/abuse cap)."""
+    key = _DAYRATE_KEY.format(shop_id=shop_id, identity=identity)
     count = await redis.incr(key)
     if count == 1:
         await redis.expire(key, DAY_WINDOW_SECONDS)
@@ -101,7 +141,9 @@ async def quarantine(
 
     Returns the incident id (None if the DB write failed — quarantine + alert still happen).
     """
-    await redis.set(quarantine_key(identity), attack.attack_type, ex=QUARANTINE_TTL_SECONDS)
+    await redis.set(
+        quarantine_key(shop.id, identity), attack.attack_type, ex=QUARANTINE_TTL_SECONDS
+    )
 
     snapshot = await history(redis, shop.id, identity)  # last 25, oldest→newest (SPEC §7)
     if message:
@@ -175,18 +217,23 @@ async def get_incident(incident_id: str, client: Any | None = None) -> dict | No
 
 
 async def lift_quarantine(redis: Any, identity: str) -> None:
-    await redis.delete(quarantine_key(identity))
+    await clear_quarantine_everywhere(redis, identity)
 
 
 async def extend_quarantine(redis: Any, identity: str) -> None:
-    """Re-arm the quarantine for a longer window (owner decided this one is a real threat)."""
-    await redis.set(quarantine_key(identity), "extended", ex=QUARANTINE_EXTEND_SECONDS)
+    """Re-arm the quarantine for a longer window (owner decided this one is a real threat).
+
+    Only where a quarantine already exists: someone can be a threat at the shop they attacked
+    without being pre-emptively blocked at twenty-nine they have never messaged. To block
+    everywhere, the owner has /blacklist."""
+    async for key in redis.scan_iter(match=quarantine_glob(identity)):
+        await redis.set(key, "extended", ex=QUARANTINE_EXTEND_SECONDS)
 
 
 async def blacklist(redis: Any, identity: str, shop_id: UUID | None, reason: str, client: Any | None = None) -> None:
     """Permanently block a number: Redis hot-path key + durable DB row. Also lifts any quarantine."""
     await redis.set(blacklist_key(identity), reason or "blacklisted")  # no TTL — permanent
-    await redis.delete(quarantine_key(identity))
+    await clear_quarantine_everywhere(redis, identity)
     sb = _sb(client)
 
     def _q() -> None:
@@ -212,5 +259,5 @@ async def remove_bypass(redis: Any, identity: str) -> None:
 
 async def forward_to_shop(redis: Any, identity: str) -> None:
     """Owner clears a (false-positive) quarantine and routes the number to the shop instead."""
-    await redis.delete(quarantine_key(identity))
+    await clear_quarantine_everywhere(redis, identity)
     await set_bypass(redis, identity)

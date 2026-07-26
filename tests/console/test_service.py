@@ -7,6 +7,7 @@ one bad op must not wedge the queue, and neither feature may break the health be
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import uuid4
 
 import fakeredis.aioredis
 import pytest
@@ -73,7 +74,7 @@ def redis() -> fakeredis.aioredis.FakeRedis:
 async def test_snapshot_publishes_health_and_quarantined_list(redis):
     from app.security.service import quarantine_key
 
-    await redis.set(quarantine_key("p1"), "1")
+    await redis.set(quarantine_key(uuid4(), "p1"), "1")
     sb = _FakeSB()
     report = SimpleNamespace(ok=True, checks={"db": "ok"}, metrics={"quarantined": 1})
 
@@ -102,14 +103,15 @@ async def test_snapshot_never_raises_when_redis_scan_fails(redis):
 async def test_drain_executes_ops_through_the_real_security_functions(redis):
     from app.security.service import bypass_key, quarantine_key
 
-    await redis.set(quarantine_key("p1"), "1")
+    shop_id = uuid4()
+    await redis.set(quarantine_key(shop_id, "p1"), "1")
     sb = _FakeSB(pending=[
         {"id": "op1", "op": "quarantine_lift", "args": {"identity": "p1"}},
         {"id": "op2", "op": "bypass_set", "args": {"identity": "p2"}},
     ])
 
     assert await drain_ops(redis, client=sb) == 2
-    assert await redis.exists(quarantine_key("p1")) == 0  # lifted for real
+    assert await redis.exists(quarantine_key(shop_id, "p1")) == 0  # lifted for real
     assert await redis.exists(bypass_key("p2")) == 1      # bypass really set
     assert all("applied_at" in patch for _, patch in sb.updates)
 

@@ -164,7 +164,7 @@ async def main() -> int:
     actions: Counter[str] = Counter()
     errors: list[str] = []
 
-    from app.telegram_bot.pacing import Pacer
+    from app.messaging.pacing import Pacer
 
     pacer = Pacer()
     sent: list[str] = []

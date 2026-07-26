@@ -46,25 +46,35 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def _shop() -> Shop:
-    return Shop(id=uuid4(), client_id=uuid4(), name="Shop 01", whatsapp_number="+10000000001")
+def _shop(channel: str = "whatsapp") -> Shop:
+    return Shop(
+        id=uuid4(),
+        client_id=uuid4(),
+        name="Shop 01",
+        whatsapp_number="+10000000001",
+        customer_channel=channel,
+    )
 
 
-def test_bad_signature_returns_403(client, monkeypatch):
+@pytest.fixture
+def delivered(monkeypatch) -> MagicMock:
+    """Spy on the hand-off to the paced worker (which replaced the Celery enqueue)."""
+    spy = MagicMock()
+    monkeypatch.setattr(webhook, "_deliver", spy)
+    return spy
+
+
+def test_bad_signature_returns_403(client, monkeypatch, delivered):
     monkeypatch.setattr(webhook, "verify_twilio_signature", lambda *a: False)
-    delay = MagicMock()
-    monkeypatch.setattr(webhook.process_whatsapp_message, "delay", delay)
     r = client.post("/webhook/whatsapp", data={"To": "whatsapp:+10000000001", "Body": "hi"})
     assert r.status_code == 403
-    delay.assert_not_called()
+    delivered.assert_not_called()
 
 
-def test_known_shop_enqueues_and_returns_200(client, monkeypatch):
+def test_known_shop_is_handed_to_its_paced_worker(client, monkeypatch, delivered):
     shop = _shop()
     monkeypatch.setattr(webhook, "verify_twilio_signature", lambda *a: True)
     monkeypatch.setattr(webhook, "get_tenant_repo", lambda: _FakeRepo(shop))
-    delay = MagicMock()
-    monkeypatch.setattr(webhook.process_whatsapp_message, "delay", delay)
     r = client.post(
         "/webhook/whatsapp",
         data={
@@ -75,18 +85,29 @@ def test_known_shop_enqueues_and_returns_200(client, monkeypatch):
         },
     )
     assert r.status_code == 200
-    delay.assert_called_once()
-    kw = delay.call_args.kwargs
-    assert kw["shop_id"] == str(shop.id)
-    assert kw["identity"] == "+19999999999"  # whatsapp: prefix stripped
-    assert kw["message_sid"] == "SM1"
+    delivered.assert_called_once()
+    got_shop, identity, text = delivered.call_args.args
+    assert got_shop.id == shop.id
+    assert identity == "+19999999999"  # whatsapp: prefix stripped
+    assert text == "hi"
 
 
-def test_unknown_shop_returns_200_without_enqueue(client, monkeypatch):
+def test_a_shop_still_on_telegram_is_not_drivable_through_this_endpoint(client, monkeypatch, delivered):
+    """Tenant safety, not tidiness: a Telegram shop's customers are identified by Telegram user id,
+    so accepting a phone number here would open a conversation under a stranger's identity."""
+    monkeypatch.setattr(webhook, "verify_twilio_signature", lambda *a: True)
+    monkeypatch.setattr(webhook, "get_tenant_repo", lambda: _FakeRepo(_shop(channel="telegram")))
+    r = client.post(
+        "/webhook/whatsapp",
+        data={"To": "whatsapp:+10000000001", "From": "whatsapp:+19999999999", "Body": "hi"},
+    )
+    assert r.status_code == 200  # ack, but nothing happens
+    delivered.assert_not_called()
+
+
+def test_unknown_shop_returns_200_without_delivering(client, monkeypatch, delivered):
     monkeypatch.setattr(webhook, "verify_twilio_signature", lambda *a: True)
     monkeypatch.setattr(webhook, "get_tenant_repo", lambda: _FakeRepo(None))
-    delay = MagicMock()
-    monkeypatch.setattr(webhook.process_whatsapp_message, "delay", delay)
     r = client.post("/webhook/whatsapp", data={"To": "whatsapp:+1404", "Body": "hi"})
     assert r.status_code == 200
-    delay.assert_not_called()
+    delivered.assert_not_called()

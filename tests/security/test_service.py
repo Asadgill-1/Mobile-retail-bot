@@ -12,6 +12,7 @@ from app.escalations.context import remember
 from app.security.detectors import AttackResult
 from app.security.service import (
     blacklist,
+    bump_daily,
     bump_rate,
     extend_quarantine,
     forward_to_shop,
@@ -84,20 +85,37 @@ def owner(monkeypatch) -> list:
 # --- hot-path reads ---
 @pytest.mark.asyncio
 async def test_read_flags_reflect_their_keys(redis):
-    assert not await is_quarantined(redis, "p1")
-    await redis.set("quarantine:p1", "1")
+    shop = _shop()
+    assert not await is_quarantined(redis, shop.id, "p1")
+    await redis.set(f"quarantine:{shop.id}:p1", "1")
     await redis.set("bypass_ai:p2", "1")
     await redis.set("blacklist:p3", "1")
-    assert await is_quarantined(redis, "p1")
+    assert await is_quarantined(redis, shop.id, "p1")
     assert await is_bypassed(redis, "p2")
     assert await is_blacklisted(redis, "p3")
 
 
 @pytest.mark.asyncio
 async def test_bump_rate_counts_and_expires(redis):
-    assert await bump_rate(redis, "p1") == 1
-    assert await redis.ttl("rate:p1") > 0  # first hit armed the window
-    assert await bump_rate(redis, "p1") == 2
+    shop = _shop()
+    assert await bump_rate(redis, shop.id, "p1") == 1
+    assert await redis.ttl(f"rate:{shop.id}:p1") > 0  # first hit armed the window
+    assert await bump_rate(redis, shop.id, "p1") == 2
+
+
+@pytest.mark.asyncio
+async def test_one_shop_cannot_silence_a_customer_at_another(redis):
+    """Independent businesses. A rapid-fire burst at one shop, or its detector quarantining
+    someone, must not answer that person with "could not be processed" at the other 29."""
+    a, b = _shop(), _shop()
+    await redis.set(f"quarantine:{a.id}:p1", "1")
+
+    assert await is_quarantined(redis, a.id, "p1")
+    assert not await is_quarantined(redis, b.id, "p1")
+
+    await bump_rate(redis, a.id, "p1")
+    assert await bump_rate(redis, b.id, "p1") == 1  # b counts from zero
+    assert await bump_daily(redis, b.id, "p1") == 1
 
 
 # --- quarantine + incident (SPEC §7) ---
@@ -110,8 +128,8 @@ async def test_quarantine_locks_snapshots_and_alerts_owner(redis, owner):
     incident_id = await quarantine(redis, shop, "p1", AttackResult("credprobe", "api key"), client=sb)
 
     assert incident_id == "inc-1"
-    assert await is_quarantined(redis, "p1")
-    assert await redis.ttl("quarantine:p1") > 0  # 1h TTL, not permanent
+    assert await is_quarantined(redis, shop.id, "p1")
+    assert await redis.ttl(f"quarantine:{shop.id}:p1") > 0  # 1h TTL, not permanent
     # the last-25 snapshot was written to security_incidents
     kind, table, row = sb.calls[0]
     assert (kind, table) == ("insert", "security_incidents")
@@ -145,32 +163,41 @@ async def test_quarantine_survives_a_failed_db_write(redis, owner):
         def execute(self):
             raise RuntimeError("db down")
 
-    inc = await quarantine(redis, _shop(), "p1", AttackResult("sql", "drop table"), client=_BadSB())
+    shop = _shop()
+    inc = await quarantine(redis, shop, "p1", AttackResult("sql", "drop table"), client=_BadSB())
     assert inc is None  # write failed
-    assert await is_quarantined(redis, "p1")  # block still holds
+    assert await is_quarantined(redis, shop.id, "p1")  # block still holds
     assert owner  # owner still alerted
 
 
 # --- owner ops ---
 @pytest.mark.asyncio
 async def test_lift_and_extend_quarantine(redis):
-    await redis.set("quarantine:p1", "1", ex=3600)
-    await lift_quarantine(redis, "p1")
-    assert not await is_quarantined(redis, "p1")
+    """The owner's commands name a person, not a shop: lifting clears them everywhere, and
+    extending re-arms wherever a quarantine actually exists."""
+    a, b = _shop(), _shop()
+    await redis.set(f"quarantine:{a.id}:p1", "1", ex=3600)
+    await redis.set(f"quarantine:{b.id}:p1", "1", ex=3600)
 
+    await lift_quarantine(redis, "p1")
+    assert not await is_quarantined(redis, a.id, "p1")
+    assert not await is_quarantined(redis, b.id, "p1"), "lifted at every shop, not just one"
+
+    await redis.set(f"quarantine:{a.id}:p1", "1", ex=3600)
     await extend_quarantine(redis, "p1")
-    assert await is_quarantined(redis, "p1")
-    assert await redis.ttl("quarantine:p1") > 3600  # extended beyond the default hour
+    assert await redis.ttl(f"quarantine:{a.id}:p1") > 3600  # extended beyond the default hour
+    assert not await is_quarantined(redis, b.id, "p1"), "not pre-armed where they never offended"
 
 
 @pytest.mark.asyncio
 async def test_blacklist_writes_redis_and_db_and_clears_quarantine(redis):
-    await redis.set("quarantine:p1", "1")
+    shop = _shop()
+    await redis.set(f"quarantine:{shop.id}:p1", "1")
     sb = _FakeSB()
     await blacklist(redis, "p1", None, "repeat attacker", client=sb)
 
     assert await is_blacklisted(redis, "p1")
-    assert not await is_quarantined(redis, "p1")  # blacklist supersedes quarantine
+    assert not await is_quarantined(redis, shop.id, "p1")  # blacklist supersedes quarantine
     assert await redis.ttl("blacklist:p1") == -1  # permanent, no expiry
     kind, table, row = sb.calls[0]
     assert (kind, table) == ("upsert", "blacklisted_phones") and row["reason"] == "repeat attacker"
@@ -187,7 +214,8 @@ async def test_set_and_remove_bypass(redis):
 
 @pytest.mark.asyncio
 async def test_forward_to_shop_lifts_quarantine_and_sets_bypass(redis):
-    await redis.set("quarantine:p1", "1")
+    shop = _shop()
+    await redis.set(f"quarantine:{shop.id}:p1", "1")
     await forward_to_shop(redis, "p1")
-    assert not await is_quarantined(redis, "p1")
+    assert not await is_quarantined(redis, shop.id, "p1")
     assert await is_bypassed(redis, "p1")
