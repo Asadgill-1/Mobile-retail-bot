@@ -150,7 +150,10 @@ async def profit_summary(
     def _q() -> list[dict]:
         r = (
             sb.table("orders")
-            .select("quantity,selling_price,discount_amount,products(cost_price,brand,model,tags)")
+            .select(
+                "quantity,selling_price,discount_amount,delivery_fee,"
+                "products(cost_price,brand,model,tags)"
+            )
             .eq("shop_id", str(shop_id))
             .gte("created_at", start.isoformat())
             .lt("created_at", end.isoformat())
@@ -160,7 +163,15 @@ async def profit_summary(
         )
         return r.data or []
 
-    summary = _aggregate(await asyncio.to_thread(_q))
+    def _keeps() -> bool:
+        r = sb.table("shops").select("rider_keeps_delivery").eq("id", str(shop_id)).execute()
+        rows = r.data or []
+        return bool(rows and rows[0].get("rider_keeps_delivery"))
+
+    rows, keeps = await asyncio.gather(
+        asyncio.to_thread(_q), asyncio.to_thread(_keeps)
+    )
+    summary = _aggregate(rows, keeps)
 
     from app.orders.counter_sales import counter_totals
 
@@ -170,26 +181,30 @@ async def profit_summary(
 def merge_counter(summary: ProfitSummary, counter_rows: list[dict]) -> ProfitSummary:
     """Pure: fold counter sales into an online-orders summary.
 
-    A counter row has no discount column — the price written on the sheet IS the price paid, so
-    it lands in revenue whole. Top products merge across both channels: the shop owner wants the
+    sold_price is the GROSS per-unit price and discount_amount (030) is the giveaway beside it —
+    exactly how an order carries selling_price and discount_amount — so revenue keeps one meaning
+    across both channels and net stays revenue − discounts. A photo-flow row from the bot has no
+    discount and defaults to 0. Top products merge across both channels: the shop owner wants the
     best seller, not the best seller *online*.
     """
     if not counter_rows:
         return summary
 
-    revenue = cost = profit = Decimal("0")
+    revenue = cost = profit = discounts = Decimal("0")
     by_product: dict[str, ProfitLine] = {line.label: line for line in summary.top}
 
     for row in counter_rows:
         p = row.get("products") or {}
         qty = int(row.get("quantity") or 0)
         sell = Decimal(str(row.get("sold_price") or 0)) * qty  # sold_price is PER UNIT
+        disc = Decimal(str(row.get("discount_amount") or 0))
         cp = Decimal(str(p.get("cost_price") or 0))
-        pr = line_profit(sell, Decimal("0"), cp, qty)
+        pr = line_profit(sell, disc, cp, qty)
 
         revenue += sell
         cost += cp * qty
         profit += pr
+        discounts += disc
 
         label = f"{p.get('brand', '?')} {p.get('model', '?')}".strip()
         prev = by_product.get(label)
@@ -199,9 +214,10 @@ def merge_counter(summary: ProfitSummary, counter_rows: list[dict]) -> ProfitSum
 
     top = sorted(by_product.values(), key=lambda line: line.profit, reverse=True)[:5]
     return ProfitSummary(
-        orders=summary.orders + len(counter_rows),
+        # A void is a reversing negative row (022); counting it would report a refunded sale twice.
+        orders=summary.orders + sum(1 for r in counter_rows if int(r.get("quantity") or 0) > 0),
         revenue=summary.revenue + revenue,
-        discounts=summary.discounts,
+        discounts=summary.discounts + discounts,
         cost=summary.cost + cost,
         profit=summary.profit + profit,
         clearance_profit=summary.clearance_profit,
@@ -285,7 +301,11 @@ def _fold_product_stats(orders: list[dict], products: list[dict]) -> list[dict]:
     return rows
 
 
-def _aggregate(rows: list[dict]) -> ProfitSummary:
+def _aggregate(rows: list[dict], keeps_delivery: bool = False) -> ProfitSummary:
+    """Revenue is GROSS sales plus the delivery cash the shop keeps; `discounts` is reported beside
+    it. Migration 023 added delivery_fee and said it flows to shop revenue unless the rider keeps
+    it — this aggregate predated that column, so a shop charging for delivery under-reported by
+    exactly the fees it collected. Both dashboards compute it the same way."""
     revenue = discounts = cost = profit = clearance = Decimal("0")
     by_product: dict[str, ProfitLine] = {}
 
@@ -296,8 +316,11 @@ def _aggregate(rows: list[dict]) -> ProfitSummary:
         cp = Decimal(str(p.get("cost_price", "0")))
         qty = int(o["quantity"])
         pr = line_profit(sell, disc, cp, qty)
+        fee = Decimal(str(o.get("delivery_fee") or 0))
 
         revenue += sell
+        if not keeps_delivery:
+            revenue += fee
         discounts += disc
         cost += cp * qty
         profit += pr
@@ -368,6 +391,7 @@ async def draft_order(
     cost_total = product.cost_price * quantity
     charge = unit * quantity
     from app.telegram_bot.keyboards import keeper_order_actions as _draft_actions
+    from app.utils.vat import money, with_vat
 
     await _notify_shop(
         shop,
@@ -377,7 +401,7 @@ async def draft_order(
         f"Buy (cost): {cost_total} AED\n"
         f"List: {list_unit * quantity} AED\n"
         + (f"Discount: {discount} AED\n" if discount else "")
-        + f"Charge: {charge} AED\n"
+        + f"Charge: {charge} AED (customer pays {money(with_vat(charge))} incl. VAT)\n"
         f"Margin: {charge - cost_total} AED\n"
         f"Deliver: {address}"
         + (f"\nWhen: {delivery_date}" if delivery_date else "")
@@ -441,10 +465,17 @@ async def request_price(
     # instead just meant it spent the card in its opening line.
     sweetener = await _haggle_offer(shop.id, product.id, client)
 
+    # Every `price_aed` below goes back to the model, which says it to the customer — so it carries
+    # VAT, the mirror of the `without_vat` the orchestrator applied on the way in. Everything
+    # between the two boundaries (floors, min_price, what we store) stays net.
+    from app.utils.vat import money, with_vat
+
+    quote = lambda net: money(with_vat(net))  # noqa: E731 — one name, used three lines below
+
     approved = await _approved_price(shop.id, identity, product.id, client)
     if approved is not None and requested_price >= approved:
         # We already beat what they're asking for — book it, don't re-ask.
-        return _with(sweetener, {"status": "already_approved", "price_aed": str(approved)})
+        return _with(sweetener, {"status": "already_approved", "price_aed": quote(approved)})
 
     # The AI's own authority: usable once per customer+product, and never when the customer is
     # pushing below a price we already granted (that's the shopkeeper's call).
@@ -458,7 +489,7 @@ async def request_price(
         await _grant_price(shop, identity, product, settled, client, asked=requested_price)
         return _with(sweetener, {
             "status": "approved" if requested_price >= floor else "counter",
-            "price_aed": str(settled),
+            "price_aed": quote(settled),
         })
 
     if await _pending_price_request(shop.id, identity, product.id, client) is not None:
@@ -473,10 +504,13 @@ async def request_price(
         shop,
         f"💰 Price request #{num}\n"
         f"{identity} — {product.brand} {product.model}\n"
-        f"Offer: {requested_price} AED\n"
+        # Your prices, not theirs: the customer named a VAT-inclusive figure and it is shown in
+        # brackets, but every number you act on here — and the one you type to counter — is net.
+        f"Offer: {requested_price} AED (they said {quote(requested_price)} incl. VAT)\n"
         f"List: {product.selling_price} AED\n"
         f"Buy (cost): {product.cost_price} AED\n"
-        f"Margin if approved: {requested_price - product.cost_price} AED\n\n"
+        f"Margin if approved: {requested_price - product.cost_price} AED\n"
+        f"All prices exclude VAT.\n\n"
         f"Tap below (Counter asks your price) — or /approveprice {num} / /custom {num} <price> "
         f"/ /denyprice {num}",
         keeper_price_actions(num),
@@ -499,7 +533,10 @@ async def approve_price(
     if not (Decimal("0") < price <= product.selling_price):
         raise ValueError(f"price must be between 0 and the list price ({product.selling_price} AED)")
     await _set_price_status(req["id"], "approved", price, client)
-    msg = f"Good news — we can do it for {price} AED. 🙌"
+    from app.utils.vat import money, with_vat
+
+    # The shopkeeper approves in their own (net) prices; the customer hears what they will pay.
+    msg = f"Good news — we can do it for {money(with_vat(price))} AED. 🙌"
     await send_to_customer(shop, req["phone"], msg)
     await _remember_to_customer(shop, req["phone"], msg)  # so the AI knows it's approved (not re-ask)
     return price
@@ -510,7 +547,9 @@ async def deny_price(shop: Shop, request_number: int, client: Any | None = None)
     req = await _get_price_request(shop.id, request_number, client)
     await _set_price_status(req["id"], "denied", None, client)
     product = await get_product(shop.id, UUID(req["product_id"]), client)
-    msg = f"{product.selling_price} AED is the best price we can do on this one."
+    from app.utils.vat import money, with_vat
+
+    msg = f"{money(with_vat(product.selling_price))} AED is the best price we can do on this one."
     await send_to_customer(shop, req["phone"], msg)
     await _remember_to_customer(shop, req["phone"], msg)  # so the AI holds at list, not re-ask
 
@@ -739,17 +778,25 @@ async def confirm_order(
     if patch:
         await _update_order(draft["id"], patch, client)
 
+    from app.utils.vat import money, with_vat
+
     item_net = Decimal(str(draft["selling_price"])) - eff_discount
-    total = item_net + eff_fee
+    # What the customer is told is what they pay: net + 5%. The grand total is grossed up as ONE
+    # amount and the delivery line is the remainder, so the parts always add to the total shown
+    # (grossing each line on its own can leave a stray fil that makes the receipt look wrong).
+    gross_total = with_vat(item_net + eff_fee)
+    gross_item = with_vat(item_net)
+    gross_fee = gross_total - gross_item
     p = draft.get("products") or {}
     name = f"{p.get('brand', '')} {p.get('model', '')}".strip() or "your order"
     ref = order_ref(draft["created_at"], draft["day_seq"]) if draft.get("day_seq") else f"#{order_number}"
     msg = (
         f"✅ Order {ref} confirmed!\n"
-        f"{draft['quantity']}× {name} — {item_net} AED"
+        f"{draft['quantity']}× {name} — {money(gross_item)} AED"
         + (f"\n🎁 {applied['gift_text']}" if applied["gift_text"] else "")
-        + ("\nDelivery — FREE" if applied["free_delivery"] else f"\nDelivery — {eff_fee} AED" if eff_fee > 0 else "")
-        + (f"\nTotal — {total} AED" if eff_fee > 0 or applied["free_delivery"] else "")
+        + ("\nDelivery — FREE" if applied["free_delivery"] else f"\nDelivery — {money(gross_fee)} AED" if eff_fee > 0 else "")
+        + (f"\nTotal — {money(gross_total)} AED" if eff_fee > 0 or applied["free_delivery"] else "")
+        + "\nAll prices include 5% VAT"
         + f"\nDeliver to: {draft['address']}"
         + (f"\nDelivery date: {draft['delivery_date']}" if draft.get("delivery_date") else "")
         + "\nThank you! 🙏"
@@ -844,9 +891,13 @@ async def assign_delivery(
     # COD = net product charge + delivery fee (the rider collects the full amount from the
     # customer). custody goes to 'offered' — the rider must /accept the pickup. If the shop lets
     # riders keep delivery, that split is settled at deliver/reconcile time, not here.
+    from app.utils.vat import with_vat
+
     fee = Decimal(str(order.get("delivery_fee") or 0))
     item_net = Decimal(str(order["selling_price"])) - Decimal(str(order["discount_amount"]))
-    cod = item_net + fee
+    # COD is real cash out of the customer's hand, so it carries the VAT the stored figures don't.
+    # It has to equal the invoice total, or the reconciliation shorts the shop 5% on every order.
+    cod = with_vat(item_net + fee)
     await _set_rider(order["id"], rider_id, cod, client)
 
     notified = False
@@ -862,7 +913,7 @@ async def assign_delivery(
             + (f"\nWhen: {order['delivery_date']}" if order.get("delivery_date") else "")
             + (f"\nNote: {order['special_instructions']}" if order.get("special_instructions") else "")
             + f"\n\n💵 Collect (COD): {cod} AED"
-            + (f" (incl. {fee} AED delivery)" if fee > 0 else "")
+            + (f" (incl. {cod - with_vat(item_net)} AED delivery)" if fee > 0 else "")
             + f"\n📊 Cash you already hold: {outstanding} AED"
             f"\n\nTap below — or /accept {order_number} / /notreceived {order_number}"
         )

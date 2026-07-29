@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -31,6 +31,18 @@ def test_parse_period_windows():
 
     s, e, label = parse_period("2026-06-15", TODAY)
     assert (s.date(), e.date()) == (date(2026, 6, 15), date(2026, 6, 16))
+
+
+def test_counter_sale_bounds_are_the_dubai_date_not_the_utc_one():
+    """counter_sales.sold_on is a plain DATE holding the Dubai day, and counter_sales.py compares
+    it with `start.date().isoformat()`. Dubai midnight is 20:00 the PREVIOUS day in UTC, so reading
+    the date off the UTC instant names yesterday and shifts every counter figure a day earlier.
+    The dashboard port did exactly that; this pins the behaviour it should have copied."""
+    start, end, _ = parse_period("today", TODAY)
+
+    assert (start.date().isoformat(), end.date().isoformat()) == ("2026-07-09", "2026-07-10")
+    # The same instants seen as UTC — what the broken port produced.
+    assert start.astimezone(timezone.utc).date().isoformat() == "2026-07-08"
 
 
 def test_parse_period_defaults_to_today_and_rejects_junk():

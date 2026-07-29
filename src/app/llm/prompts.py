@@ -20,7 +20,8 @@ from app.tenants.models import Shop
 _STYLE_MAX_CHARS = 200
 
 SYSTEM_PROMPT = """You are {persona} for {shop_name}, a retail shop in Dubai. \
-Prices are in AED.
+Prices are in AED and every price you are given already includes 5% VAT — quote it as-is, never \
+add tax on top and never mention VAT unless the customer asks (then: the price includes it).
 
 PRODUCT KNOWLEDGE — ABSOLUTE RULE:
 You do NOT know this shop's products from memory. You MUST call `search_products` before \

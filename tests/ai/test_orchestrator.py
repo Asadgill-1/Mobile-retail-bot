@@ -80,7 +80,8 @@ def test_serialize_hides_boost_level_but_keeps_tags():
     payload = orch._serialize(_product())
     assert "boost_level" not in payload
     assert payload["tags"] == ["clearance"]  # model needs these to phrase "clearance deal"
-    assert payload["price_aed"] == "1500.00"  # money as string, never float
+    # 030: selling_price is stored ex-VAT, and a customer must never be quoted less than they pay.
+    assert payload["price_aed"] == "1575"  # 1500 + 5% VAT, money as a string, never float
     assert isinstance(payload["price_aed"], str)
 
 
@@ -383,7 +384,10 @@ async def test_price_sort_and_budget_are_passed_through(monkeypatch, redis):
     monkeypatch.setattr(orch, "search_products", _search)
     await orch.answer_customer(_shop(), "p1", "whats your cheapest phone?", redis)
     assert seen["sort"] == "price_asc"
-    assert seen["max_price"] == 3000
+    # A budget is what the customer is willing to PAY, so it arrives VAT-inclusive and has to be
+    # net before it can filter a catalogue stored ex-VAT — otherwise "under 3000" hides the
+    # 2,900 phone that costs them 3,045.
+    assert seen["max_price"] == Decimal("2857.14")
 
 
 @pytest.mark.asyncio

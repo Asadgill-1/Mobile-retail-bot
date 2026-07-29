@@ -40,7 +40,7 @@ def _spec(specs: dict | None, *keys: str) -> str:
 
 def _row(o: dict, detailed: bool) -> list[Any]:
     p = o.get("products") or {}
-    net = float(o.get("selling_price") or 0) - float(o.get("discount_amount") or 0)  # what the customer pays
+    net = float(o.get("selling_price") or 0) - float(o.get("discount_amount") or 0)  # net charge, EX-VAT
     row = [
         o.get("order_number"), o.get("customer_name"), o.get("phone"), o.get("address"),
         p.get("category"), p.get("brand"), p.get("model"), p.get("color"),

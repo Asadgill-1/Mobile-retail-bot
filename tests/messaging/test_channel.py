@@ -12,6 +12,7 @@ visible error and is exactly what an over-tolerant test would wave through.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -172,6 +173,55 @@ async def test_the_window_is_per_shop(redis):
     await note_inbound(redis, a, "+971500000000")
     assert await within_service_window(redis, a, "+971500000000") is True
     assert await within_service_window(redis, b, "+971500000000") is False
+
+
+def test_no_customer_send_bypasses_the_channel_seam():
+    """The cutover footgun, pinned.
+
+    `send_to_customer` / `send_photo_to_customer` are the only two functions that know which channel
+    a shop's customers are on. A staff-side path that reaches for `Bot(token).send_message` directly
+    still works today — every shop is on Telegram — and goes permanently silent the moment that shop
+    is switched to WhatsApp, with no error anywhere. Grep-level, because the failure is the ABSENCE
+    of a call: no fixture can catch a path that was never wired up.
+    """
+    src = Path(__file__).resolve().parents[2] / "src" / "app"
+    allowed = {Path("telegram_bot") / "notify.py", Path("telegram_bot") / "bot.py"}
+
+    offenders = []
+    for path in src.rglob("*.py"):
+        rel = path.relative_to(src)
+        if rel in allowed or rel.parts[0] == "whatsapp":
+            continue
+        body = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(body.splitlines(), 1):
+            if "Bot(" in line and (".send_message" in line or ".send_photo" in line):
+                offenders.append(f"{rel}:{lineno}")
+
+    assert offenders == [], (
+        "these send to a chat directly instead of through the channel seam, so they will go silent "
+        f"for any shop switched to WhatsApp: {offenders}"
+    )
+
+
+def test_every_customer_notification_goes_through_one_of_the_two_senders():
+    """Counts the choke-point call sites so a new customer-facing message can't be added without
+    someone noticing it has to work cross-channel. Update the number when you add a real one."""
+    src = Path(__file__).resolve().parents[2] / "src" / "app"
+    callers = set()
+    for path in src.rglob("*.py"):
+        if path.name == "notify.py":
+            continue
+        body = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(body.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("#", '"', "'")) or "import" in stripped:
+                continue
+            if "send_to_customer(" in line or "send_photo_to_customer(" in line:
+                callers.add(f"{path.relative_to(src)}:{lineno}")
+
+    # escalation reply + escalation photo, price approved, price declined, order confirmed,
+    # delivery update, rider out-for-delivery, rider delivered.
+    assert len(callers) == 8, f"customer-facing sends changed: {sorted(callers)}"
 
 
 @pytest.mark.asyncio

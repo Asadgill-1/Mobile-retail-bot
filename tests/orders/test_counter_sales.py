@@ -204,9 +204,13 @@ async def test_record_sales_mixed_batch(sale_wire):
 
 
 # --- merge_counter: the money fold ---
-def _crow(qty, unit, cost, brand="Samsung", model="S23"):
-    return {"quantity": qty, "sold_price": str(unit),
-            "products": {"cost_price": str(cost), "brand": brand, "model": model}}
+def _crow(qty, unit, cost, brand="Samsung", model="S23", discount=None):
+    row = {"quantity": qty, "sold_price": str(unit),
+           "products": {"cost_price": str(cost), "brand": brand, "model": model}}
+    # Photo-flow rows from the bot carry no discount at all; POS rows carry one (030).
+    if discount is not None:
+        row["discount_amount"] = str(discount)
+    return row
 
 
 def test_merge_counter_adds_revenue_cost_and_profit():
@@ -242,11 +246,40 @@ def test_merge_counter_merges_top_products_across_both_channels():
     assert out.top[0].qty == 3 and out.top[0].profit == Decimal("1700")
 
 
-def test_merge_counter_keeps_discounts_and_clearance_from_online_only():
-    # A counter sheet has no discount column and no tags — those stay whatever orders said.
+def test_merge_counter_leaves_a_photo_flow_row_alone():
+    # The bot's sheet has no discount column and no tags — those stay whatever orders said.
     base = ProfitSummary(discounts=Decimal("200"), clearance_profit=Decimal("50"))
     out = merge_counter(base, [_crow(1, 100, 60)])
     assert out.discounts == Decimal("200") and out.clearance_profit == Decimal("50")
+
+
+def test_merge_counter_reports_a_pos_discount_beside_revenue():
+    # 030: sold_price stays GROSS and the giveaway sits next to it, exactly like an online order —
+    # so revenue means one thing on both channels and net is still revenue − discounts.
+    base = ProfitSummary(discounts=Decimal("200"))
+    out = merge_counter(base, [_crow(1, 1000, 600, discount=150)])
+
+    assert out.counter_revenue == Decimal("1000"), "revenue is gross, discount not netted out"
+    assert out.discounts == Decimal("350"), "online 200 + counter 150"
+    assert out.counter_profit == Decimal("250"), "(1000 − 150) − 600"
+    assert out.revenue - out.discounts == Decimal("650")
+
+
+def test_merge_counter_void_takes_back_the_discount_too():
+    base = ProfitSummary()
+    out = merge_counter(
+        base,
+        [_crow(1, 1000, 600, discount=150), _crow(-1, 1000, 600, discount=-150)],
+    )
+    assert out.revenue == Decimal("0") and out.profit == Decimal("0")
+    assert out.discounts == Decimal("0"), "a voided discount was never given away"
+
+
+def test_merge_counter_does_not_count_a_void_as_a_second_sale():
+    # Reversing rows are how a void is recorded (022); counting them reports a refund as a sale.
+    base = ProfitSummary(orders=1)
+    out = merge_counter(base, [_crow(2, 3400, 2800), _crow(-2, 3400, 2800)])
+    assert out.orders == 2, "one online order + one counter sale that was later voided"
 
 
 def test_merge_counter_margin_reflects_both_channels():

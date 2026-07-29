@@ -22,6 +22,27 @@ def _row(sell, disc, cost, qty, brand="Samsung", model="S23", tags=None):
     }
 
 
+def test_aggregate_counts_delivery_the_shop_keeps_as_revenue():
+    """023 added delivery_fee and said it flows to shop revenue unless the rider keeps it. This
+    aggregate predated the column, so /profit under-reported by exactly the fees collected while
+    both dashboards counted them — the same shop read two different revenues."""
+    row = _row(1000, 0, 600, 1)
+    row["delivery_fee"] = "25"
+
+    assert _aggregate([row]).revenue == Decimal("1025")
+    assert _aggregate([row], keeps_delivery=True).revenue == Decimal("1000")
+
+
+def test_aggregate_revenue_is_gross_with_discounts_reported_apart():
+    """Revenue is gross sales; net is revenue − discounts. Both dashboards copy this, so changing
+    one side silently would make the console and the bot disagree."""
+    s = _aggregate([_row(1500, 50, 600, 1)])
+
+    assert s.revenue == Decimal("1500")
+    assert s.discounts == Decimal("50")
+    assert s.profit == Decimal("850")  # (1500 − 50) − 600
+
+
 # --- pure aggregation ---
 def test_aggregate_totals_and_margin():
     rows = [_row(2499, 0, 2000, 1), _row(5000, 200, 2000, 2)]  # profit 499 + 800
@@ -128,7 +149,13 @@ async def test_profit_summary_reads_range_and_aggregates(monkeypatch):
         def neq(self, *a): return self
         def order(self, *a): return self
         def execute(self):
-            rows = [] if self._t == "counter_sales" else [_row(2499, 0, 2000, 1)]
+            if self._t == "counter_sales":
+                rows = []
+            elif self._t == "shops":
+                # 023: the shop keeps the delivery cash, so any fee counts as its revenue.
+                rows = [{"rider_keeps_delivery": False}]
+            else:
+                rows = [_row(2499, 0, 2000, 1)]
 
             class _R:
                 data = rows
@@ -365,7 +392,7 @@ async def test_request_price_steers_to_order_when_already_approved(price_wire, m
 
     monkeypatch.setattr(svc, "get_product", _get)
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
-    assert res == {"status": "already_approved", "price_aed": "3250"}
+    assert res == {"status": "already_approved", "price_aed": "3412.50"}  # 3250 net + 5% VAT
     assert price_wire["opened"] is None and price_wire["notified"] is None
 
 
@@ -405,7 +432,7 @@ async def test_approve_price_at_requested_and_tells_customer(price_wire):
     assert price == Decimal("3100")
     assert price_wire["status"] == ("approved", Decimal("3100"))
     ident, text = price_wire["customer"]
-    assert ident == "p1" and "3100 AED" in text
+    assert ident == "p1" and "3255 AED" in text  # 3100 approved net, quoted with VAT
 
 
 @pytest.mark.asyncio
@@ -413,7 +440,7 @@ async def test_custom_price_counters_with_shop_price(price_wire):
     price = await approve_price(_shop_obj(), 4, Decimal("3250"))
     assert price == Decimal("3250")
     assert price_wire["status"] == ("approved", Decimal("3250"))
-    assert "3250 AED" in price_wire["customer"][1]
+    assert "3412.50 AED" in price_wire["customer"][1]  # keeper counters net, customer hears gross
 
 
 @pytest.mark.asyncio
@@ -424,7 +451,7 @@ async def test_deny_price_tells_customer_the_list_price(price_wire, monkeypatch)
     monkeypatch.setattr(svc, "get_product", _get)
     await deny_price(_shop_obj(), 4)
     assert price_wire["status"] == ("denied", None)
-    assert "3400 AED" in price_wire["customer"][1]
+    assert "3570 AED" in price_wire["customer"][1]  # list 3400 net + 5% VAT
 
 
 @pytest.mark.asyncio
@@ -467,7 +494,7 @@ async def test_confirm_order_decrements_stock_and_notifies_customer(monkeypatch)
     await confirm_order(_shop_obj(), 7)
     assert cap["status"] == "confirmed"
     ident, text = cap["customer"]
-    assert ident == "p1" and "#7 confirmed" in text and "6700 AED" in text  # net = 6800 - 100
+    assert ident == "p1" and "#7 confirmed" in text and "7035 AED" in text  # (6800-100) + 5% VAT
 
 
 @pytest.mark.asyncio
@@ -555,11 +582,11 @@ async def test_assign_delivery_notifies_linked_rider_with_cod(monkeypatch):
 
     rid = uuid4()
     res = await assign_delivery(_shop_obj(), 8, rid)
-    assert res["notified"] is True and res["cod"] == Decimal("3250")  # net = 3400 − 150
-    assert cap["set"] == ("o1", str(rid), Decimal("3250"))
+    assert res["notified"] is True and res["cod"] == Decimal("3412.50")  # (3400 − 150) + 5% VAT
+    assert cap["set"] == ("o1", str(rid), Decimal("3412.50"))
     tid, text = cap["msg"]
     assert tid == 999 and "#8" in text and "Marina" in text and "Samsung S23" in text
-    assert "COD): 3250 AED" in text          # cash to collect on this order
+    assert "COD): 3412.50 AED" in text       # real cash to collect — carries the VAT
     assert "already hold: 500 AED" in text   # running balance shown at assignment
     assert "/accept 8" in text and "/notreceived 8" in text  # custody handshake offered
 
@@ -823,7 +850,7 @@ async def test_ai_settles_at_the_asked_price_when_it_clears_the_floor(price_wire
 
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3200"))
 
-    assert res == {"status": "approved", "price_aed": "3200"}
+    assert res == {"status": "approved", "price_aed": "3360"}  # settled net 3200, quoted with VAT
     assert price_wire["granted"] == Decimal("3200")
     assert price_wire["opened"] is None, "the shopkeeper must not be asked"
 
@@ -836,7 +863,7 @@ async def test_ai_counters_at_the_floor_on_a_lowball(price_wire):
 
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("2000"))
 
-    assert res == {"status": "counter", "price_aed": "3060"}
+    assert res == {"status": "counter", "price_aed": "3213"}  # floor 3060 net, quoted with VAT
     assert price_wire["granted"] == Decimal("3060")
     assert price_wire["opened"] is None
 
@@ -862,7 +889,7 @@ async def test_asking_above_a_granted_price_just_books(price_wire):
 
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("3300"))
 
-    assert res == {"status": "already_approved", "price_aed": "3060"}
+    assert res == {"status": "already_approved", "price_aed": "3213"}  # 3060 net + 5% VAT
     assert price_wire["opened"] is None
 
 
@@ -940,4 +967,4 @@ async def test_never_grants_above_the_list_price(price_wire):
     res = await request_price(_shop_obj(), "p1", uuid4(), Decimal("4000"))  # list is 3400
 
     assert price_wire["granted"] == Decimal("3400"), "clamped down to the list price"
-    assert res["price_aed"] == "3400"
+    assert res["price_aed"] == "3570"  # clamped to list 3400 net, quoted with VAT

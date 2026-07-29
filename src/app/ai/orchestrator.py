@@ -49,6 +49,7 @@ def _serialize(p: Any, *, need: int | None = None) -> dict[str, Any]:
     and the held-back offer: what the model cannot see, it cannot say.
     """
     from app.products.service import INTERNAL_TAGS
+    from app.utils.vat import money, with_vat
 
     data = {
         "id": str(p.id),
@@ -59,7 +60,10 @@ def _serialize(p: Any, *, need: int | None = None) -> dict[str, Any]:
         "condition": p.condition,
         "specs": p.specs,
         "tags": [t for t in p.tags if t not in INTERNAL_TAGS],
-        "price_aed": str(p.selling_price),
+        # VAT-INCLUSIVE. selling_price is stored before VAT; a customer must never be quoted a
+        # number smaller than the one they will be asked to pay, so the 5% goes on here — at the
+        # only place a price crosses to the model — and comes back off in `_request_price`.
+        "price_aed": money(with_vat(p.selling_price)),
         "in_stock": True,
     }
     if need:
@@ -129,10 +133,16 @@ async def _run_tool(
             need = int(args.get("need_quantity") or 0)
         except (ValueError, TypeError):
             need = 0
+        # A customer's budget is what they are willing to PAY, so it is VAT-inclusive; the
+        # catalogue it filters is stored net. Without this a "under 2000" shopper never sees the
+        # 1,950 phone that costs them 2,047.50.
+        from app.utils.vat import without_vat
+
+        budget = args.get("max_price_aed")
         products = await search_products(
             shop.id,
             args.get("requirements", ""),
-            max_price=args.get("max_price_aed"),
+            max_price=without_vat(budget) if budget else None,
             sort=sort,
             rows=catalogue,
         )
@@ -149,10 +159,14 @@ async def _request_price(args: dict[str, Any], shop: Shop, identity: str) -> dic
     """Raise a discount request for the shop to decide (ADR-010 rev.). Errors are recoverable."""
     from app.orders.service import request_price
     from app.products.service import ProductNotFound
+    from app.utils.vat import without_vat
 
     try:
         pid = UUID(str(args.get("product_id") or ""))
-        price = Decimal(str(args.get("requested_price_aed")))
+        # The customer haggles over the price they PAY, which includes VAT. Everything behind this
+        # line — floors, min_price, discount_amount, the shop's own notices — is net, so the 5%
+        # comes off here and goes back on in the replies request_price returns.
+        price = without_vat(Decimal(str(args.get("requested_price_aed"))))
     except (ValueError, TypeError, InvalidOperation):
         return {"error": "bad_request"}
     try:
