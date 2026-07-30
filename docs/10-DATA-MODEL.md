@@ -80,6 +80,9 @@
 - **New fields:** `sold_by` (text, `dashboard:{email}` on dashboard rows, null on bot rows), `payment_method` (`cash|card`, null on bot rows — the paper sheet never recorded one).
 - **Invariant:** `orders.service.merge_counter`/`counter_totals` are plain sums over `quantity`/`sold_price`, so a void row nets its original out automatically — **no Python code changed** to support voids.
 
+### counter_sales.discount_amount  (migration 030, Stage 12l)
+- **New field:** `discount_amount` numeric, default 0 — mirrors `orders.discount_amount`. `sold_price` stays the GROSS per-unit price (**before VAT**); the giveaway sits beside it, not carved out of it, so revenue keeps one meaning across both channels and `merge_counter` reports `discounts = online + counter` in one figure. No `>= 0` check: a void row (see above) carries the **negative** discount, so a voided discount cancels itself out of every sum exactly the way its quantity and price already do. A bot photo-flow row (no discount column on the paper sheet) simply defaults to 0.
+
 ### product_units  (migration 022, Stage 12f)
 - **Key fields:** `id`, `shop_id`, `product_id`, `imei` (unique per shop), `status` (`in_stock|sold`), `counter_sale_id`/`order_id` FK? (which sale consumed it), `added_at`, `sold_at`.
 - **Purpose:** light IMEI/serial ledger for phones sold through the dashboard POS. **`products.quantity` remains the sole stock source of truth** — the bots know nothing about this table. It exists for warranty lookup and anti-theft (an IMEI can't be sold from two different shops, or sold twice) and the printed invoice line.
@@ -89,6 +92,23 @@
 - **Key fields (`invoices`):** `id`, `shop_id`, `invoice_number` (per-shop sequential, unique on `(shop_id, invoice_number)`), `source` (`order|counter`), `order_id`/`counter_sale_ids[]`, customer name/phone/address/TRN, `items` jsonb (line snapshot incl. IMEIs), `subtotal`/`vat_rate`/`vat_amount`/`total`, `issued_at`, `created_by`.
 - **Numbering:** `invoice_counters(shop_id pk, last_no)` + `next_invoice_number(p_shop)` RPC — a row-locked increment (same pattern as `decrement_stock`, migration 003) so two simultaneous checkouts on one shop can't collide. Per-shop, not global — a shared global sequence would let one shop infer another's sales volume from the gaps.
 - **Invariant:** created only by the dashboard (`actions/pos.ts::checkoutSale`, `actions/invoices.ts::createInvoiceFromOrder`); nothing here writes it. Voiding a counter sale does **not** delete its invoice — the invoice trail is append-only, the UI marks it voided instead.
+- **Money is EX-VAT + VAT-on-top since migration 030** (corrected from an original VAT-inclusive assumption): `subtotal` = taxable amount after discount, `vat_amount` = `subtotal × 5%` (`utils/vat.py::with_vat` / TS `vatOnNet` — NOT `total × 5/105`, which is what a credit note uses to negate an already-issued total), `total` = `subtotal + vat_amount`.
+
+### invoices.credit_of / reason  (migration 029, Stage 12l)
+- **New fields:** `credit_of` uuid FK→`invoices(id)` **ON DELETE RESTRICT**, unique (one credit note per original); `reason` text. A sign-check constraint enforces `credit_of is null ⇒ amounts ≥ 0` and `credit_of is not null ⇒ amounts ≤ 0`.
+- **Purpose:** FTA rule — a reversed supply is reversed by a credit note, never by erasing the tax invoice. `lib/credit-note.ts::issueCreditNote` mirrors the original (negative subtotal/vat/total, negated line items), continues the **same** per-shop `invoice_number`/`day_seq` sequence, and is idempotent (a second call returns the existing note rather than crediting twice — the unique index enforces the same thing at the DB layer). Wired from `voidSale` (counter) and `cancelOrder` (online) via `invoiceForCounterSale`/`invoiceForOrder`.
+- **Reporting invariant:** every `sum(vat_amount)`/`sum(total)` in the codebase (dashboard, console, and this backend nowhere sums invoices) nets out for free — a credited invoice's output VAT and revenue are gone from every report without a single `WHERE credit_of IS NULL` filter needed on the aggregate.
+
+### counter_sales.payment_ref  (migration 031)
+The acquirer's reference for a card payment (approval code / RRN off the terminal slip). Cash
+reconciles against the drawer; a card sale reconciles against the acquirer's settlement file, and
+without this there is nothing to match a line to. The CHECK is `NOT VALID` (one pre-existing card
+sale genuinely has no reference — a placeholder would invent a payment record) and exempts
+reversals, since a void copies the sale's tender and would otherwise be unvoidable. **Never a card
+number**: the write path rejects any 13–19 digit Luhn-valid input before it reaches the column.
+
+### invoices.discount  (migration 030, Stage 12l)
+- **New field:** `discount` numeric, default 0 — the EX-VAT giveaway shown on the printed document. `subtotal + discount` = the gross ex-VAT amount before the discount, on both channels. Always printed (`0.00` included) so a reader sees that nothing was discounted rather than inferring it from an absent line. Negated by `issueCreditNote` along with everything else.
 
 ### shops (extended, migration 022, Stage 12f)
 - **New fields:** `trn` (UAE Tax Registration Number, nullable), `invoice_name`, `invoice_address` — printed on every tax invoice. Nullable/unset shops print a "TRN missing" warning rather than blocking a sale (a keeper can sell before finishing onboarding paperwork).
@@ -183,7 +203,8 @@ invoices ?──1 orders, ?──* counter_sales (via counter_sale_ids[])
 ## Storage notes
 
 - DB: **Supabase Postgres** (ADR-001).
-- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010, then **020–022** (see `migrations/` for the full list); all applied live. Numbering gap 011–019 is deliberate buffer room. **All dashboard-driven schema lives in this repo's `migrations/` folder too** — the dashboard repo has no migrations of its own; every dashboard-needed table/column is written and applied here (via `scripts/apply_migration.py`), since this is where the Supabase MCP tooling and the one shared project live. 020 = dashboard auth mapping, 021 = the AI-relay flag (`messages.relay_pending`), 022 = POS/invoices/IMEI schema.
+- Migration tool: raw SQL in `migrations/` (Supabase SQL editor / `psql`). A real migration tool (e.g. alembic) may be adopted later (open). Sequential files 001–010, then **020–030** (see `migrations/` for the full list); all applied live. Numbering gap 011–019 is deliberate buffer room. **All dashboard-driven schema lives in this repo's `migrations/` folder too** — the dashboard repo has no migrations of its own; every dashboard-needed table/column is written and applied here (via `scripts/apply_migration.py`), since this is where the Supabase MCP tooling and the one shared project live. 020 = dashboard auth mapping, 021 = the AI-relay flag (`messages.relay_pending`), 022 = POS/invoices/IMEI schema, 023 = date-based refs + delivery fee + offers + online-order IMEI, 024–026 = platform console + runtime AI switching + soft delete, 027 = persona/negotiation prompt rework, 028 = the customer-channel seam (WhatsApp cutover prep), 029 = tax credit notes, 030 = counter-sale discounts + the VAT-on-top correction, 031 = the card
+payment reference.
 - Naming: tables `snake_case`, columns `snake_case`.
 - **RLS**: migration 006 (Stage-audit) locked the data API to service-role only across every table that existed at the time — RLS on, no policies, anon revoked. **Migrations 008/009/010 (added after 006) still ship a permissive `using(true)` scaffold on their new tables** (`cod_ledger`, `messages`, `counter_sales`) — a documented ponytail gap, not an oversight; the backend only ever talks with the service-role key, so app-layer `shop_id` scoping is what actually enforces isolation on those three tables today. Tighten alongside the rest if the anon key is ever exposed. `clients` is owner-level (no RLS).
 

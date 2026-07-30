@@ -71,7 +71,7 @@ new retail v2/
 │   ├── reports/                # service.py (parse_period + profit formatting, 8 ✅) + health.py (check_health §13, one checker for /health + beat, 10 ✅)
 │   ├── audit/                   # service.py: record/recent → audit_logs (§16), wired at the command wrappers — Stage 12 ✅
 │   ├── tasks/                  # celery_app.py + tasks.py: process_whatsapp_message (Stage 3 skeleton ✅; beat Stage 10)
-│   └── utils/                  # excel.py (pure openpyxl pick-&-pack builder, §10) + storage.py (shop-reports upload + 24h signed URL) — Stage 9 ✅
+│   └── utils/                  # excel.py (pure openpyxl pick-&-pack builder, §10) + storage.py (shop-reports upload + 24h signed URL) — Stage 9 ✅; vat.py (with_vat/without_vat, the one VAT-on-top conversion point, TS twin lib/money.ts) — Stage 12l ✅
 ├── tests/
 │   ├── conftest.py             # fixtures: in-memory repo, TenantService (Stage 1 ✅)
 │   ├── customer_simulator/     # Telethon userbot harness (ADR-005) — Stage 2 skeleton, Stage 3 build-out
@@ -125,7 +125,7 @@ new retail v2/
 | `src/app/reports/` | profit formatting (§6) + `health.check_health` (§13) + owner dashboards (§12) | 8/10 ✅ | `src/app/reports/README.md` |
 | `src/app/audit/` | `audit_logs` write/read (§16), wired at command wrappers | 12 ✅ | `src/app/audit/README.md` |
 | `src/app/tasks/` | celery app + tasks, beat | 3 ✅/10 | `src/app/tasks/README.md` |
-| `src/app/utils/` | money, time, Excel builder (§10), Storage upload + signed URL | 9 ✅ | `src/app/utils/README.md` |
+| `src/app/utils/` | money, time, Excel builder (§10), Storage upload + signed URL, VAT-on-top conversion (12l) | 9 ✅ | `src/app/utils/README.md` |
 | `tests/customer_simulator/` | Telethon userbot test harness | 2/3 | `tests/customer_simulator/README.md` |
 
 ## Where things go
