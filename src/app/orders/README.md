@@ -27,8 +27,10 @@ secret `min_price` floor was removed in migration 004.
 `advance_delivery(shop, order_number, status)` moves a confirmed order one step down
 `confirmed→packed→shipped→delivered` — `_is_next_step` (pure) rejects any skip, backward move, or
 touch on a draft/cancelled order. Each step tells the customer. `assign_delivery(shop, order_number,
-rider_id)` attaches a rider to a `confirmed|packed|shipped` order: sets `cod_amount` (net =
-`selling_price − discount_amount`) and `custody='offered'`, then pushes the rider a card with the
+rider_id)` attaches a rider to a `confirmed|packed|shipped` order: sets `cod_amount` — real cash, so
+it carries the VAT the stored figures don't (`with_vat(selling_price − discount_amount +
+delivery_fee)`, migration 030 — must equal the dashboard's invoice total to the fil, `utils/vat.py`)
+— and `custody='offered'`, then pushes the rider a card with the
 COD amount, the cash they already hold (`riders.cod_balance`), and `/accept`/`/notreceived`. Delivery
 finalization (cash, `delivered_at`, the `cod_ledger` 'collect' row) happens in `riders.deliver_order`
 once the rider accepts custody — see `riders/README.md` for the handshake + ledger rules.
@@ -43,11 +45,25 @@ returning `(filename, 24h signed URL, row_count)`. Wired to keeper `/exportorder
 
 ## Profit formula (§6)
 `line_profit = selling_price - discount_amount - cost_price × quantity`
-`margin% = profit / cost × 100` (0 when no cost — no divide-by-zero on empty)
+`margin% = profit / revenue × 100` (0 when no revenue — no divide-by-zero on empty)
+
+> Margin is over **revenue**, not cost. Dividing by cost is markup; it made the bot report 28.9%
+> where the dashboard (`lib/profit-math.ts`) reported 22.3% for the same shop and period.
 
 > **quantity matters.** SPEC's literal formula omits it, but `cost_price` is per-unit while
 > `selling_price` is the line total — so cost is `cost_price × quantity`. Dropping it under-counts
 > cost on any multi-unit order (a silent money bug). Pinned by `models.py` `__main__` + tests.
+
+## Counter (walk-in) sales fold-in (`counter_sales.py`, Stage 12d; discount in migration 030)
+`profit_summary` calls `merge_counter(summary, counter_totals(...))` to add the dashboard POS's and
+the bot photo-flow's walk-in sales into the same `ProfitSummary` an online-only report would
+produce. `sold_price` is **per unit** (unlike `orders.selling_price`, a line total) and stays GROSS
+— `discount_amount` (migration 030) sits beside it, exactly like an order's, so `discounts` in the
+summary is one number across both channels and `revenue − discounts` is net either way. A void is a
+reversing negative row (migration 022): it nets its own sale out of every sum for free, including
+its discount, and is excluded from the `orders` count (a refund is not counted as a second sale).
+`discrepancy` rows (stock couldn't cover the sale) are excluded entirely — counting them would book
+profit on a sale the system itself flagged as unbacked.
 
 ## Key files
 | Path | Role | Stage |

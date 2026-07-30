@@ -36,8 +36,14 @@ class ProfitSummary:
 
     @property
     def margin(self) -> float:
-        """Gross margin % over cost. 0 when there is no cost (no orders)."""
-        return float(self.profit / self.cost * 100) if self.cost else 0.0
+        """Gross margin % — profit over REVENUE. 0 when there is no revenue.
+
+        This was profit/cost, which is markup, not margin. The dashboard has always divided by
+        revenue (`lib/profit-math.ts`), so one shop and period read 28.9% from the bot and 22.3%
+        from the dashboard — same money, two numbers. Revenue is the standard denominator; the
+        bot moves to it so the two agree.
+        """
+        return float(self.profit / self.revenue * 100) if self.revenue else 0.0
 
 
 def line_profit(selling_price: Decimal, discount: Decimal, cost_price: Decimal, qty: int) -> Decimal:
@@ -50,6 +56,6 @@ if __name__ == "__main__":  # ponytail: one runnable check on the money path
     assert line_profit(d("2499"), d("0"), d("2000"), 1) == d("499")
     assert line_profit(d("5000"), d("200"), d("2000"), 2) == d("800")  # qty=2: cost 4000
     s = ProfitSummary(orders=1, revenue=d("2499"), cost=d("2000"), profit=d("499"))
-    assert round(s.margin, 1) == 24.9
+    assert round(s.margin, 1) == 20.0  # 499/2499 — over revenue, not cost (that would be 24.9)
     assert ProfitSummary().margin == 0.0  # no divide-by-zero on empty
     print("profit math ok")

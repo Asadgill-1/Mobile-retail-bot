@@ -285,7 +285,7 @@ def test_merge_counter_does_not_count_a_void_as_a_second_sale():
 def test_merge_counter_margin_reflects_both_channels():
     out = merge_counter(ProfitSummary(), [_crow(1, 100, 50)])
     assert out.profit == Decimal("50") and out.cost == Decimal("50")
-    assert round(out.margin, 1) == 100.0
+    assert round(out.margin, 1) == 50.0  # 50/100 revenue (over cost it would read 100%)
 
 
 # --- extract_rows: the vision-model override must actually be used ---

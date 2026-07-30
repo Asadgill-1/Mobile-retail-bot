@@ -59,7 +59,7 @@ def test_format_profit_shows_money_margin_and_top():
     )
     out = format_profit(s, "Today")
     assert "7,499 AED" in out and "1,299 AED" in out
-    assert "21.6%" in out  # 1299/6000*100 = 21.65 → 21.6 at 1dp
+    assert "17.3%" in out  # 1299/7499*100 = 17.32 → 17.3 at 1dp (margin is over revenue)
     assert "Samsung S23 — 2 sold, +999 AED" in out
     assert "Clearance profit: +300 AED" in out
 

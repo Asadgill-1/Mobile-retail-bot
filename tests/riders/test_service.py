@@ -97,6 +97,7 @@ from decimal import Decimal  # noqa: E402
 from app.riders.service import (  # noqa: E402
     NotYourDelivery,
     cancel_delivery,
+    cod_balance,
     cod_trail,
     custody_transition,
     deliver_order,
@@ -104,6 +105,7 @@ from app.riders.service import (  # noqa: E402
     parse_cash,
     reconcile_cod,
     report_window,
+    set_custody,
 )
 
 
@@ -196,18 +198,37 @@ class _Shop:
 
 
 class _WriteSB:
-    """Records updates + inserts; enough for deliver/cancel/reconcile paths."""
+    """Records updates + inserts; enough for deliver/cancel/reconcile paths.
 
-    def __init__(self):
+    Optionally stateful: pass `order_row` and real writes land in that dict, so the lifecycle test
+    can walk assign → accept → deliver with each step reading the state the previous one left.
+    `cod_ledger` inserts accumulate and are served back on select, so the real `cod_balance` /
+    `cod_trail` fold real rows — that fold IS the assertion, so it must not be stubbed. `keeps`
+    answers the shops lookup behind `_rider_keeps_delivery` (migration 023). Filters are ignored;
+    these flows only ever address one order and one rider.
+    """
+
+    def __init__(self, order_row=None, keeps=False, ledger=None):
         self.updates = []   # (table, patch)
         self.inserts = []   # (table, row)
+        self.tables = []    # every table touched, in call order
+        self.order_row = order_row
+        self.keeps = keeps
+        self.ledger = list(ledger or [])
         self._t = None
         self._patch = None
         self._insert = None
+        self._select = False
 
     def table(self, name):
         self._t = name
+        self.tables.append(name)
         self._patch = self._insert = None
+        self._select = False
+        return self
+
+    def select(self, *a):
+        self._select = True
         return self
 
     def update(self, patch):
@@ -221,23 +242,40 @@ class _WriteSB:
     def eq(self, *a):
         return self
 
+    def limit(self, *a):
+        return self
+
+    def order(self, *a):
+        return self
+
     def execute(self):
+        rows = [{}]
         if self._patch is not None:
             self.updates.append((self._t, self._patch))
+            if self._t == "orders" and self.order_row is not None:
+                self.order_row.update(self._patch)  # next step reads what this one wrote
         if self._insert is not None:
             self.inserts.append((self._t, self._insert))
+            if self._t == "cod_ledger":
+                # created_at is a DB default; cod_trail reads it unconditionally, so stamp it here.
+                self.ledger.append({"created_at": datetime.now(_tz.utc).isoformat(), **self._insert})
+        if self._select:
+            rows = {
+                "shops": [{"rider_keeps_delivery": self.keeps}],
+                "cod_ledger": self.ledger,
+            }.get(self._t, [])
 
         class _R:
-            data = [{}]
+            data = rows
 
         return _R()
 
 
-def _my_order(status="shipped", custody="accepted"):
+def _my_order(status="shipped", custody="accepted", fee="0"):
     return {
         "id": "o1", "shop_id": str(uuid4()), "rider_id": "r1", "order_number": 8,
         "status": status, "custody": custody, "phone": "p1", "address": "Marina",
-        "quantity": 2, "product_id": "pid", "cod_amount": "3250",
+        "quantity": 2, "product_id": "pid", "cod_amount": "3250", "delivery_fee": fee,
         "products": {"brand": "Samsung", "model": "S23"},
     }
 
@@ -297,6 +335,7 @@ async def test_deliver_order_writes_time_cash_ledger_and_notifies(rider_wire):
     assert lt == "cod_ledger" and row["entry"] == "collect" and row["amount"] == "3250"
     assert "delivered" in rider_wire["cust_msg"][1]
     assert "Sami" in rider_wire["shop_msg"] and "3250 AED" in rider_wire["shop_msg"]
+    assert "shops" not in sb.tables  # a zero-fee order short-circuits the rider-keeps-fee lookup
 
 
 @pytest.mark.asyncio
@@ -351,3 +390,167 @@ async def test_reconcile_cod_trail_math_and_rider_push(monkeypatch):
     assert lt == "cod_ledger" and row["entry"] == "handover" and row["amount"] == "3000"
     tid, text = pushed["msg"]
     assert tid == 999 and "600 AED" in text and "3000 AED" in text  # rider gets the same trail
+
+
+# --- who ends up with the delivery fee (migration 023) ---
+@pytest.mark.asyncio
+async def test_deliver_order_rider_keeps_the_delivery_fee(rider_wire):
+    """The rider collects product+delivery from the customer but only OWES the shop the product
+    portion, so the 'collect' claim — what they hold on the shop's behalf — is cash minus the fee."""
+    rider_wire["order"] = _my_order("shipped", "accepted", fee="150")
+    sb = _WriteSB(keeps=True)
+
+    await deliver_order(["r1"], "Sami", 8, Decimal("3570.00"), datetime.now(_tz.utc), client=sb)
+
+    lt, row = sb.inserts[0]
+    assert lt == "cod_ledger" and Decimal(row["amount"]) == Decimal("3420.00")
+    assert "rider kept 150 AED delivery" in row["note"]
+    assert sb.updates[0][1]["cash_received"] == "3570.00"  # the order still records the full cash
+    assert "Rider keeps 150 AED delivery — owes shop 3420.00 AED" in rider_wire["shop_msg"]
+
+
+@pytest.mark.asyncio
+async def test_deliver_order_fee_goes_to_the_shop_when_the_flag_is_off(rider_wire):
+    """Same order, flag off: the rider owes the whole collection, delivery included. Every shop in
+    the live DB is on this setting, so it is the path that actually runs."""
+    rider_wire["order"] = _my_order("shipped", "accepted", fee="150")
+    sb = _WriteSB(keeps=False)
+
+    await deliver_order(["r1"], "Sami", 8, Decimal("3570.00"), datetime.now(_tz.utc), client=sb)
+
+    row = sb.inserts[0][1]
+    assert Decimal(row["amount"]) == Decimal("3570.00") and "rider kept" not in row["note"]
+    assert "Rider keeps" not in rider_wire["shop_msg"]
+    assert "shops" in sb.tables  # it read the flag rather than short-circuiting on a zero fee
+
+
+@pytest.mark.asyncio
+async def test_deliver_order_short_collection_never_writes_a_negative_claim(rider_wire):
+    """A rider keeping a 150 fee who collects only 100 owes nothing — the claim clamps at 0 instead
+    of going negative and inverting the ledger. The 50 shortfall stays visible in the cash line."""
+    rider_wire["order"] = _my_order("shipped", "accepted", fee="150")
+    sb = _WriteSB(keeps=True)
+
+    await deliver_order(["r1"], "Sami", 8, Decimal("100"), datetime.now(_tz.utc), client=sb)
+
+    assert Decimal(sb.inserts[0][1]["amount"]) == Decimal("0")
+    assert "Cash received: 100 AED" in rider_wire["shop_msg"]
+
+
+# --- custody handshake, at the DB (the pure rule is covered above) ---
+@pytest.mark.asyncio
+async def test_set_custody_accept_writes_the_answer_and_tells_the_shop(rider_wire):
+    rider_wire["order"] = _my_order("confirmed", "offered")
+    sb = _WriteSB()
+
+    order = await set_custody(["r1"], "Sami", 8, True, client=sb)
+
+    t, patch = sb.updates[0]
+    assert t == "orders" and patch["custody"] == "accepted"
+    assert datetime.fromisoformat(patch["custody_at"])  # a real stamp, not a placeholder
+    assert "Pickup confirmed" in rider_wire["shop_msg"] and "Sami" in rider_wire["shop_msg"]
+    assert order["custody"] == "accepted"  # the returned row is mutated to the new state
+
+
+@pytest.mark.asyncio
+async def test_set_custody_dispute_alerts_the_shop(rider_wire):
+    """The rider says the product was never handed to them. The shop has to hear that immediately —
+    the package is unaccounted for while this is open."""
+    rider_wire["order"] = _my_order("confirmed", "offered")
+    sb = _WriteSB()
+
+    await set_custody(["r1"], "Sami", 8, False, client=sb)
+
+    assert sb.updates[0][1]["custody"] == "disputed"
+    assert "🚨 PICKUP DISPUTED" in rider_wire["shop_msg"] and "NOT handed" in rider_wire["shop_msg"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answered", ["accepted", "disputed"])
+async def test_set_custody_cannot_be_re_decided_and_writes_nothing(rider_wire, answered):
+    """The audit answer is written once: a rider can't accept a package and later claim they never
+    got it. Refusing after the write would defeat the whole handshake, so assert nothing moved."""
+    rider_wire["order"] = _my_order("confirmed", answered)
+    sb = _WriteSB()
+
+    with pytest.raises(ValueError):
+        await set_custody(["r1"], "Sami", 8, True, client=sb)
+
+    assert sb.updates == [] and rider_wire["shop_msg"] is None
+
+
+@pytest.mark.asyncio
+async def test_cod_balance_folds_collects_minus_handovers():
+    """What a rider owes is derived from the ledger on every read, never stored in a column — so
+    this fold is the only definition of it that exists."""
+    sb = _WriteSB(ledger=[
+        {"entry": "collect", "amount": "500", "created_at": "2026-07-01T10:00:00+00:00"},
+        {"entry": "collect", "amount": "3400", "created_at": "2026-07-02T10:00:00+00:00"},
+        {"entry": "handover", "amount": "3000", "created_at": "2026-07-02T18:00:00+00:00"},
+    ])
+
+    assert await cod_balance(uuid4(), "r1", client=sb) == Decimal("900")
+
+
+# --- the whole arc: assign → accept → deliver → reconcile ---
+from app.orders.service import assign_delivery  # noqa: E402
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keeps", [False, True])
+async def test_the_delivery_arc_closes_the_money_loop(monkeypatch, rider_wire, keeps):
+    """One order walked end to end across both service modules, asserting the cash reconciles to
+    exactly zero.
+
+    COD is fixed once at assignment (`with_vat(net + fee)`), collected by the rider, claimed on the
+    ledger minus whatever fee they keep, then handed over. Three separate computations in two
+    modules have to agree: if VAT gets applied twice, the fee double-counted, or the discount lost,
+    the balance won't land on 0 and the shop is silently short by the drift. That identity — not any
+    single step — is what this test exists to pin.
+    """
+    shop = rider_wire["shop"]
+    order = _my_order("confirmed", "none", fee="150")
+    order["selling_price"], order["discount_amount"] = "3400", "150"  # net 3250, plus the 150 fee
+    order["shop_id"] = str(shop.id)
+    rider_wire["order"] = order
+    sb = _WriteSB(order_row=order, keeps=keeps)
+    rid = uuid4()
+
+    async def _get_order(shop_id, num, client):
+        return order
+
+    async def _get_rider(shop_id, rider_id, client=None):
+        return {"id": str(rider_id), "name": "Sami", "telegram_id": None}  # nothing to push
+
+    async def _set_status(oid, status, by, client):
+        order["status"] = status  # so `deliverable` reads what the previous step actually wrote
+
+    monkeypatch.setattr("app.orders.service._get_order", _get_order)
+    monkeypatch.setattr("app.riders.service.get_rider", _get_rider)
+    monkeypatch.setattr(rsvc, "_set_status", _set_status)
+
+    # 1. assign — COD carries the VAT the stored figures don't, and the status must NOT move.
+    res = await assign_delivery(shop, 8, rid, client=sb)
+    assert res["cod"] == Decimal("3570.00")  # (3400 − 150) + 150 fee, +5%
+    assert order["custody"] == "offered" and order["status"] == "confirmed"
+
+    # 2. the custody gate holds — no delivery before pickup is confirmed, and nothing is written.
+    with pytest.raises(ValueError):
+        await deliver_order([str(rid)], "Sami", 8, res["cod"], datetime.now(_tz.utc), client=sb)
+    assert sb.ledger == []
+
+    # 3. accept, then deliver the exact COD that was quoted at assignment.
+    await set_custody([str(rid)], "Sami", 8, True, client=sb)
+    assert order["custody"] == "accepted"
+    await deliver_order([str(rid)], "Sami", 8, res["cod"], datetime.now(_tz.utc), client=sb)
+    assert order["status"] == "delivered"
+
+    # 4. what the rider owes the shop = COD minus the fee they keep.
+    owed = await cod_balance(shop.id, str(rid), client=sb)
+    assert owed == (Decimal("3420.00") if keeps else Decimal("3570.00"))
+
+    # 5. hand it over — the loop closes at zero, and the rider's pocket is exactly the fee.
+    trail = await reconcile_cod(shop, {"id": str(rid), "name": "Sami"}, owed, client=sb)
+    assert trail["remaining"] == Decimal("0")
+    assert await cod_balance(shop.id, str(rid), client=sb) == Decimal("0")
+    assert res["cod"] - owed == (Decimal("150") if keeps else Decimal("0"))

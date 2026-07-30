@@ -858,6 +858,17 @@ async def advance_delivery(
     if not _is_next_step(current, target):
         raise InvalidTransition(f"cannot move order #{order_number} from '{current}' to '{target}'")
 
+    # A rider who confirmed pickup holds the goods AND the COD cash. Only `riders.deliver_order`
+    # writes the 'collect' ledger row, so closing the order from here would strand that cash: the
+    # ledger reads zero while the rider is carrying it, and `riders.deliverable` then refuses their
+    # own /deliver ("already delivered") forever, so it can never be repaired. Gate on custody, not
+    # on rider_id — a rider who hasn't linked Telegram can never /accept or /deliver, so the keeper
+    # must still be able to close those by hand.
+    if target == "delivered" and (order.get("custody") or "none") == "accepted":
+        raise InvalidTransition(
+            f"order #{order_number} is with a rider — they must /deliver it so the cash is recorded"
+        )
+
     await _set_status(order["id"], target, "shopkeeper", client)
     msg = _DELIVERY_MSG[target].format(num=order_number, shop=shop.name)
     await send_to_customer(shop, order["phone"], msg)

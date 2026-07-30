@@ -50,7 +50,8 @@ def test_aggregate_totals_and_margin():
     assert s.orders == 2
     assert s.revenue == Decimal("7499") and s.discounts == Decimal("200")
     assert s.cost == Decimal("6000") and s.profit == Decimal("1299")
-    assert round(s.margin, 2) == round(float(Decimal("1299") / Decimal("6000") * 100), 2)
+    # margin is profit over REVENUE (matches the dashboard), not over cost
+    assert round(s.margin, 2) == round(float(Decimal("1299") / Decimal("7499") * 100), 2)
 
 
 def test_aggregate_clearance_and_top_grouping():
@@ -545,9 +546,10 @@ async def test_reject_order_cancels_without_messaging_customer(monkeypatch):
 from app.orders.service import assign_delivery  # noqa: E402
 
 
-def _order_row(status="confirmed"):
+def _order_row(status="confirmed", custody="none"):
     return {
-        "id": "o1", "status": status, "customer_name": "Ali", "phone": "p1", "address": "Marina",
+        "id": "o1", "status": status, "custody": custody,
+        "customer_name": "Ali", "phone": "p1", "address": "Marina",
         "quantity": 1, "delivery_date": None, "special_instructions": None,
         "selling_price": "3400", "discount_amount": "150",  # COD = net = 3250
         "products": {"brand": "Samsung", "model": "S23", "color": "green"},
@@ -626,6 +628,130 @@ async def test_assign_delivery_rejects_non_assignable_status(monkeypatch, status
     with pytest.raises(svc.InvalidTransition):
         await assign_delivery(_shop_obj(), 8, uuid4())
     assert called["set"] is False  # rejected before any write — never assigns to a done/draft order
+
+
+# --- the fulfilment status machine (SPEC §6) ---
+from app.orders.service import advance_delivery  # noqa: E402
+
+
+@pytest.fixture
+def advance_wire(monkeypatch):
+    """Fake the four edges `advance_delivery` touches; capture the write and the customer message."""
+    cap = {"status": None, "cust_msg": None, "remembered": None, "read": False}
+    cap["order"] = _order_row("confirmed")
+
+    async def _get_order(shop_id, num, client):
+        cap["read"] = True
+        return cap["order"]
+
+    async def _set_status(oid, status, by, client):
+        cap["status"] = (oid, status, by)
+
+    async def _send_cust(shop, phone, text):
+        cap["cust_msg"] = (phone, text)
+        return True
+
+    async def _remember(shop, phone, text):
+        cap["remembered"] = text
+
+    monkeypatch.setattr(svc, "_get_order", _get_order)
+    monkeypatch.setattr(svc, "_set_status", _set_status)
+    monkeypatch.setattr(svc, "send_to_customer", _send_cust)
+    monkeypatch.setattr(svc, "_remember_to_customer", _remember)
+    return cap
+
+
+@pytest.mark.asyncio
+async def test_advance_delivery_writes_status_and_tells_customer(advance_wire):
+    res = await advance_delivery(_shop_obj(), 8, "packed")
+
+    assert advance_wire["status"] == ("o1", "packed", "shopkeeper")
+    phone, text = advance_wire["cust_msg"]
+    assert phone == "p1" and text == "📦 Order #8 is packed and ready to go."
+    assert advance_wire["remembered"] == text  # the AI is told exactly what the customer was told
+    assert res["status"] == "confirmed"  # the PRE-update row — callers see what it moved away from
+
+
+@pytest.mark.asyncio
+async def test_advance_delivery_to_delivered_names_the_shop(advance_wire):
+    """`delivered` is the only message carrying a {shop} placeholder, so a missing format kwarg
+    would KeyError here and pass on every other step of the chain."""
+    advance_wire["order"] = _order_row("shipped")
+
+    await advance_delivery(_shop_obj(), 8, "delivered")
+
+    assert advance_wire["status"] == ("o1", "delivered", "shopkeeper")
+    text = advance_wire["cust_msg"][1]
+    assert "Shop 01" in text and "#8" in text
+
+
+@pytest.mark.asyncio
+async def test_advance_delivery_accepts_a_sloppy_target(advance_wire):
+    """Bot arguments arrive as typed. `/deliveryupdate 8 Packed` must work."""
+    await advance_delivery(_shop_obj(), 8, "  Packed \n")
+    assert advance_wire["status"] == ("o1", "packed", "shopkeeper")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "current,target",
+    [
+        ("confirmed", "delivered"),  # skips packed + shipped
+        ("shipped", "packed"),       # backwards
+        ("packed", "packed"),        # replay of a double-tapped button
+        ("draft", "packed"),         # never confirmed
+        ("cancelled", "packed"),     # already dead
+        ("delivered", "delivered"),  # terminal
+    ],
+)
+async def test_advance_delivery_refuses_an_illegal_move_without_writing(advance_wire, current, target):
+    """`_is_next_step` is unit-tested apart; what this adds is that a refusal writes NOTHING and
+    tells the customer nothing. A guard that raised *after* the update would still pass a
+    raises-only test while having already moved the order."""
+    advance_wire["order"] = _order_row(current)
+
+    with pytest.raises(svc.InvalidTransition):
+        await advance_delivery(_shop_obj(), 8, target)
+
+    assert advance_wire["status"] is None and advance_wire["cust_msg"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["dispatched", "", None, "cancelled", "confirmed"])
+async def test_advance_delivery_rejects_a_bad_target_before_reading_the_order(advance_wire, target):
+    """The destination check precedes the fetch, so junk from a bot command costs no round-trip.
+    'confirmed' is in the flow but is not a valid destination — you can't advance backwards into it."""
+    with pytest.raises(svc.InvalidTransition):
+        await advance_delivery(_shop_obj(), 8, target)
+
+    assert advance_wire["read"] is False
+
+
+@pytest.mark.asyncio
+async def test_advance_delivery_will_not_close_an_order_a_rider_is_holding(advance_wire):
+    """Money path. Only `riders.deliver_order` writes the 'collect' ledger row, so a keeper marking
+    this delivered left the rider carrying cash the ledger said they didn't have — and
+    `riders.deliverable` then refused the rider's own /deliver as 'already delivered', so it could
+    never be repaired afterwards. Once pickup is confirmed, only the rider closes the order."""
+    advance_wire["order"] = _order_row("shipped", custody="accepted")
+
+    with pytest.raises(svc.InvalidTransition):
+        await advance_delivery(_shop_obj(), 8, "delivered")
+
+    assert advance_wire["status"] is None and advance_wire["cust_msg"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custody", ["none", "offered", "disputed"])
+async def test_advance_delivery_still_closes_when_no_rider_confirmed_pickup(advance_wire, custody):
+    """The other half of that guard, and why it reads custody rather than rider_id: a rider who
+    never linked Telegram can't /accept or /deliver, so gating on rider_id would strand their
+    orders with nobody able to close them. 'disputed' means the rider says they never got it."""
+    advance_wire["order"] = _order_row("shipped", custody=custody)
+
+    await advance_delivery(_shop_obj(), 8, "delivered")
+
+    assert advance_wire["status"] == ("o1", "delivered", "shopkeeper")
 
 
 # --- price requests: the live column is `phone`, not `identity` (regression: "Internal error") ---
