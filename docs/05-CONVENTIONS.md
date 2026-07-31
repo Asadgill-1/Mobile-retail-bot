@@ -24,10 +24,23 @@
 ## Code structure rules
 
 1. **No business logic in webhook handlers** — push into services/use-cases under the owning module.
-2. **No direct cross-module DB access** — go through the owning module's interface; RLS still enforces `shop_id`.
+2. **No direct cross-module DB access** — go through the owning module's interface. Note RLS does **not**
+   enforce `shop_id`: there are no per-tenant policies, only RLS-on with no policy, which seals the data
+   API. Tenant scoping is app-layer (`shop_id` filters here, `lib/scope.ts`/`assertShop` in the
+   dashboards) — so a missing filter is a real leak, not something the database catches for you.
 3. **Pure functions first** — side effects (Redis, DB, Twilio, LLM) at the edges / in services.
 4. **One responsibility per file.**
 5. **Webhook returns 200 immediately**; real processing enqueued to Celery (SPEC §11).
+6. **Every new table in a migration MUST carry these two lines**, and MUST NOT carry a `using (true)`
+   policy:
+   ```sql
+   alter table public.<t> enable row level security;
+   revoke all on public.<t> from anon, authenticated;
+   ```
+   Migration 006 sealed the data API; 010/022/023/025 each pasted the permissive scaffold back onto new
+   tables and Supabase's default privileges granted them, leaving **12 tables readable and writable by the
+   public anon key** — including `invoices` and `messages` — until 032 re-sealed it. RLS-on with **no
+   policy** is the correct posture: the service-role backend bypasses RLS, everyone else gets nothing.
 
 ## Ponytail ladder (apply before writing any new code)
 
