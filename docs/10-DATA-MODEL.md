@@ -188,6 +188,47 @@ number**: the write path rejects any 13–19 digit Luhn-valid input before it re
 - **Source:** Fed from Redis counters (`usage:{client_id}:{shop_id}:{day}:{metric}`) by a daily Celery beat job (Stage 10). Hot path touches Redis only — no per-message DB write.
 - **Metrics:** `customer_msg_in`, `msg_out`, `escalation`, `ai_call`, `telegram_command`. (`active_conversations` is a realtime Redis metric in `/health`, not stored.)
 
+### manager_pins + override_approvals  (migration 035, Stage 12m)
+
+Written and read only by the shop dashboard (`lib/override.ts`); no Python path touches either.
+
+**manager_pins** — one row per **shop**, PK `shop_id`.
+- **Key fields:** `pin_hash`, `pin_salt`, `limits` JSONB, `fail_count`, `locked_until`, `set_by`, `updated_at`.
+- **Purpose:** the ceiling on the *loosening* direction of every destructive action — a deeper
+  discount, a lower unit price, a bigger void, a stock correction, a cost edit, a TRN change.
+  Phase 1d had established that every one of those is identical for a keeper and the owner.
+- **Hashing:** `scrypt(pin + OVERRIDE_PEPPER, pin_salt)` in **Node**, N=16384 r=8 p=1 keylen 64.
+  Deliberately *not* pgcrypto: `crypt('123456', …)` travels inside the SQL body and lands in the
+  query log, the Supabase request log and any pooler in between. Only the digest is ever sent here.
+  The pepper is an env var and **never touches this database** — 6 digits is 10⁶, and the pepper is
+  the reason a leak of this table alone is worthless. `scripts/pos_integration_check.py` recomputes
+  the digest in Python to pin the parameters; if Node's defaults ever move, every till locks at once.
+- **Lockout:** 5 wrong PINs → `locked_until = now + 2^(fails-5)` minutes, capped at 60. Checked
+  *before* the 64ms hash, so a wrong-PIN storm cannot pin the Node event loop. A correct PIN resets
+  `fail_count`; setting a new PIN also clears the lock, which is the documented recovery.
+- **Who may set it:** the shop **owner** only (`actions/settings.ts::setManagerPin`) — a ceiling the
+  gated person can move is not a ceiling. This is the only role gate Phase 3 added.
+- `limits` holds per-shop **deltas** from the defaults in `lib/override-rules.ts`. No UI writes it
+  yet; it is set by SQL until a shop asks.
+
+**override_approvals** — append-only, one row per over-threshold attempt.
+- **Key fields:** `id`, `shop_id` FK, `kind`, `outcome`, `amount`, `threshold`, `detail`, `actor`,
+  `ref_table`/`ref_id`, `created_at`.
+- **`outcome`:** `approved` · `refused` (wrong PIN) · `locked` (too many) · **`unset`**.
+- **`unset` is the important one.** A shop with no `manager_pins` row is blocked from *nothing* — the
+  till behaves exactly as before — but every action that *would* have needed approval still writes a
+  row. The owner's first look at the Approvals view is therefore a priced list of what has been
+  happening unsupervised, which argues for setting a PIN better than a locked screen does, and means
+  the migration cannot break a live shop on the day it lands.
+- Units follow `kind`: AED for money, whole units for `stock_adjust`, percent for `price_cut`. The
+  always-PIN kinds (`product_delete`, `cost_edit`, `trn`) carry neither number.
+- A prompt merely *appearing* is not logged — only decisions are, or the log would fill with a row
+  per cancelled keystroke.
+- Surfaced as the 4th view on the owner-gated `/logs` (`?view=approvals`) and its CSV export. Zero
+  new routes, zero new auth surface.
+
+Both tables: RLS on, no policy, `revoke all from anon, authenticated` — probed live, anon gets 401.
+
 ## Relationships (overview)
 
 ```

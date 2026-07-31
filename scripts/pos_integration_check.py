@@ -16,6 +16,7 @@ discipline scripts/loadtest.py uses so a harness never pollutes real numbers.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 import sys
@@ -125,6 +126,54 @@ async def check_the_ledger_still_balances(c, shop: str) -> None:
            for p in products if p["quantity"] != summed.get(p["id"], 0)}
     check("every product's balance equals the sum of its journal", off, {},
           "product_id -> (quantity, sum(delta))")
+
+
+async def check_the_pin_gate_is_sealed_and_portable(c, shop: str) -> None:
+    """Migration 035. Two things a unit test cannot reach, and both fail silently if they break.
+
+    First, the scrypt PARAMETERS. lib/override.ts hashes the PIN in Node and stores only the digest,
+    so the day node:crypto's defaults move, every PIN in the table stops verifying and every till
+    locks at once with no error anyone can read. Recomputing the identical digest here, from a
+    different implementation, is what pins N=16384 r=8 p=1 — and proves the pepper is doing work.
+
+    Second, the SEAL. Migration 032's standing rule is that a table added after it stays shut to the
+    anon key that ships in the browser bundle; a PIN hash and a log of everything a manager approved
+    are the last two rows on the platform that should ever answer it.
+    """
+    salt, pin, pepper = "a1b2c3d4e5f60718", "246810", "harness-pepper"
+    node = run_ts(
+        'import { scrypt } from "node:crypto";\n'
+        'import { promisify } from "node:util";\n'
+        "const a = JSON.parse(process.argv[2]);\n"
+        'const d = await promisify(scrypt)(a.pin + a.pepper, a.salt, 64);\n'
+        'process.stdout.write(JSON.stringify({ hash: d.toString("hex") }));\n',
+        {"pin": pin, "pepper": pepper, "salt": salt},
+    )["hash"]
+    check("a PIN hashed in Node is the same digest here", node,
+          hashlib.scrypt((pin + pepper).encode(), salt=salt.encode(),
+                         n=16384, r=8, p=1, dklen=64).hex(),
+          "node:crypto scrypt defaults are N=16384 r=8 p=1, keylen 64")
+    check("...and a digest without the pepper is a different one", node !=
+          hashlib.scrypt(pin.encode(), salt=salt.encode(),
+                         n=16384, r=8, p=1, dklen=64).hex(), True)
+
+    await rest(c, "POST", "manager_pins", json={
+        "shop_id": shop, "pin_hash": node, "pin_salt": salt, "set_by": TAG,
+    })
+    await rest(c, "POST", "override_approvals", json={
+        "shop_id": shop, "kind": "unit_price", "outcome": "unset", "amount": "1.00",
+        "threshold": "1000.00", "detail": f"{TAG} rang a 1000 phone at 1", "actor": TAG,
+    })
+    logged = await rest(c, "GET", f"override_approvals?shop_id=eq.{shop}&select=outcome")
+    check("an unapproved action is still recorded", [r["outcome"] for r in logged], ["unset"],
+          "fails open, loudly — no PIN row blocks nothing but logs everything")
+
+    anon = {"apikey": settings.supabase_anon_key,
+            "Authorization": f"Bearer {settings.supabase_anon_key}"}
+    for table in ("manager_pins", "override_approvals"):
+        r = await c.get(f"{_BASE}/rest/v1/{table}", headers=anon,
+                        params={"select": "*"}, timeout=30)
+        check(f"anon cannot read {table}", r.status_code, 401, r.text[:120])
 
 
 DOC = {"source": "counter", "items": [], "subtotal": "100.00", "vat_amount": "5.00",
@@ -528,6 +577,8 @@ async def main() -> int:
             print("VAT on top + POS discounts")
             await check_vat_on_top_and_the_discount_lands(c, shop, product)
             await check_cod_equals_the_invoice_total(c, shop, product)
+            print("manager PIN gate")
+            await check_the_pin_gate_is_sealed_and_portable(c, shop)
             # Last of all: everything above moved stock, and none of it may have broken the journal.
             print("stock ledger")
             await check_the_ledger_still_balances(c, shop)
@@ -541,12 +592,16 @@ async def main() -> int:
 
 
 async def counts(c) -> dict[str, int]:
+    """Row counts per table, keyed by a column each one actually has — manager_pins is keyed on
+    shop_id, not id, so the select column travels with the table name."""
     out = {}
-    for t in ("clients", "shops", "products", "orders", "counter_sales", "invoices",
-              "product_units", "stock_moves"):
+    for t, key in (("clients", "id"), ("shops", "id"), ("products", "id"), ("orders", "id"),
+                   ("counter_sales", "id"), ("invoices", "id"), ("product_units", "id"),
+                   ("stock_moves", "id"), ("manager_pins", "shop_id"),
+                   ("override_approvals", "id")):
         r = await c.get(f"{_BASE}/rest/v1/{t}", headers={**_H, "Prefer": "count=exact",
                                                          "Range": "0-0"},
-                        params={"select": "id"}, timeout=30)
+                        params={"select": key}, timeout=30)
         out[t] = int(r.headers["content-range"].split("/")[-1])
     return out
 
