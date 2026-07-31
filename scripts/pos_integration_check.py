@@ -82,25 +82,56 @@ async def check_stock_is_atomic(c, shop: str, product: str) -> None:
     check("stock never goes negative", left, 0)
 
 
-async def check_invoice_numbers_are_gap_free(c, shop: str) -> None:
-    """FTA wants a per-business sequence; a gap or a duplicate is a compliance problem, so the
-    counter row lock has to hold under simultaneous issuance."""
-    nums = await asyncio.gather(*(rpc(c, "next_invoice_number", {"p_shop": shop}) for _ in range(10)))
+DOC = {"source": "counter", "items": [], "subtotal": "100.00", "vat_amount": "5.00",
+       "total": "105.00", "created_by": TAG}
 
-    check("10 concurrent invoice numbers are unique", len(set(nums)), 10)
-    check("...and contiguous from 1", sorted(nums), list(range(1, 11)))
+
+async def check_invoice_numbers_are_gap_free(c, shop: str) -> None:
+    """FTA wants a per-business sequence and an auditor reads a gap as a suppressed sale. Numbers
+    come from the BEFORE INSERT trigger (033), so they must survive concurrency AND a failed insert
+    — the old two-round-trip RPC committed the counter first and burned one on every failure. Live
+    proof it did: Shop 01 is missing invoice_number 3 and 4, and day_seq 1 of 2026-07-29."""
+    async def last_no() -> int:
+        rows = await rest(c, "GET", f"invoice_counters?shop_id=eq.{shop}&select=last_no")
+        return rows[0]["last_no"] if rows else 0
+
+    made = await asyncio.gather(
+        *(rest(c, "POST", "invoices", json={"shop_id": shop, **DOC}) for _ in range(10))
+    )
+    nums = sorted(m[0]["invoice_number"] for m in made)
+    check("10 concurrent inserts allocate unique numbers", len(set(nums)), 10)
+    check("...and contiguous from 1", nums, list(range(1, 11)))
+
+    # The burn test. A negative total with no credit_of violates 029's sign check, which fires
+    # AFTER the trigger has already incremented — so only a shared transaction can undo it.
+    before = await last_no()
+    bad = await c.post(f"{_BASE}/rest/v1/invoices", headers=_H, timeout=30,
+                       json={"shop_id": shop, **DOC,
+                             "subtotal": "-1.00", "vat_amount": "-1.00", "total": "-1.00"})
+    check("an invalid invoice is rejected", bad.status_code, 400)
+    check("...and burns no invoice number", await last_no(), before)
+    nxt = (await rest(c, "POST", "invoices", json={"shop_id": shop, **DOC}))[0]
+    check("...so the next real one continues the sequence", nxt["invoice_number"], before + 1)
 
 
 async def check_day_seq_per_kind(c, shop: str) -> None:
-    """ODR-DD-MM-NNN and INV-DD-MM-NNN are independent per-day sequences (023)."""
+    """ODR-DD-MM-NNN and INV-DD-MM-NNN are independent per-day sequences (023). Orders still
+    allocate through the RPC at insert (orders/service.py:130); invoices moved into the trigger,
+    so this pins that neither side consumes the other's numbers."""
     day = datetime.now(DUBAI).date().isoformat()
+    rows = await rest(
+        c, "GET", f"daily_counters?shop_id=eq.{shop}&kind=eq.invoice&day=eq.{day}&select=last_no"
+    )
+    inv_before = rows[0]["last_no"] if rows else 0
+
     orders = await asyncio.gather(
         *(rpc(c, "next_day_seq", {"p_shop": shop, "p_kind": "order", "p_day": day}) for _ in range(5))
     )
-    inv = await rpc(c, "next_day_seq", {"p_shop": shop, "p_kind": "invoice", "p_day": day})
-
     check("5 concurrent order refs are 1..5", sorted(orders), [1, 2, 3, 4, 5])
-    check("the invoice sequence is separate, not continued", inv, 1)
+
+    inv = (await rest(c, "POST", "invoices", json={"shop_id": shop, **DOC}))[0]
+    check("the invoice day sequence is separate, not advanced by orders",
+          inv["day_seq"], inv_before + 1)
 
 
 async def check_void_reverses_in_its_own_bucket(c, shop: str, product: str) -> None:
@@ -186,22 +217,21 @@ async def check_credit_note_reverses_the_vat(c, shop: str) -> None:
         return round(sum(float(r["vat_amount"]) for r in rows), 2)
 
     before = await vat()
-    inv_no = await rpc(c, "next_invoice_number", {"p_shop": shop})
     original = (await rest(c, "POST", "invoices", json={
-        "shop_id": shop, "invoice_number": inv_no, "source": "counter",
+        "shop_id": shop, "source": "counter",
         "items": [{"desc": TAG, "qty": 1, "unit_price": 105.0, "line_total": 105.0}],
         "subtotal": "100.00", "vat_amount": "5.00", "total": "105.00", "created_by": TAG,
     }))[0]
     check("issuing an invoice raises output VAT", await vat(), round(before + 5.0, 2))
 
-    cn_no = await rpc(c, "next_invoice_number", {"p_shop": shop})
-    check("the credit note continues the same per-shop sequence", cn_no, inv_no + 1)
-    await rest(c, "POST", "invoices", json={
-        "shop_id": shop, "invoice_number": cn_no, "source": original["source"],
+    note = (await rest(c, "POST", "invoices", json={
+        "shop_id": shop, "source": original["source"],
         "items": [{"desc": TAG, "qty": -1, "unit_price": 105.0, "line_total": -105.0}],
         "subtotal": "-100.00", "vat_amount": "-5.00", "total": "-105.00",
         "credit_of": original["id"], "reason": "Counter sale voided", "created_by": TAG,
-    })
+    }))[0]
+    check("the credit note continues the same per-shop sequence",
+          note["invoice_number"], original["invoice_number"] + 1)
     check("the credit note nets the VAT back out", await vat(), before)
 
     # The two database guards behind it, so the sign can never be faked by a stray row.
@@ -234,7 +264,9 @@ async def check_both_channels_reconcile(c, shop: str, product: str) -> None:
     await rest(c, "POST", "counter_sales", json={
         "shop_id": shop, "product_id": product, "quantity": 2, "sold_price": "300",
         "sold_on": today, "recorded_by": 0, "discrepancy": False,
-        "payment_method": "card", "sold_by": f"{TAG}:recon",
+        # 031 requires a terminal reference on every card sale — a card row without one is
+        # unreconcilable against the acquirer's statement.
+        "payment_method": "card", "payment_ref": f"{TAG}-recon", "sold_by": f"{TAG}:recon",
     })
 
     start = datetime.combine(datetime.now(DUBAI).date(), datetime.min.time(), tzinfo=DUBAI)
@@ -335,9 +367,8 @@ async def check_vat_on_top_and_the_discount_lands(c, shop: str, product: str) ->
             "sold_on": today, "recorded_by": 0, "discrepancy": False,
             "payment_method": "cash", "sold_by": f"{TAG}:vat",
         })
-    inv_no = await rpc(c, "next_invoice_number", {"p_shop": shop})
     inv = (await rest(c, "POST", "invoices", json={
-        "shop_id": shop, "invoice_number": inv_no, "source": "counter",
+        "shop_id": shop, "source": "counter",
         "items": [{"desc": TAG, "qty": l["qty"], "unit_price": l["unit"], "line_total": t}
                   for l, t in zip(lines, money["totals"])],
         "subtotal": f"{money['subtotal']:.2f}", "discount": "150.00",
