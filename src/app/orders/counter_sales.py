@@ -132,7 +132,11 @@ async def record_sales(
         price = product.selling_price if price is None else Decimal(str(price))
 
         # Stock first: if it can't be taken, the sale is still recorded — flagged, not dropped.
-        ok = await _decrement_stock(shop.id, str(product.id), qty, client)
+        # No ref_id: the counter_sales row is written below, and only if this succeeds does it
+        # count as a clean sale — a discrepancy row records stock that was never there to take.
+        ok = await _decrement_stock(
+            shop.id, str(product.id), qty, client, reason="sale", ref_table="counter_sales",
+        )
         entry = {
             "shop_id": str(shop.id),
             "product_id": str(product.id),

@@ -2,8 +2,8 @@
 
 Two identical Telegram checkout taps (the keeper's ✅ Confirm inline button → callback `kconf:N`)
 fire at the same instant on a product with stock == 1. The confirmation routes through the real
-`orders.service.confirm_order`, whose stock decrement is the atomic Supabase RPC (`decrement_stock`,
-migration 003 — conditional `UPDATE … WHERE quantity >= n`, the row-lock guarantee).
+`orders.service.confirm_order`, whose stock decrement is the atomic Supabase RPC (`move_stock`,
+migration 034 — conditional `UPDATE … WHERE quantity + delta >= 0`, the row-lock guarantee).
 
 The fake client below emulates that RPC's atomic conditional decrement under a real threading.Lock,
 and `confirm_order` runs it inside `asyncio.to_thread`, so the two taps contend on real OS threads.
@@ -28,7 +28,7 @@ PID = "prod-1"
 
 
 class AtomicStockClient:
-    """Emulates the decrement_stock RPC: atomic check-and-decrement (the SELECT FOR UPDATE guard)."""
+    """Emulates the move_stock RPC: atomic check-and-move (the SELECT FOR UPDATE guard)."""
     def __init__(self, stock: int) -> None:
         self.stock = {PID: stock}
         self._lock = threading.Lock()
@@ -38,12 +38,12 @@ class AtomicStockClient:
 
         class _E:
             def execute(self):
-                if name != "decrement_stock":
+                if name != "move_stock":
                     return SimpleNamespace(data=[])
                 with client._lock:
                     have = client.stock.get(params["p_id"], 0)
-                    if have >= params["n"]:
-                        client.stock[params["p_id"]] = have - params["n"]
+                    if have + params["p_delta"] >= 0:   # p_delta is negative for a sale (034)
+                        client.stock[params["p_id"]] = have + params["p_delta"]
                         return SimpleNamespace(data=[{"quantity": client.stock[params["p_id"]]}])
                     return SimpleNamespace(data=[])
         return _E()

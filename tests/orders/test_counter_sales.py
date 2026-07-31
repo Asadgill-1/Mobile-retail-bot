@@ -116,7 +116,7 @@ def sale_wire(monkeypatch):
             raise ProductNotFound(ref)
         return cap["products"][ref]
 
-    async def _dec(shop_id, pid, qty, client=None):
+    async def _dec(shop_id, pid, qty, client=None, **_):
         cap["decrements"].append((str(pid), qty))
         return cap["stock_ok"]
 

@@ -757,7 +757,10 @@ async def confirm_order(
     from app.utils.codes import order_ref
 
     draft = await _get_draft(shop.id, order_number, client)
-    if not await _decrement_stock(shop.id, draft["product_id"], draft["quantity"], client):
+    if not await _decrement_stock(
+        shop.id, draft["product_id"], draft["quantity"], client,
+        reason="sale", ref_table="orders", ref_id=draft["id"],
+    ):
         raise OutOfStock(order_number)  # sold out between draft and confirm — nothing oversold
     fee = Decimal(str(delivery_fee or 0))
     await _set_status(draft["id"], "confirmed", "system", client)
@@ -1239,7 +1242,10 @@ async def _apply_offer_at_confirm(shop_id: UUID, draft: dict, fee: Decimal, clie
         snapshot: dict = {"type": offer["type"], "label": offer["label"]}
 
         if offer["type"] == "free_gift" and offer.get("gift_product_id"):
-            if await _decrement_stock(shop_id, offer["gift_product_id"], 1, client):
+            if await _decrement_stock(
+                shop_id, offer["gift_product_id"], 1, client,
+                reason="gift", ref_table="orders", ref_id=draft["id"],
+            ):
                 g = await get_product(shop_id, offer["gift_product_id"], client)
                 gift_name = f"{g.brand} {g.model}".strip() or "gift"
                 out["gift_text"] = f"Free {gift_name}"
@@ -1260,13 +1266,37 @@ async def _apply_offer_at_confirm(shop_id: UUID, draft: dict, fee: Decimal, clie
     return out
 
 
-async def _decrement_stock(shop_id: UUID, product_id: str, qty: int, client: Any | None) -> bool:
-    """Atomic (SPEC inventory). The DB RPC decrements only if `quantity >= qty` (migration 003)."""
+async def _decrement_stock(
+    shop_id: UUID,
+    product_id: str,
+    qty: int,
+    client: Any | None,
+    *,
+    reason: str = "sale",
+    ref_table: str | None = None,
+    ref_id: str | None = None,
+) -> bool:
+    """Atomic (SPEC inventory). `move_stock` (034) moves the balance and writes the stock_moves
+    journal row in ONE transaction, refusing anything that would go negative — the same guarantee
+    migration 003's decrement_stock gave, now with a reason and a link back to what caused it.
+
+    `qty` keeps the old subtract-this-many sense, so a negative qty restocks; the ledger's own sign
+    convention is the opposite (delta: + is stock in), hence the negation.
+    """
     sb = _sb(client)
 
     def _q() -> bool:
         r = sb.rpc(
-            "decrement_stock", {"p_id": product_id, "p_shop": str(shop_id), "n": qty}
+            "move_stock",
+            {
+                "p_id": product_id,
+                "p_shop": str(shop_id),
+                "p_delta": -qty,
+                "p_reason": reason,
+                "p_actor": "bot",
+                "p_ref_table": ref_table,
+                "p_ref_id": ref_id,
+            },
         ).execute()
         return bool(r.data)
 

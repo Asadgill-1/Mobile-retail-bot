@@ -391,10 +391,13 @@ async def cancel_delivery(
         sb.table("orders").update({"cancel_remarks": remarks}).eq("id", order["id"]).execute()
 
     await asyncio.to_thread(_q)
-    # Stock was decremented at confirm; a cancelled delivery puts it back. The decrement RPC with
-    # a NEGATIVE n increments (quantity >= -n is always true for qty >= 0) — reusing the one
-    # atomic stock writer instead of a second RPC.
-    await _decrement_stock(UUID(order["shop_id"]), order["product_id"], -int(order["quantity"]), client)
+    # Stock was decremented at confirm; a cancelled delivery puts it back. A NEGATIVE qty restocks
+    # through the same atomic writer, so the return lands in the journal as its own row rather than
+    # quietly undoing the sale's.
+    await _decrement_stock(
+        UUID(order["shop_id"]), order["product_id"], -int(order["quantity"]), client,
+        reason="cancel", ref_table="orders", ref_id=order["id"],
+    )
 
     shop = await _shop_of_order(order)
     from app.orders.service import _remember_to_customer

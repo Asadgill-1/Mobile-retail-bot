@@ -11,7 +11,7 @@ Order model, status history, profit calculation (SPEC §6 formula), fulfilment +
 ## Hybrid booking (Q-017 → ADR-010)
 AI drafts, shopkeeper confirms. `draft_order` (from the `place_order` tool) checks stock, applies any
 shop-approved price, writes a `draft`, and notifies staff (cost/list/discount/margin) — **no customer
-message yet**. `/confirmorder` runs the atomic `decrement_stock` RPC (migration 003), marks `confirmed`,
+message yet**. `/confirmorder` runs the atomic `move_stock` RPC (migration 034), marks `confirmed`,
 and tells the customer the `order_number`. `/rejectorder` cancels without cold-messaging the customer.
 A pending draft does not freeze the AI; a new order intent supersedes it.
 

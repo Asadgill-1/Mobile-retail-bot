@@ -1,8 +1,8 @@
 """AUDIT CATEGORY 3 — E-commerce concurrency: two buyers, one unit of stock.
 
 Two shopkeeper confirmations for the same product run concurrently while stock_count == 1. The
-decrement must go through the atomic Postgres RPC (`decrement_stock`, migration 003 — a conditional
-`UPDATE … WHERE quantity >= n`), never a read-then-write on the raw table. The RPC only decrements
+decrement must go through the atomic Postgres RPC (`move_stock`, migration 034 — a conditional
+`UPDATE … WHERE quantity + delta >= 0`), never a read-then-write on the raw table. It only moves
 when stock is sufficient, so of two racing confirmations exactly one succeeds; the other gets a
 falsy result and `confirm_order` raises OutOfStock (the shopkeeper is told, and can tell the buyer).
 
@@ -11,7 +11,7 @@ threading.Lock — `confirm_order` runs the RPC inside `asyncio.to_thread`, so t
 confirmations contend on genuine OS threads, exactly as two Postgres backends would on the row lock.
 
 Pass: exactly one confirmation succeeds, one raises OutOfStock, final stock == 0 (never negative,
-never split), and the decrement was done via `.rpc('decrement_stock', …)`, not a raw table update.
+never split), and the decrement was done via `.rpc('move_stock', …)`, not a raw table update.
 """
 
 from __future__ import annotations
@@ -35,15 +35,16 @@ class _Exec:
         self._client, self._name, self._params = client, name, params
 
     def execute(self):
-        if self._name != "decrement_stock":
+        if self._name != "move_stock":
             return SimpleNamespace(data=[])
         p = self._params
-        # Atomic check-and-decrement — the row lock a real Postgres SELECT FOR UPDATE / conditional
+        # Atomic check-and-move — the row lock a real Postgres SELECT FOR UPDATE / conditional
         # UPDATE gives us. Returns a row only when there was enough stock (truthy = success).
+        # p_delta is the ledger's sign (034): negative takes stock out.
         with self._client.lock:
             have = self._client.stock.get(p["p_id"], 0)
-            if have >= p["n"]:
-                self._client.stock[p["p_id"]] = have - p["n"]
+            if have + p["p_delta"] >= 0:
+                self._client.stock[p["p_id"]] = have + p["p_delta"]
                 return SimpleNamespace(data=[{"quantity": self._client.stock[p["p_id"]]}])
             return SimpleNamespace(data=[])  # not enough stock → conditional UPDATE hit 0 rows
 
@@ -116,7 +117,7 @@ async def test_concurrent_purchase_one_wins_zero_oversell(confirm_env):
 
     assert sorted([r1, r2]) == ["ok", "out_of_stock"]   # exactly one success
     assert client.stock[PRODUCT_ID] == 0                # never negative, never split
-    assert "decrement_stock" in client.rpc_calls        # went through the atomic RPC…
+    assert "move_stock" in client.rpc_calls             # went through the atomic RPC…
     assert client.table_updates == []                   # …not a raw table read-then-write
 
 

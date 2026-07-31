@@ -467,7 +467,7 @@ async def test_confirm_order_decrements_stock_and_notifies_customer(monkeypatch)
     async def _get_draft(shop_id, num, client):
         return draft
 
-    async def _dec(shop_id, pid, qty, client):
+    async def _dec(shop_id, pid, qty, client, **_):
         return True  # stock available
 
     async def _set(oid, status, by, client):
@@ -505,7 +505,7 @@ async def test_confirm_order_out_of_stock_raises_and_does_not_confirm(monkeypatc
     async def _get_draft(shop_id, num, client):
         return {"id": "o1", "product_id": "pid", "quantity": 2}
 
-    async def _dec(shop_id, pid, qty, client):
+    async def _dec(shop_id, pid, qty, client, **_):
         return False  # sold out between draft and confirm
 
     async def _set(*a):

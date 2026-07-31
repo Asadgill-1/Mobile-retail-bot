@@ -71,7 +71,11 @@ async def rpc(c: httpx.AsyncClient, fn: str, args: dict):
 async def check_stock_is_atomic(c, shop: str, product: str) -> None:
     """The last unit, sold by both channels at once. decrement_stock guards with `quantity >= n`
     inside one UPDATE, so exactly one caller may win — anything else is an oversell."""
-    await rest(c, "PATCH", f"products?id=eq.{product}", json={"quantity": 1})
+    # Down to the last unit THROUGH the ledger, not by PATCHing quantity — a direct write is the one
+    # thing that can desync the journal, so the harness does not model it (034).
+    have = (await rest(c, "GET", f"products?id=eq.{product}&select=quantity"))[0]["quantity"]
+    await rpc(c, "move_stock", {"p_id": product, "p_shop": shop, "p_delta": 1 - have,
+                                "p_reason": "count", "p_actor": TAG})
 
     wins = await asyncio.gather(
         *(rpc(c, "decrement_stock", {"p_id": product, "p_shop": shop, "n": 1}) for _ in range(8))
@@ -80,6 +84,47 @@ async def check_stock_is_atomic(c, shop: str, product: str) -> None:
 
     check("only one of 8 concurrent sells takes the last unit", sum(bool(w) for w in wins), 1)
     check("stock never goes negative", left, 0)
+
+
+async def check_every_stock_move_is_journalled(c, shop: str, product: str) -> None:
+    """034: products.quantity is the balance, stock_moves is the journal, and move_stock writes both
+    in one transaction so they cannot disagree. Without the journal nothing can say why a number is
+    what it is, and sell-through / valuation-at-a-date have no inbound denominator to work from."""
+    async def ledger() -> list[dict]:
+        return await rest(c, "GET", f"stock_moves?product_id=eq.{product}"
+                                    "&select=delta,balance_after,reason,actor&order=id")
+
+    rows = await ledger()  # opening 5 → count −4 → the one concurrent sale that won −1
+    check("creating a product opens the ledger", rows[0]["reason"], "opening")
+    check("...at the quantity it was created with", rows[0]["delta"], 5)
+    check("a counted adjustment carries its reason", rows[1]["reason"], "count")
+    check("...and who made it", rows[1]["actor"], TAG)
+    check("the sale that won is journalled", rows[-1]["reason"], "legacy")
+    check("...and the 7 that lost wrote nothing", len(rows), 3)
+    check("balance_after tracks the running balance", [r["balance_after"] for r in rows], [5, 1, 0])
+
+    check("a restock is journalled too",
+          await rpc(c, "move_stock", {"p_id": product, "p_shop": shop, "p_delta": 3,
+                                      "p_reason": "purchase", "p_actor": TAG}), True)
+    check("a move that would take stock negative is refused",
+          await rpc(c, "move_stock", {"p_id": product, "p_shop": shop, "p_delta": -4,
+                                      "p_reason": "sale"}), False)
+    check("...and leaves no journal row behind", len(await ledger()), 4)
+
+
+async def check_the_ledger_still_balances(c, shop: str) -> None:
+    """The standing invariant, run last so it covers every sale, void, restock and cancel above:
+    a product's quantity IS the sum of its journal. Run this after any phase that touches stock."""
+    products = await rest(c, "GET", f"products?shop_id=eq.{shop}&select=id,quantity")
+    moves = await rest(c, "GET", f"stock_moves?shop_id=eq.{shop}&select=product_id,delta")
+    summed: dict[str, int] = {}
+    for m in moves:
+        summed[m["product_id"]] = summed.get(m["product_id"], 0) + m["delta"]
+
+    off = {p["id"]: (p["quantity"], summed.get(p["id"], 0))
+           for p in products if p["quantity"] != summed.get(p["id"], 0)}
+    check("every product's balance equals the sum of its journal", off, {},
+          "product_id -> (quantity, sum(delta))")
 
 
 DOC = {"source": "counter", "items": [], "subtotal": "100.00", "vat_amount": "5.00",
@@ -437,13 +482,13 @@ async def seed(c, made: dict) -> str:
 
 
 async def teardown(c, made: dict) -> None:
-    """Children first — orders and counter_sales reference products with ON DELETE RESTRICT."""
+    """Children first — orders, counter_sales and stock_moves reference products ON DELETE RESTRICT."""
     shop, client = made.get("shop"), made.get("client")
     paths = []
     if shop:
         paths += [f"{t}?shop_id=eq.{shop}" for t in (
             "invoices", "product_units", "counter_sales", "orders", "daily_counters",
-            "invoice_counters", "cod_ledger", "products",
+            "invoice_counters", "cod_ledger", "stock_moves", "products",
         )]
         paths.append(f"shops?id=eq.{shop}")
     if client:
@@ -468,6 +513,7 @@ async def main() -> int:
 
             print("stock integrity")
             await check_stock_is_atomic(c, shop, product)
+            await check_every_stock_move_is_journalled(c, shop, product)
             print("invoice numbering")
             await check_invoice_numbers_are_gap_free(c, shop)
             await check_day_seq_per_kind(c, shop)
@@ -482,6 +528,9 @@ async def main() -> int:
             print("VAT on top + POS discounts")
             await check_vat_on_top_and_the_discount_lands(c, shop, product)
             await check_cod_equals_the_invoice_total(c, shop, product)
+            # Last of all: everything above moved stock, and none of it may have broken the journal.
+            print("stock ledger")
+            await check_the_ledger_still_balances(c, shop)
         finally:
             await teardown(c, made)
             after = await counts(c)
@@ -493,7 +542,8 @@ async def main() -> int:
 
 async def counts(c) -> dict[str, int]:
     out = {}
-    for t in ("clients", "shops", "products", "orders", "counter_sales", "invoices", "product_units"):
+    for t in ("clients", "shops", "products", "orders", "counter_sales", "invoices",
+              "product_units", "stock_moves"):
         r = await c.get(f"{_BASE}/rest/v1/{t}", headers={**_H, "Prefer": "count=exact",
                                                          "Range": "0-0"},
                         params={"select": "id"}, timeout=30)

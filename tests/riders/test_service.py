@@ -305,7 +305,7 @@ def rider_wire(monkeypatch):
     async def _remember(s, phone, text):
         pass
 
-    async def _dec(shop_id, pid, n, client):
+    async def _dec(shop_id, pid, n, client, **_):
         cap["restock"] = n
         return True
 
