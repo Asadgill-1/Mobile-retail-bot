@@ -176,6 +176,69 @@ async def check_the_pin_gate_is_sealed_and_portable(c, shop: str) -> None:
         check(f"anon cannot read {table}", r.status_code, 401, r.text[:120])
 
 
+async def check_a_supplier_bill_cannot_be_claimed_twice(c, shop: str) -> None:
+    """Migration 036. Claiming one supplier invoice twice is the commonest input-VAT error there is,
+    and the easiest for the FTA to find — they hold the supplier's copy of the same document. It is
+    rarely fraud: the same bill arrives by WhatsApp and in the box, and two people book it.
+
+    The unique index is what makes the second booking impossible rather than merely detectable, and
+    it is case- and whitespace-insensitive, because "INV-0091" and "inv-0091 " are one document. A
+    plain UNIQUE over the raw text would store all three spellings and claim the VAT three times.
+
+    Then the sum: input VAT for a period is added here in Decimal, the way an accountant adds the
+    paper stack, and compared against what the rows say. Phase 5's return reads that same sum.
+    """
+    supplier = (await rest(c, "POST", "suppliers", json={
+        "shop_id": shop, "name": f"{TAG} Trading", "trn": "100123456700003",
+    }))[0]
+
+    async def book(no: str, subtotal: str, vat: str, day: str):
+        return await c.post(f"{_BASE}/rest/v1/purchase_invoices", headers=_H, timeout=30, json={
+            "shop_id": shop, "supplier_id": supplier["id"], "supplier_invoice_no": no,
+            "supplier_trn": "100123456700003", "invoice_date": day,
+            "subtotal": subtotal, "vat_amount": vat, "created_by": TAG,
+        })
+
+    today = datetime.now(DUBAI).date()
+    first = await book("INV-0091", "1000.00", "50.00", today.isoformat())
+    check("a supplier bill books", first.status_code, 201, first.text[:160])
+
+    dupe = await book("INV-0091", "1000.00", "50.00", (today - timedelta(days=3)).isoformat())
+    check("the same bill cannot be booked twice", dupe.status_code, 409, dupe.text[:160])
+    # Different date, different amount, different typist — same document. Only the number matters.
+    sloppy = await book("  inv-0091 ", "999.00", "49.95", today.isoformat())
+    check("...however it is typed", sloppy.status_code, 409, sloppy.text[:160])
+
+    second = await book("INV-0092", "400.00", "20.00", today.isoformat())
+    check("a different bill from the same supplier books", second.status_code, 201, second.text[:160])
+    # The control is per shop AND per supplier: two suppliers really do both use "INV-1".
+    other = (await rest(c, "POST", "suppliers", json={
+        "shop_id": shop, "name": f"{TAG} Electronics",
+    }))[0]
+    same_no = await c.post(f"{_BASE}/rest/v1/purchase_invoices", headers=_H, timeout=30, json={
+        "shop_id": shop, "supplier_id": other["id"], "supplier_invoice_no": "INV-0091",
+        "invoice_date": today.isoformat(), "subtotal": "10.00", "vat_amount": "0.50",
+        "created_by": TAG,
+    })
+    check("another supplier may use the same number", same_no.status_code, 201, same_no.text[:160])
+
+    rows = await rest(c, "GET", f"purchase_invoices?shop_id=eq.{shop}"
+                                f"&invoice_date=gte.{today.isoformat()}"
+                                f"&select=vat_amount,recoverable")
+    check("input VAT for the period is the paper stack, added up",
+          sum((Decimal(r["vat_amount"]) for r in rows), Decimal(0)), Decimal("70.50"),
+          "50.00 + 20.00 + 0.50 — the refused duplicates contribute nothing")
+    check("...and every booked bill defaults to claimable",
+          all(r["recoverable"] for r in rows), True)
+
+    anon = {"apikey": settings.supabase_anon_key,
+            "Authorization": f"Bearer {settings.supabase_anon_key}"}
+    for table in ("suppliers", "purchase_invoices"):
+        r = await c.get(f"{_BASE}/rest/v1/{table}", headers=anon,
+                        params={"select": "*"}, timeout=30)
+        check(f"anon cannot read {table}", r.status_code, 401, r.text[:120])
+
+
 DOC = {"source": "counter", "items": [], "subtotal": "100.00", "vat_amount": "5.00",
        "total": "105.00", "created_by": TAG}
 
@@ -538,6 +601,9 @@ async def teardown(c, made: dict) -> None:
         paths += [f"{t}?shop_id=eq.{shop}" for t in (
             "invoices", "product_units", "counter_sales", "orders", "daily_counters",
             "invoice_counters", "cod_ledger", "stock_moves", "products",
+            # Bills before suppliers: purchase_invoices.supplier_id is ON DELETE RESTRICT, which is
+            # the point — a supplier's tax records must never vanish with the supplier.
+            "purchase_invoices", "suppliers",
         )]
         paths.append(f"shops?id=eq.{shop}")
     if client:
@@ -579,6 +645,8 @@ async def main() -> int:
             await check_cod_equals_the_invoice_total(c, shop, product)
             print("manager PIN gate")
             await check_the_pin_gate_is_sealed_and_portable(c, shop)
+            print("purchases + input VAT")
+            await check_a_supplier_bill_cannot_be_claimed_twice(c, shop)
             # Last of all: everything above moved stock, and none of it may have broken the journal.
             print("stock ledger")
             await check_the_ledger_still_balances(c, shop)
@@ -598,7 +666,8 @@ async def counts(c) -> dict[str, int]:
     for t, key in (("clients", "id"), ("shops", "id"), ("products", "id"), ("orders", "id"),
                    ("counter_sales", "id"), ("invoices", "id"), ("product_units", "id"),
                    ("stock_moves", "id"), ("manager_pins", "shop_id"),
-                   ("override_approvals", "id")):
+                   ("override_approvals", "id"), ("suppliers", "id"),
+                   ("purchase_invoices", "id")):
         r = await c.get(f"{_BASE}/rest/v1/{t}", headers={**_H, "Prefer": "count=exact",
                                                          "Range": "0-0"},
                         params={"select": key}, timeout=30)

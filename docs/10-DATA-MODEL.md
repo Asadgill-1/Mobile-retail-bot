@@ -234,6 +234,68 @@ Written and read only by the shop dashboard (`lib/override.ts`); no Python path 
 
 Both tables: RLS on, no policy, `revoke all from anon, authenticated` — probed live, anon gets 401.
 
+### suppliers + purchase_invoices  (migration 036, Stage 12o)
+
+The **input** side of the VAT return. Everything before 036 was output-side: what the shop sold and
+the 5% it collected. A shop that files only that pays over its whole output VAT and recovers nothing.
+Written and read only by the shop dashboard (`actions/purchases.ts`); no Python path touches either.
+
+**suppliers** — one row per shop per supplier.
+- **Key fields:** `id`, `shop_id` FK, `name`, `trn`, `phone`, `created_at`.
+- **Unique `(shop_id, lower(btrim(name)))`** — "Al Noor Trading" and "AL NOOR TRADING" are one
+  supplier, and two rows would split one account's history in half.
+- `trn` is nullable: a cash purchase from an unregistered trader is real. Those simply are not
+  recoverable, and the booking form says so.
+
+**purchase_invoices** — the bills the shop received. **Header only**; lines are migration 037.
+- **Key fields:** `id`, `shop_id` FK, `supplier_id` FK, `supplier_invoice_no`, `supplier_trn`,
+  `invoice_date` DATE, `subtotal`, `vat_amount`, `vat_treatment`, `recoverable`, `scan_path`,
+  `notes`, `created_by`, `created_at`.
+- **THE control: unique `(shop_id, supplier_id, upper(btrim(supplier_invoice_no)))`.** Claiming one
+  supplier invoice twice is the commonest input-VAT error and the easiest for the FTA to find — they
+  hold the supplier's copy. It is rarely fraud: the same bill arrives by WhatsApp and in the box, and
+  two people book it. The index makes the second booking *impossible* rather than detectable, which
+  is the difference between a control and a report. Case- and whitespace-insensitive, so
+  `"INV-0091"`, `"inv-0091 "` and `"  inv-0091"` are one document. Per **supplier**, because two
+  suppliers really do both use "INV-1".
+- **No CHECK that `vat_amount ≈ subtotal × 5%`, deliberately.** Real bills round per line and then
+  total, so a true document lands a fil or two out; partly-exempt bills are legitimately far off; a
+  reverse-charge import carries no supplier VAT at all. A constraint would reject true documents and
+  force whoever is booking to retype the paper until the form accepts it — which is how wrong numbers
+  get filed. `lib/vat.ts::vatVarianceWarning` warns past **±0.02** and books it anyway.
+- `invoice_date` is the date **on the paper**, not when it was typed: that is what decides the tax
+  period. It is a DATE, so pages compare it against Dubai calendar days, never UTC instants.
+- `supplier_trn` is a **snapshot** of the TRN as printed on that bill. Suppliers register,
+  deregister and re-register; the return must say what the document said on the day.
+- `recoverable` is the shop's call, `notes` says why not — entertainment, most motor vehicles and
+  anything not for the business are blocked by law, and so is any bill that is not a valid tax
+  invoice. Booking still happens either way; only the claimable total moves.
+- `scan_path` points into the existing private `shop-media` bucket (`{shop_id}/purchases/…`), reusing
+  the product-media signed-upload flow. The FTA wants the supplier's invoice kept for 5 years.
+- `supplier_id` is **ON DELETE RESTRICT** — a supplier's tax records must never vanish with the
+  supplier. Probed live: a bare supplier delete is refused, while deleting the whole *shop* still
+  cascades both tables in one statement.
+
+**The shop's own VAT facts**, added to `shops` by the same migration:
+- `emirate` — standard-rated supplies are reported **per emirate** (VAT201 boxes 1a–1g). Nothing can
+  derive it, so it starts NULL and Settings badges it as missing; a default of 'Dubai' would silently
+  file another emirate's numbers under Dubai. Changing it is **manager-PIN gated** (kind `emirate`),
+  exactly like the TRN — it re-files a whole period's sales under a different heading, and it is a
+  value that legitimately never changes.
+- `vat_period` — `monthly` | `quarterly` (default quarterly, the FTA default under AED 150m).
+- `vat_quarter_anchor` — 1, 2 or 3: which stagger group the shop's quarters end in (Jan/Apr/Jul/Oct,
+  Feb/May/Aug/Nov, Mar/Jun/Sep/Dec). Two thirds of quarterly filers are **not** on calendar quarters,
+  so a report that assumes 3 shows most of them the wrong period. Ignored when filing monthly.
+
+**`invoices.vat_treatment`** — the output-side twin, default `'standard'`, which is true of every
+invoice this system has issued (UAE retail at 5%). Both columns share one word list —
+`standard · zero_rated · exempt · reverse_charge · out_of_scope` — so phase 5 reads one vocabulary
+for both sides of the return. Header-level, not per line: a mixed bill (standard phone + zero-rated
+export accessory on one document) would move the same word list down onto `invoices.items`, when a
+shop actually issues one. No UI writes it yet — nothing this shop sells is anything but standard.
+
+Both new tables: RLS on, no policy, `revoke all from anon, authenticated` — probed live, anon gets 401.
+
 ## Relationships (overview)
 
 ```
@@ -260,6 +322,8 @@ orders 1──* product_units (via order_id, online-order IMEI — migration 023
 counter_sales 1──?1 product_units (via counter_sale_id)
 shops 1───* invoices ──1 invoice_counters (per-shop sequence)
 invoices ?──1 orders, ?──* counter_sales (via counter_sale_ids[])
+shops 1───* suppliers 1───* purchase_invoices  (ON DELETE RESTRICT — bills outlive the supplier row)
+shops ?──1 manager_pins, shops 1───* override_approvals
 ```
 
 ## Storage notes
