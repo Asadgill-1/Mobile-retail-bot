@@ -208,6 +208,9 @@ Written and read only by the shop dashboard (`lib/override.ts`); no Python path 
   `fail_count`; setting a new PIN also clears the lock, which is the documented recovery.
 - **Who may set it:** the shop **owner** only (`actions/settings.ts::setManagerPin`) — a ceiling the
   gated person can move is not a ceiling. This is the only role gate Phase 3 added.
+- **Who it stops: everyone, including the owner.** It is the *shop's* PIN, not a role check —
+  verified live under `owner1@owner.ae`. If only keepers were gated, `outcome='approved'` would be a
+  synonym for "a keeper did it" and the owner's own overrides would leave no record.
 - `limits` holds per-shop **deltas** from the defaults in `lib/override-rules.ts`. No UI writes it
   yet; it is set by SQL until a shop asks.
 
@@ -220,8 +223,10 @@ Written and read only by the shop dashboard (`lib/override.ts`); no Python path 
   row. The owner's first look at the Approvals view is therefore a priced list of what has been
   happening unsupervised, which argues for setting a PIN better than a locked screen does, and means
   the migration cannot break a live shop on the day it lands.
-- Units follow `kind`: AED for money, whole units for `stock_adjust`, percent for `price_cut`. The
-  always-PIN kinds (`product_delete`, `cost_edit`, `trn`) carry neither number.
+- **Units follow `kind`:** AED for money, whole units for `stock_adjust`, percent for `price_cut`.
+  The always-PIN kinds (`product_delete`, `cost_edit`, `trn`) carry neither number. Anything
+  rendering `amount`/`threshold` must branch on `kind` — the first version of the Approvals view did
+  not, and printed `limit AED 5` against a five-*unit* stock ceiling.
 - A prompt merely *appearing* is not logged — only decisions are, or the log would fill with a row
   per cancelled keystroke.
 - Surfaced as the 4th view on the owner-gated `/logs` (`?view=approvals`) and its CSV export. Zero
